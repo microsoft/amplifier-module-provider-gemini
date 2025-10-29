@@ -149,9 +149,9 @@ class GeminiProvider:
 
         start_time = time.time()
         try:
-            # Call Gemini API
+            # Call Gemini API (use .aio for async)
             response = await asyncio.wait_for(
-                self.client.models.generate_content(model=model, contents=gemini_contents, config=config),
+                self.client.aio.models.generate_content(model=model, contents=gemini_contents, config=config),
                 timeout=self.timeout,
             )
 
@@ -349,9 +349,9 @@ class GeminiProvider:
         start_time = time.time()
 
         try:
-            # Call Gemini API
+            # Call Gemini API (use .aio for async)
             response = await asyncio.wait_for(
-                self.client.models.generate_content(model=model, contents=all_messages, config=config),
+                self.client.aio.models.generate_content(model=model, contents=all_messages, config=config),
                 timeout=self.timeout,
             )
 

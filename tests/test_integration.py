@@ -59,7 +59,7 @@ class TestEndToEndTextCompletion:
         mock_response.usage_metadata.total_token_count = 25
 
         # Mock API call
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             # Execute
@@ -92,7 +92,7 @@ class TestEndToEndTextCompletion:
         mock_response.usage_metadata.candidates_token_count = 10
         mock_response.usage_metadata.total_token_count = 30
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             # Multi-turn conversation
@@ -137,7 +137,7 @@ class TestEndToEndWithTools:
         mock_response.usage_metadata.candidates_token_count = 5
         mock_response.usage_metadata.total_token_count = 20
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             # Request with tools
@@ -191,7 +191,7 @@ class TestEndToEndWithThinking:
         mock_response.usage_metadata.candidates_token_count = 30
         mock_response.usage_metadata.total_token_count = 50
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             # Request with thinking
@@ -243,7 +243,7 @@ class TestCombinedFeatures:
         mock_response.usage_metadata.candidates_token_count = 35
         mock_response.usage_metadata.total_token_count = 60
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             request = ChatRequest(
@@ -276,7 +276,7 @@ class TestErrorScenarios:
         mock_response = MagicMock()
         mock_response.candidates = []
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             request = ChatRequest(messages=[Message(role="user", content="Hello")])
@@ -293,7 +293,7 @@ class TestErrorScenarios:
         mock_response = MagicMock()
         mock_response.candidates = [mock_candidate]
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             request = ChatRequest(messages=[Message(role="user", content="Hello")])
@@ -309,7 +309,7 @@ class TestErrorScenarios:
         # Create provider with short timeout
         provider = GeminiProvider(api_key="test-key", config={"timeout": 0.1})
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             # Simulate slow call
             async def slow_call(*args, **kwargs):
                 await asyncio.sleep(1)  # Longer than timeout
@@ -346,7 +346,7 @@ class TestEventEmission:
         mock_response.usage_metadata.candidates_token_count = 5
         mock_response.usage_metadata.total_token_count = 15
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             request = ChatRequest(messages=[Message(role="user", content="Hello")])
@@ -384,7 +384,7 @@ class TestLegacyFormat:
         mock_response.usage_metadata.candidates_token_count = 5
         mock_response.usage_metadata.total_token_count = 10
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             # Legacy format
@@ -421,7 +421,7 @@ class TestChatRequestFormat:
         mock_response.usage_metadata.candidates_token_count = 5
         mock_response.usage_metadata.total_token_count = 10
 
-        with patch.object(provider.client.models, "generate_content", new_callable=AsyncMock) as mock_gen:
+        with patch.object(provider.client.aio.models, "generate_content", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = mock_response
 
             request = ChatRequest(messages=[Message(role="user", content="Hello")])

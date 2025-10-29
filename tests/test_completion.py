@@ -48,7 +48,9 @@ class TestBasicTextCompletion:
         """Test basic text completion with simple user message."""
         messages = [{"role": "user", "content": "Hello"}]
 
-        with patch.object(provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)):
+        with patch.object(
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+        ):
             response = await provider.complete(messages)
 
         assert response.content == "Hello! How can I help you today?"
@@ -64,7 +66,9 @@ class TestBasicTextCompletion:
             {"role": "user", "content": "What about 3+3?"},
         ]
 
-        with patch.object(provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)):
+        with patch.object(
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+        ):
             response = await provider.complete(messages)
 
         assert response.content == "Hello! How can I help you today?"
@@ -79,7 +83,7 @@ class TestBasicTextCompletion:
         ]
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(messages)
 
@@ -97,7 +101,7 @@ class TestModelSelection:
         messages = [{"role": "user", "content": "Hello"}]
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(messages)
 
@@ -110,7 +114,7 @@ class TestModelSelection:
         messages = [{"role": "user", "content": "Hello"}]
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(messages, model="gemini-2.5-pro")
 
@@ -127,7 +131,7 @@ class TestParameterControl:
         messages = [{"role": "user", "content": "Hello"}]
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(messages, temperature=0.5)
 
@@ -140,7 +144,7 @@ class TestParameterControl:
         messages = [{"role": "user", "content": "Hello"}]
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(messages, max_tokens=1000)
 
@@ -156,7 +160,9 @@ class TestEventEmission:
         """Test llm:request event is emitted."""
         messages = [{"role": "user", "content": "Hello"}]
 
-        with patch.object(provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)):
+        with patch.object(
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+        ):
             await provider.complete(messages)
 
         # Check that emit was called with llm:request
@@ -168,7 +174,9 @@ class TestEventEmission:
         """Test llm:response event is emitted."""
         messages = [{"role": "user", "content": "Hello"}]
 
-        with patch.object(provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)):
+        with patch.object(
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+        ):
             await provider.complete(messages)
 
         # Check that emit was called with llm:response
@@ -181,7 +189,9 @@ class TestEventEmission:
         provider = GeminiProvider(api_key="test-key", config={"debug": True}, coordinator=mock_coordinator)
         messages = [{"role": "user", "content": "Hello"}]
 
-        with patch.object(provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)):
+        with patch.object(
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+        ):
             await provider.complete(messages)
 
         # Check that debug events were emitted
@@ -207,7 +217,7 @@ class TestTimeoutHandling:
             await asyncio.sleep(10)
 
         with (
-            patch.object(provider.client.models, "generate_content", new=slow_response),
+            patch.object(provider.client.aio.models, "generate_content", new=slow_response),
             pytest.raises(asyncio.TimeoutError),
         ):
             await provider.complete(messages)
@@ -223,7 +233,9 @@ class TestErrorHandling:
 
         # Mock an API error
         with (
-            patch.object(provider.client.models, "generate_content", new=AsyncMock(side_effect=Exception("API Error"))),
+            patch.object(
+                provider.client.aio.models, "generate_content", new=AsyncMock(side_effect=Exception("API Error"))
+            ),
             pytest.raises(Exception) as exc_info,
         ):
             await provider.complete(messages)
@@ -248,7 +260,9 @@ class TestChatRequestFormat:
             ]
         )
 
-        with patch.object(provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)):
+        with patch.object(
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+        ):
             response = await provider.complete(request)
 
         assert len(response.content) == 1
@@ -265,7 +279,7 @@ class TestChatRequestFormat:
         )
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(request)
 
@@ -284,7 +298,7 @@ class TestChatRequestFormat:
         )
 
         with patch.object(
-            provider.client.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
+            provider.client.aio.models, "generate_content", new=AsyncMock(return_value=mock_gemini_response)
         ) as mock_generate:
             await provider.complete(request)
 

@@ -20,8 +20,9 @@ def provider():
 def mock_client():
     """Create mock Gemini client."""
     mock = MagicMock()
-    mock.models = MagicMock()
-    mock.models.generate_content = AsyncMock()
+    mock.aio = MagicMock()
+    mock.aio.models = MagicMock()
+    mock.aio.models.generate_content = AsyncMock()
     return mock
 
 
@@ -91,7 +92,7 @@ class TestFunctionCallParsing:
 
         # Mock the client
         provider.client = mock_client
-        mock_client.models.generate_content.return_value = mock_response
+        mock_client.aio.models.generate_content.return_value = mock_response
 
         # Create request with tools
         request = ChatRequest(
@@ -138,7 +139,7 @@ class TestFunctionCallParsing:
         mock_response.candidates[0].content.parts = [text_part, fc_part]
 
         provider.client = mock_client
-        mock_client.models.generate_content.return_value = mock_response
+        mock_client.aio.models.generate_content.return_value = mock_response
 
         request = ChatRequest(
             messages=[Message(role="user", content="What's the weather?")],
@@ -281,7 +282,7 @@ class TestMultipleToolsInTurn:
         mock_response.candidates[0].content.parts = [fc_part1, fc_part2]
 
         provider.client = mock_client
-        mock_client.models.generate_content.return_value = mock_response
+        mock_client.aio.models.generate_content.return_value = mock_response
 
         request = ChatRequest(
             messages=[Message(role="user", content="What's the weather and time?")],
@@ -337,7 +338,7 @@ class TestMultiTurnWithTools:
         mock_response.candidates[0].content.parts = [fc_part]
 
         provider.client = mock_client
-        mock_client.models.generate_content.return_value = mock_response
+        mock_client.aio.models.generate_content.return_value = mock_response
 
         response = await provider._complete_chat_request(request)
 

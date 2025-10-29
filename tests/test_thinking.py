@@ -44,7 +44,7 @@ class TestThinkingConfiguration:
         mock_response.usage_metadata.total_token_count = 150
 
         mock_generate = AsyncMock(return_value=mock_response)
-        monkeypatch.setattr(provider.client.models, "generate_content", mock_generate)
+        monkeypatch.setattr(provider.client.aio.models, "generate_content", mock_generate)
 
         # Create request with thinking_budget in metadata
         request = ChatRequest(
@@ -75,7 +75,7 @@ class TestThinkingConfiguration:
         mock_response.usage_metadata.total_token_count = 150
 
         mock_generate = AsyncMock(return_value=mock_response)
-        monkeypatch.setattr(provider.client.models, "generate_content", mock_generate)
+        monkeypatch.setattr(provider.client.aio.models, "generate_content", mock_generate)
 
         request = ChatRequest(messages=[Message(role="user", content="Test prompt")], metadata={"thinking_budget": 0})
 
@@ -99,7 +99,7 @@ class TestThinkingConfiguration:
         mock_response.usage_metadata.total_token_count = 150
 
         mock_generate = AsyncMock(return_value=mock_response)
-        monkeypatch.setattr(provider.client.models, "generate_content", mock_generate)
+        monkeypatch.setattr(provider.client.aio.models, "generate_content", mock_generate)
 
         request = ChatRequest(
             messages=[Message(role="user", content="Test prompt")], metadata={"thinking_budget": 5000}
@@ -125,7 +125,7 @@ class TestThinkingConfiguration:
         mock_response.usage_metadata.total_token_count = 150
 
         mock_generate = AsyncMock(return_value=mock_response)
-        monkeypatch.setattr(provider.client.models, "generate_content", mock_generate)
+        monkeypatch.setattr(provider.client.aio.models, "generate_content", mock_generate)
 
         request = ChatRequest(
             messages=[Message(role="user", content="Test prompt")],
@@ -151,7 +151,7 @@ class TestThinkingConfiguration:
         mock_response.usage_metadata.total_token_count = 150
 
         mock_generate = AsyncMock(return_value=mock_response)
-        monkeypatch.setattr(provider.client.models, "generate_content", mock_generate)
+        monkeypatch.setattr(provider.client.aio.models, "generate_content", mock_generate)
 
         request = ChatRequest(
             messages=[Message(role="user", content="Test prompt")]
@@ -177,7 +177,7 @@ class TestThinkingConfiguration:
         mock_response.usage_metadata.total_token_count = 150
 
         mock_generate = AsyncMock(return_value=mock_response)
-        monkeypatch.setattr(provider.client.models, "generate_content", mock_generate)
+        monkeypatch.setattr(provider.client.aio.models, "generate_content", mock_generate)
 
         request = ChatRequest(messages=[Message(role="user", content="Test prompt")])
 
