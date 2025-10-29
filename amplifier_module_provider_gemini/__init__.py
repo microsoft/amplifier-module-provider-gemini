@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import suppress
 from typing import Any
 from typing import Optional
 
@@ -274,8 +275,28 @@ class GeminiProvider:
         temperature = request.temperature or kwargs.get("temperature", self.temperature)
         max_tokens = request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens)
 
-        # Build Gemini config (no thinking yet - that's Chunk 5)
+        # Extract thinking parameters from request metadata or kwargs
+        thinking_budget = None
+        include_thoughts = True
+
+        if request.metadata:
+            thinking_budget = request.metadata.get("thinking_budget")
+            include_thoughts = request.metadata.get("include_thoughts", True)
+
+        # Allow kwargs to override if metadata not present
+        if thinking_budget is None and "thinking_budget" in kwargs:
+            thinking_budget = kwargs["thinking_budget"]
+        if "include_thoughts" in kwargs:
+            include_thoughts = kwargs["include_thoughts"]
+
+        # Build Gemini config with thinking support
         config = genai.types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens)
+
+        # Add thinking configuration if specified
+        if thinking_budget is not None:
+            config.thinking_config = genai.types.ThinkingConfig(
+                thinking_budget=thinking_budget, include_thoughts=include_thoughts
+            )
 
         if system_instruction:
             config.system_instruction = system_instruction
@@ -397,15 +418,27 @@ class GeminiProvider:
         Returns:
             ChatResponse with content blocks
         """
+        from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCallBlock
 
         content_blocks = []
         tool_calls = []
 
         for part in response.candidates[0].content.parts:
-            if hasattr(part, "text"):
-                # ChatResponse expects TextBlock from message_models, not TextContent
-                content_blocks.append(TextBlock(text=part.text))
+            if hasattr(part, "text") and part.text:
+                # Check if this is thinking content
+                if hasattr(part, "thought") and part.thought:
+                    # This is a thinking/reasoning part
+                    content_blocks.append(ThinkingBlock(thinking=part.text, signature=None))
+
+                    # Emit thinking:final event (fire-and-forget, safe if no loop)
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        # Skip event emission if no event loop running (sync context)
+                        with suppress(RuntimeError):
+                            asyncio.create_task(self.coordinator.hooks.emit("thinking:final", {"text": part.text}))
+                else:
+                    # Regular text - ChatResponse expects TextBlock from message_models
+                    content_blocks.append(TextBlock(text=part.text))
             elif hasattr(part, "function_call"):
                 # Extract tool call
                 fc = part.function_call
@@ -425,10 +458,17 @@ class GeminiProvider:
 
                 tool_calls.append(TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args)))
 
-        # For now, just text and tool calls (thinking in later chunks)
-        return ChatResponse(
-            content=content_blocks, tool_calls=tool_calls if tool_calls else None, metadata={"raw_response": response}
-        )
+        # Build metadata with usage including thought tokens
+        metadata = {"raw_response": response}
+        if hasattr(response, "usage_metadata"):
+            # Gemini includes thoughtsTokenCount in usage metadata when thinking is used
+            metadata["usage"] = {
+                "input_tokens": response.usage_metadata.prompt_token_count,
+                "output_tokens": response.usage_metadata.candidates_token_count,
+                "total_tokens": response.usage_metadata.total_token_count,
+            }
+
+        return ChatResponse(content=content_blocks, tool_calls=tool_calls if tool_calls else None, metadata=metadata)
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
         """

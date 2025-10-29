@@ -33,6 +33,7 @@ def mock_gemini_response():
     mock_response.candidates[0].content = MagicMock()
     mock_response.candidates[0].content.parts = [MagicMock()]
     mock_response.candidates[0].content.parts[0].text = "Hello! How can I help you today?"
+    mock_response.candidates[0].content.parts[0].thought = False  # Regular text, not thinking
     mock_response.usage_metadata = MagicMock()
     mock_response.usage_metadata.prompt_token_count = 10
     mock_response.usage_metadata.candidates_token_count = 15
