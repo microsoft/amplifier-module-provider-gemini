@@ -93,12 +93,19 @@ providers:
 
 **Thinking** (complex reasoning):
 ```yaml
+session:
+  orchestrator:
+    module: loop-streaming
+    source: git+https://github.com/microsoft/amplifier-module-loop-streaming@main
+    config:
+      extended_thinking: true  # Show thinking content
+
 providers:
   - module: provider-gemini
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-pro
-      temperature: 1.0  # Required for thinking
+      temperature: 1.0
       max_tokens: 16384
 ```
 
@@ -125,18 +132,25 @@ providers:
 
 ### Thinking/Reasoning
 
-Gemini 2.5 models support extended thinking for complex reasoning tasks. Thinking is enabled by default with dynamic token budgets.
+**Gemini 2.5 models (Pro and Flash) think by default** using dynamic token budgets. The provider automatically captures thinking content from the Gemini API.
 
-```python
-# Control thinking via request parameters
-await provider.complete(
-    messages=messages,
-    thinking_budget=-1,      # -1=dynamic, 0=disabled, N=tokens
-    include_thoughts=True    # Return thought summaries
-)
+**To display thinking output**, configure your orchestrator (not the provider):
+
+```yaml
+session:
+  orchestrator:
+    module: loop-streaming     # Required for thinking display
+    source: git+https://github.com/microsoft/amplifier-module-loop-streaming@main
+    config:
+      extended_thinking: true  # Show thinking content to user
 ```
 
-**Note**: Thinking increases token usage and processing time but improves response quality for complex tasks.
+**Model thinking behavior**:
+- **gemini-2.5-pro**: Thinks by default (best for complex reasoning)
+- **gemini-2.5-flash**: Thinks by default (good for most tasks)
+- **gemini-2.5-flash-lite**: Does NOT think by default
+
+**Note**: The provider captures thinking from the API automatically. The orchestrator's `extended_thinking: true` config controls whether it's displayed. Without this config, thinking still happens but isn't shown to the user.
 
 ### Tool Calling
 
