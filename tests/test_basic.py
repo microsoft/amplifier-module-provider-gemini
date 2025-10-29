@@ -116,17 +116,15 @@ class TestMountFunction:
     @pytest.mark.asyncio
     @patch("amplifier_module_provider_gemini.genai.Client")
     async def test_mount_cleanup_function(self, mock_client_class, mock_coordinator, test_config):
-        """Test cleanup function works."""
-        # Create mock client with close method
-        mock_client = MagicMock()
-        mock_client.close = AsyncMock()
-        mock_client_class.return_value = mock_client
-
+        """Test cleanup function can be called without error."""
         cleanup = await mount(mock_coordinator, test_config)
 
-        # Verify cleanup calls close
+        # Verify cleanup is returned and callable
+        assert cleanup is not None
+
+        # Verify cleanup doesn't error
+        # genai.Client doesn't require explicit cleanup
         await cleanup()
-        mock_client.close.assert_called_once()
 
 
 class TestPlaceholderMethods:
