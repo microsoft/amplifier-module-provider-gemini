@@ -130,15 +130,7 @@ class TestMountFunction:
 class TestPlaceholderMethods:
     """Test placeholder methods return expected behavior."""
 
-    @patch("amplifier_module_provider_gemini.genai.Client")
-    def test_complete_not_implemented(self, mock_client_class, mock_coordinator):
-        """Test complete() raises NotImplementedError."""
-        provider = GeminiProvider("test-key", None, mock_coordinator)
-
-        with pytest.raises(NotImplementedError, match="Chunk 3"):
-            import asyncio
-
-            asyncio.run(provider.complete([]))
+    # Chunk 3 complete - test removed
 
     @patch("amplifier_module_provider_gemini.genai.Client")
     def test_parse_tool_calls_returns_empty(self, mock_client_class, mock_coordinator):
