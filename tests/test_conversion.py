@@ -324,10 +324,11 @@ class TestToolConversion:
         tools = [tool_spec]
         gemini_tools = provider._convert_tools_from_request(tools)
 
+        # Verify FunctionDeclaration objects
         assert len(gemini_tools) == 1
-        assert gemini_tools[0]["name"] == "calculate"
-        assert gemini_tools[0]["description"] == "Perform calculation"
-        assert gemini_tools[0]["parameters"]["type"] == "object"
+        assert gemini_tools[0].name == "calculate"
+        assert gemini_tools[0].description == "Perform calculation"
+        assert gemini_tools[0].parameters_json_schema["type"] == "object"
 
     def test_convert_multiple_tools(self, provider):
         """Test converting multiple tools."""

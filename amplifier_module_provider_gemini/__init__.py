@@ -397,27 +397,69 @@ class GeminiProvider:
         Returns:
             ChatResponse with content blocks
         """
+        from amplifier_core.message_models import ToolCallBlock
+
         content_blocks = []
+        tool_calls = []
 
         for part in response.candidates[0].content.parts:
             if hasattr(part, "text"):
                 # ChatResponse expects TextBlock from message_models, not TextContent
                 content_blocks.append(TextBlock(text=part.text))
+            elif hasattr(part, "function_call"):
+                # Extract tool call
+                fc = part.function_call
+                tool_call_id = self._generate_tool_call_id()
 
-        # For now, just text content (tools/thinking in later chunks)
-        return ChatResponse(content=content_blocks, raw=response)
+                # Create ToolCallBlock
+                content_blocks.append(
+                    ToolCallBlock(
+                        id=tool_call_id,
+                        name=fc.name,
+                        input=dict(fc.args),  # Convert to dict
+                    )
+                )
+
+                # Create ToolCall for tool_calls list
+                from amplifier_core.message_models import ToolCall as TCModel
+
+                tool_calls.append(TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args)))
+
+        # For now, just text and tool calls (thinking in later chunks)
+        return ChatResponse(
+            content=content_blocks, tool_calls=tool_calls if tool_calls else None, metadata={"raw_response": response}
+        )
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
         """
-        Parse tool calls from response.
+        Parse tool calls from provider response.
+
+        Filters out tool calls with empty/missing arguments to handle
+        Gemini API quirk where empty function_call blocks are sometimes generated.
 
         Args:
             response: Provider response
 
         Returns:
-            List of tool calls
+            List of valid tool calls (with non-empty arguments)
         """
-        return response.tool_calls or []
+        if not response.tool_calls:
+            return []
+
+        # Filter out tool calls with empty arguments (Gemini API quirk)
+        # Gemini sometimes generates function_call blocks with empty args {}
+        valid_calls = []
+        for tc in response.tool_calls:
+            # Skip tool calls with no arguments or empty dict
+            if not tc.arguments:
+                logger.debug(f"Filtering out tool '{tc.tool}' with empty arguments")
+                continue
+            valid_calls.append(tc)
+
+        if len(valid_calls) < len(response.tool_calls):
+            logger.info(f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments")
+
+        return valid_calls
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
         """
@@ -560,25 +602,27 @@ class GeminiProvider:
 
         return gemini_tools
 
-    def _convert_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
+    def _convert_tools_from_request(self, tools: list) -> list:
         """
-        Convert ToolSpec objects from ChatRequest to Gemini format.
+        Convert ToolSpec objects from ChatRequest to Gemini FunctionDeclaration objects.
 
         Args:
             tools: List of ToolSpec objects
 
         Returns:
-            List of Gemini-formatted tool definitions
+            List of Gemini FunctionDeclaration objects
         """
+        from google.genai import types
+
         gemini_tools = []
 
         for tool in tools:
-            gemini_tools.append(
-                {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": tool.parameters,  # Already in OpenAPI format
-                }
+            # Create FunctionDeclaration using parametersJsonSchema (camelCase)
+            func_decl = types.FunctionDeclaration(
+                name=tool.name,
+                description=tool.description or "",
+                parametersJsonSchema=tool.parameters,  # Already in OpenAPI/JSON Schema format
             )
+            gemini_tools.append(func_decl)
 
         return gemini_tools
