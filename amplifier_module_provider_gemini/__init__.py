@@ -157,12 +157,19 @@ class GeminiProvider:
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
+            # Validate response structure
+            if not response.candidates or len(response.candidates) == 0:
+                raise ValueError("Gemini API returned no candidates in response")
+
+            if not hasattr(response.candidates[0], "content") or not response.candidates[0].content:
+                raise ValueError("Gemini API response candidate has no content")
+
             # Parse response - text only for now (no tools/thinking yet)
             content_blocks = []
             text_parts = []
 
             for part in response.candidates[0].content.parts:
-                if hasattr(part, "text"):
+                if hasattr(part, "text") and part.text:
                     text_parts.append(part.text)
                     content_blocks.append(TextContent(text=part.text, raw=part))
 
@@ -350,6 +357,16 @@ class GeminiProvider:
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
+            # Validate response structure
+            if not response.candidates or len(response.candidates) == 0:
+                raise ValueError("Gemini API returned no candidates in response")
+
+            if not hasattr(response.candidates[0], "content") or not response.candidates[0].content:
+                raise ValueError("Gemini API response candidate has no content")
+
+            if not hasattr(response.candidates[0].content, "parts"):
+                raise ValueError("Gemini API response content has no parts")
+
             # Emit llm:response event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 usage_data = {}
@@ -373,6 +390,11 @@ class GeminiProvider:
                 )
 
                 if self.debug:
+                    # Truncate content preview to avoid huge debug logs
+                    content_preview = str(response.candidates[0].content.parts)[:500]
+                    if len(str(response.candidates[0].content.parts)) > 500:
+                        content_preview += "... (truncated)"
+
                     await self.coordinator.hooks.emit(
                         "llm:response:debug",
                         {
@@ -380,7 +402,7 @@ class GeminiProvider:
                             "data": {
                                 "provider": "gemini",
                                 "response": {
-                                    "content_preview": str(response.candidates[0].content.parts)[:500],
+                                    "content_preview": content_preview,
                                 },
                             },
                             "status": "ok",
@@ -388,7 +410,7 @@ class GeminiProvider:
                         },
                     )
 
-            # Convert to ChatResponse - text only for now
+            # Convert to ChatResponse
             return self._convert_to_chat_response(response)
 
         except Exception as e:
