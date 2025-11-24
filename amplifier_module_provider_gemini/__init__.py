@@ -437,7 +437,7 @@ class GeminiProvider:
                 )
             raise
 
-    def _convert_to_chat_response(self, response) -> ChatResponse:
+    def _convert_to_chat_response(self, response) -> GeminiChatResponse:
         """
         Convert Gemini response to ChatResponse.
 
@@ -445,13 +445,15 @@ class GeminiProvider:
             response: Gemini API response
 
         Returns:
-            ChatResponse with content blocks
+            GeminiChatResponse with content blocks for UI compatibility
         """
         from amplifier_core.message_models import ThinkingBlock
         from amplifier_core.message_models import ToolCallBlock
 
         content_blocks = []
         tool_calls = []
+        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
+        text_accumulator: list[str] = []
 
         for part in response.candidates[0].content.parts:
             if hasattr(part, "text") and part.text:
@@ -460,7 +462,15 @@ class GeminiProvider:
                 # Parts with thought_signature (but NOT thought=True) are the final answer
                 if hasattr(part, "thought") and part.thought is True:
                     # This is a thinking/reasoning part (internal reasoning process)
-                    content_blocks.append(ThinkingBlock(thinking=part.text, signature=None))
+                    content_blocks.append(
+                        ThinkingBlock(
+                            thinking=part.text,
+                            signature=getattr(part, "thought_signature", None),
+                            visibility="internal",
+                        )
+                    )
+                    event_blocks.append(ThinkingContent(text=part.text))
+                    # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
 
                     # Emit thinking:final event (fire-and-forget, safe if no loop)
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -470,6 +480,8 @@ class GeminiProvider:
                 else:
                     # Regular text (including final answer with thought_signature)
                     content_blocks.append(TextBlock(text=part.text))
+                    text_accumulator.append(part.text)
+                    event_blocks.append(TextContent(text=part.text))
             elif hasattr(part, "function_call"):
                 # Extract tool call
                 fc = part.function_call
@@ -488,6 +500,7 @@ class GeminiProvider:
                 from amplifier_core.message_models import ToolCall as TCModel
 
                 tool_calls.append(TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args)))
+                event_blocks.append(ToolCallContent(id=tool_call_id, name=fc.name, arguments=dict(fc.args)))
 
         # Build metadata with usage including thought tokens
         metadata = {"raw_response": response}
@@ -505,8 +518,15 @@ class GeminiProvider:
                 total_tokens=total_tokens,
             )
 
-        return ChatResponse(
-            content=content_blocks, tool_calls=tool_calls if tool_calls else None, usage=usage, metadata=metadata
+        combined_text = "\n\n".join(text_accumulator).strip()
+
+        return GeminiChatResponse(
+            content=content_blocks,
+            tool_calls=tool_calls if tool_calls else None,
+            usage=usage,
+            metadata=metadata,
+            content_blocks=event_blocks if event_blocks else None,
+            text=combined_text or None,
         )
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
