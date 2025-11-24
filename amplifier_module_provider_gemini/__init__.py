@@ -258,15 +258,17 @@ class GeminiProvider:
         max_tokens = request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens)
 
         # Extract thinking parameters from request metadata or kwargs
-        thinking_budget = None
-        include_thoughts = True
+        # Default: Enable dynamic thinking with text summaries for 2.5+ models
+        thinking_budget = -1  # -1 = dynamic (model decides), 0 = disabled
+        include_thoughts = True  # Get text summaries of thoughts
 
         if request.metadata:
-            thinking_budget = request.metadata.get("thinking_budget")
+            if "thinking_budget" in request.metadata:
+                thinking_budget = request.metadata.get("thinking_budget")
             include_thoughts = request.metadata.get("include_thoughts", True)
 
-        # Allow kwargs to override if metadata not present
-        if thinking_budget is None and "thinking_budget" in kwargs:
+        # Allow kwargs to override
+        if "thinking_budget" in kwargs:
             thinking_budget = kwargs["thinking_budget"]
         if "include_thoughts" in kwargs:
             include_thoughts = kwargs["include_thoughts"]
@@ -274,8 +276,8 @@ class GeminiProvider:
         # Build Gemini config with thinking support
         config = genai.types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens)
 
-        # Add thinking configuration if specified
-        if thinking_budget is not None:
+        # Add thinking configuration (enabled by default for 2.5+ models)
+        if thinking_budget != 0:  # 0 explicitly disables thinking
             config.thinking_config = genai.types.ThinkingConfig(
                 thinking_budget=thinking_budget, include_thoughts=include_thoughts
             )
@@ -355,9 +357,13 @@ class GeminiProvider:
                 raise ValueError("Gemini API returned no candidates in response")
 
             if not hasattr(response.candidates[0], "content") or not response.candidates[0].content:
+                # Log more details about what we got
+                logger.error(f"Response structure: {response}")
+                logger.error(f"Candidate: {response.candidates[0] if response.candidates else 'None'}")
                 raise ValueError("Gemini API response candidate has no content")
 
             if not hasattr(response.candidates[0].content, "parts"):
+                logger.error(f"Content: {response.candidates[0].content}")
                 raise ValueError("Gemini API response content has no parts")
 
             # Emit llm:response event
@@ -450,8 +456,10 @@ class GeminiProvider:
         for part in response.candidates[0].content.parts:
             if hasattr(part, "text") and part.text:
                 # Check if this is thinking content
-                if hasattr(part, "thought") and part.thought:
-                    # This is a thinking/reasoning part
+                # According to Gemini API docs: parts with thought=True are thinking/reasoning
+                # Parts with thought_signature (but NOT thought=True) are the final answer
+                if hasattr(part, "thought") and part.thought is True:
+                    # This is a thinking/reasoning part (internal reasoning process)
                     content_blocks.append(ThinkingBlock(thinking=part.text, signature=None))
 
                     # Emit thinking:final event (fire-and-forget, safe if no loop)
@@ -460,7 +468,7 @@ class GeminiProvider:
                         with suppress(RuntimeError):
                             asyncio.create_task(self.coordinator.hooks.emit("thinking:final", {"text": part.text}))
                 else:
-                    # Regular text - ChatResponse expects TextBlock from message_models
+                    # Regular text (including final answer with thought_signature)
                     content_blocks.append(TextBlock(text=part.text))
             elif hasattr(part, "function_call"):
                 # Extract tool call

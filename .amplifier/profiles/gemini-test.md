@@ -20,7 +20,7 @@ providers:
       temperature: 0.7
       timeout: 300.0
       debug: true           # Enable debug-level logging
-      raw_debug: false      # Set to true for ultra-verbose raw API logging
+      raw_debug: true       # Enable ultra-verbose raw API logging
       debug_truncate_length: 180
 
 tools:
@@ -28,6 +28,13 @@ tools:
     source: git+https://github.com/microsoft/amplifier-module-tool-bash@main
   - module: tool-filesystem
     source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
+
+hooks:
+  - module: hooks-logging
+    source: git+https://github.com/microsoft/amplifier-module-hooks-logging@main
+    config:
+      mode: session-only
+      session_log_template: ~/.amplifier/projects/{project}/sessions/{session_id}/events.jsonl
 ---
 
 # Gemini Provider Test Profile
