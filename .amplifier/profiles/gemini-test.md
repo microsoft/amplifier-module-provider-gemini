@@ -1,7 +1,14 @@
 ---
 profile:
   name: gemini-test
+  version: 1.0.0
   description: Test profile for Gemini provider with debug logging enabled
+
+session:
+  orchestrator:
+    module: loop-basic
+    source: git+https://github.com/microsoft/amplifier-module-loop-basic@main
+  context: context-simple
 
 providers:
   - module: provider-gemini
@@ -16,20 +23,13 @@ providers:
       raw_debug: false      # Set to true for ultra-verbose raw API logging
       debug_truncate_length: 180
 
-session:
-  orchestrator:
-    module: loop-basic
-    source: git+https://github.com/microsoft/amplifier-module-loop-basic@main
-
 tools:
   - module: tool-bash
     source: git+https://github.com/microsoft/amplifier-module-tool-bash@main
   - module: tool-filesystem
     source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
-
-context:
-  module: context-simple
-  source: git+https://github.com/microsoft/amplifier-module-context-simple@main
+  - module: context-simple
+    source: git+https://github.com/microsoft/amplifier-module-context-simple@main
 ---
 
 # Gemini Provider Test Profile
