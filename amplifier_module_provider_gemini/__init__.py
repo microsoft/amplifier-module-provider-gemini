@@ -617,7 +617,7 @@ class GeminiProvider:
                     tool_call_id = "unknown"
 
                 if not tool_name:
-                    logger.warning(f"Tool result missing name field: {msg}")
+                    logger.debug("Tool result missing name field, recovering from function_call history")
                     # Try to find the tool name from earlier function_call in conversation
                     # Scan backwards to find matching function_call
                     for prev_msg in reversed(gemini_contents):

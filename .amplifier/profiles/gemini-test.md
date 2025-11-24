@@ -6,8 +6,10 @@ profile:
 
 session:
   orchestrator:
-    module: loop-basic
-    source: git+https://github.com/microsoft/amplifier-module-loop-basic@main
+    module: loop-streaming
+    source: git+https://github.com/microsoft/amplifier-module-loop-streaming@main
+    config:
+      extended_thinking: true  # Show thinking blocks in console
   context:
     module: context-simple
     source: git+https://github.com/microsoft/amplifier-module-context-simple@main
@@ -28,6 +30,8 @@ tools:
     source: git+https://github.com/microsoft/amplifier-module-tool-bash@main
   - module: tool-filesystem
     source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
+  - module: tool-web
+    source: git+https://github.com/microsoft/amplifier-module-tool-web@main
 
 hooks:
   - module: hooks-logging
