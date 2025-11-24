@@ -283,9 +283,11 @@ class GeminiProvider:
         if system_instruction:
             config.system_instruction = system_instruction
 
-        # Add tools if provided (conversion only - execution in Chunk 4)
+        # Add tools if provided
         if request.tools:
             config.tools = [genai.types.Tool(function_declarations=self._convert_tools_from_request(request.tools))]
+            # CRITICAL: Disable automatic function calling - Amplifier handles tool execution
+            config.automatic_function_calling = genai.types.AutomaticFunctionCallingConfig(disable=True)
 
         logger.info(f"Gemini API call - model: {model}, messages: {len(all_messages)}")
 
