@@ -109,9 +109,44 @@ export GOOGLE_API_KEY="your-api-key-here"
 
 Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-## Usage
+## Getting Started
+
+### For End Users
+
+If you have Amplifier installed via `uv tool install amplifier`, add the Gemini provider to your profiles:
+
+1. **Set your API key**:
+   ```bash
+   export GOOGLE_API_KEY="your-api-key-here"
+   ```
+   Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
+
+2. **Create a profile** in `~/.amplifier/profiles/gemini.md`:
+   ```yaml
+   ---
+   profile:
+     name: gemini
+     version: 1.0.0
+     description: Gemini provider profile
+     extends: developer-expertise:dev
+
+   providers:
+     - module: provider-gemini
+       source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
+       config:
+         default_model: gemini-2.5-flash
+         temperature: 0.7
+   ---
+   ```
+
+3. **Use it**:
+   ```bash
+   amplifier run --profile gemini "Hello from Gemini!"
+   ```
 
 ### In Profile Configuration
+
+To add Gemini to any existing profile:
 
 ```yaml
 providers:
