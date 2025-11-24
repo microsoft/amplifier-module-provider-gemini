@@ -19,7 +19,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ## Purpose
 
-Provides access to Google's Gemini 2.5 models (Flash, Pro, Flash-Lite) as an LLM provider for Amplifier with 1M token context window and extended thinking capabilities.
+Provides access to Google's Gemini models as an LLM provider for Amplifier with 1M token context windows and extended thinking capabilities.
 
 ## Contract
 
@@ -33,18 +33,18 @@ Provides access to Google's Gemini 2.5 models (Flash, Pro, Flash-Lite) as an LLM
 
 ### Gemini 3.0 (Latest - Preview)
 
-- `gemini-3-pro-preview` - Best model for advanced reasoning and text generation (1M context, 65.5K output)
+- `gemini-3-pro-preview` - Best model for advanced reasoning and text generation (1M context, 65K max output)
 
 ### Gemini 2.5 (Stable - Recommended)
 
-- `gemini-2.5-flash` - Best price-performance for large-scale processing (1M context, default)
-- `gemini-2.5-pro` - State-of-the-art thinking model for complex reasoning (1M context)
-- `gemini-2.5-flash-lite` - Fastest model optimized for cost-efficiency (1M context)
+- `gemini-2.5-flash` - Best price-performance for large-scale processing (1M context, 65K max output, default)
+- `gemini-2.5-pro` - State-of-the-art thinking model for complex reasoning (1M context, 65K max output)
+- `gemini-2.5-flash-lite` - Fastest model optimized for cost-efficiency (1M context, 65K max output)
 
 ### Gemini 2.0 (Stable)
 
-- `gemini-2.0-flash` - Well-rounded capabilities with focus on price-performance (1M context)
-- `gemini-2.0-flash-lite` - Optimized for cost efficiency and low latency (1M context)
+- `gemini-2.0-flash` - Well-rounded capabilities with focus on price-performance (1M context, 8K max output)
+- `gemini-2.0-flash-lite` - Optimized for cost efficiency and low latency (1M context, 8K max output)
 
 **Note**: Image/video/audio models not listed as the provider doesn't support multimodal capabilities yet.
 
@@ -135,6 +135,7 @@ If you have Amplifier installed via `uv tool install amplifier`, add the Gemini 
        source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
        config:
          default_model: gemini-2.5-flash
+         max_tokens: 65536  # Use full 65K output capacity
          temperature: 0.7
    ---
    ```
@@ -154,6 +155,7 @@ providers:
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-flash
+      max_tokens: 65536  # Use full 65K output capacity
       temperature: 0.7
 ```
 
@@ -166,7 +168,7 @@ providers:
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-flash
-      max_tokens: 8192
+      max_tokens: 65536  # Full 65K output capacity
 ```
 
 **Thinking** (complex reasoning):
@@ -183,8 +185,8 @@ providers:
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-pro
+      max_tokens: 65536  # Full 65K output capacity
       temperature: 1.0
-      max_tokens: 16384
 ```
 
 **Fast** (simple queries, low cost):
@@ -194,6 +196,7 @@ providers:
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-flash-lite
+      max_tokens: 65536  # Full 65K output capacity
       temperature: 0.5
 ```
 
