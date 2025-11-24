@@ -1,0 +1,112 @@
+---
+profile:
+  name: gemini-test
+  description: Test profile for Gemini provider with debug logging enabled
+
+providers:
+  - module: provider-gemini
+    source: file://.
+    name: gemini
+    config:
+      default_model: gemini-2.5-flash
+      max_tokens: 8192
+      temperature: 0.7
+      timeout: 300.0
+      debug: true           # Enable debug-level logging
+      raw_debug: false      # Set to true for ultra-verbose raw API logging
+      debug_truncate_length: 180
+
+session:
+  orchestrator:
+    module: loop-basic
+    source: git+https://github.com/microsoft/amplifier-module-loop-basic@main
+
+tools:
+  - module: tool-bash
+    source: git+https://github.com/microsoft/amplifier-module-tool-bash@main
+  - module: tool-filesystem
+    source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
+
+context:
+  module: context-simple
+  source: git+https://github.com/microsoft/amplifier-module-context-simple@main
+---
+
+# Gemini Provider Test Profile
+
+This profile is configured to test the local Gemini provider with debug logging enabled.
+
+## Usage
+
+From the Gemini provider repository:
+
+```bash
+# Run with this profile
+amplifier run --profile gemini-test "Hello, can you test the Gemini provider?"
+
+# Enable raw debug logging
+amplifier run --profile gemini-test "Test with raw debug" # Edit profile to set raw_debug: true first
+```
+
+## Configuration
+
+- **Provider**: Local Gemini provider (file://.)
+- **Model**: gemini-2.5-flash (balanced performance)
+- **Debug**: Enabled (debug=true) for detailed logging
+- **Raw Debug**: Disabled by default (set to true for ultra-verbose API I/O)
+
+## Features Being Tested
+
+1. **Three-level debug logging**:
+   - INFO: Summary events (always enabled)
+   - DEBUG: Truncated request/response (debug=true)
+   - RAW: Complete untruncated data (raw_debug=true)
+
+2. **Tool result validation**:
+   - Automatic detection of missing tool results
+   - Synthetic error injection for graceful recovery
+   - Observable via provider:tool_sequence_repaired events
+
+3. **Usage tracking**:
+   - Proper Usage model integration
+   - Token counting (input/output/total)
+
+4. **Tool calling**:
+   - Bash and filesystem tools available for testing
+   - Synthetic tool call IDs (Gemini doesn't provide them)
+
+## Testing Scenarios
+
+### Basic Completion
+```bash
+amplifier run --profile gemini-test "What is 2+2?"
+```
+
+### Tool Usage
+```bash
+amplifier run --profile gemini-test "List files in the current directory"
+```
+
+### Thinking/Reasoning
+Edit the profile to use `gemini-2.5-pro` and add thinking config for complex reasoning tasks.
+
+## Debug Logs
+
+When debug=true, look for these events in logs:
+- `llm:request` - Request summary
+- `llm:request:debug` - Detailed request with truncated values
+- `llm:response` - Response summary
+- `llm:response:debug` - Detailed response with truncated values
+
+When raw_debug=true, also see:
+- `llm:request:raw` - Complete untruncated request
+- `llm:response:raw` - Complete untruncated response
+
+## Environment Variables
+
+Ensure you have:
+```bash
+export GOOGLE_API_KEY="your-api-key-here"
+```
+
+Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
