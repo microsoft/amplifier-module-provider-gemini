@@ -230,7 +230,7 @@ class GeminiProvider:
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant")]
+        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
 
         # Combine system messages
         system_instruction = (
@@ -610,13 +610,30 @@ class GeminiProvider:
             # Handle tool results → function_response
             elif role == "tool":
                 tool_call_id = msg.get("tool_call_id")
+                tool_name = msg.get("name")
+
                 if not tool_call_id:
                     logger.warning(f"Tool result missing tool_call_id: {msg}")
                     tool_call_id = "unknown"
 
-                # Extract tool name from message (may need to track this separately)
-                # For now, we'll use "unknown" as Gemini requires tool name
-                tool_name = msg.get("name", "unknown")
+                if not tool_name:
+                    logger.warning(f"Tool result missing name field: {msg}")
+                    # Try to find the tool name from earlier function_call in conversation
+                    # Scan backwards to find matching function_call
+                    for prev_msg in reversed(gemini_contents):
+                        if prev_msg.get("role") == "model" and prev_msg.get("parts"):
+                            for part in prev_msg["parts"]:
+                                if "function_call" in part:
+                                    # Found the function call - use its name
+                                    tool_name = part["function_call"]["name"]
+                                    logger.info(f"Recovered tool name '{tool_name}' from function_call history")
+                                    break
+                        if tool_name:
+                            break
+
+                    if not tool_name:
+                        logger.error(f"Could not determine tool name for tool_call_id: {tool_call_id}")
+                        tool_name = "unknown"
 
                 gemini_contents.append(
                     {
