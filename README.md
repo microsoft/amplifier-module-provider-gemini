@@ -29,9 +29,24 @@ Provides access to Google's Gemini 2.5 models (Flash, Pro, Flash-Lite) as an LLM
 
 ## Supported Models
 
-- `gemini-2.5-flash` - Balanced performance and cost with 1M context window (recommended, default)
-- `gemini-2.5-pro` - Most powerful thinking model for complex reasoning
-- `gemini-2.5-flash-lite` - Fastest and most cost-efficient model
+**Current support**: Text generation, tool calling, and thinking. Multimodal capabilities (images, video, audio) are not yet implemented.
+
+### Gemini 3.0 (Latest - Preview)
+
+- `gemini-3-pro-preview` - Best model for advanced reasoning and text generation (1M context, 65.5K output)
+
+### Gemini 2.5 (Stable - Recommended)
+
+- `gemini-2.5-flash` - Best price-performance for large-scale processing (1M context, default)
+- `gemini-2.5-pro` - State-of-the-art thinking model for complex reasoning (1M context)
+- `gemini-2.5-flash-lite` - Fastest model optimized for cost-efficiency (1M context)
+
+### Gemini 2.0 (Stable)
+
+- `gemini-2.0-flash` - Well-rounded capabilities with focus on price-performance (1M context)
+- `gemini-2.0-flash-lite` - Optimized for cost efficiency and low latency (1M context)
+
+**Note**: Image/video/audio models not listed as the provider doesn't support multimodal capabilities yet.
 
 ## Configuration
 
