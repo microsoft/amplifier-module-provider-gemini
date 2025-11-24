@@ -11,7 +11,13 @@ A test profile configured to use the local Gemini provider with debug logging en
 **Usage from this repository:**
 
 ```bash
-# Basic test
+# IMPORTANT: First set the environment variable to use local code
+export AMPLIFIER_MODULE_PROVIDER_GEMINI=$(pwd)
+
+# Set your API key
+export GOOGLE_API_KEY="your-api-key-here"
+
+# Now run tests
 amplifier run --profile gemini-test "Hello, can you test the Gemini provider?"
 
 # Test with tool usage
@@ -22,7 +28,7 @@ amplifier run --profile gemini-test "Explain the design patterns in this codebas
 ```
 
 **Configuration:**
-- Provider source: `file://.` (uses local provider code)
+- Provider source: Environment variable `AMPLIFIER_MODULE_PROVIDER_GEMINI` points to local code
 - Debug logging: Enabled by default
 - Raw debug: Disabled (edit profile to enable ultra-verbose logging)
 - Model: `gemini-2.5-flash` (balanced performance)
@@ -32,6 +38,10 @@ amplifier run --profile gemini-test "Explain the design patterns in this codebas
 Before testing, ensure you have:
 
 ```bash
+# Point to local provider code (from the provider repository root)
+export AMPLIFIER_MODULE_PROVIDER_GEMINI=$(pwd)
+
+# Set your Google API key
 export GOOGLE_API_KEY="your-api-key-here"
 ```
 

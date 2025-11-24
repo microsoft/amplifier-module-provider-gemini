@@ -8,12 +8,12 @@ session:
   orchestrator:
     module: loop-basic
     source: git+https://github.com/microsoft/amplifier-module-loop-basic@main
-  context: context-simple
+  context:
+    module: context-simple
+    source: git+https://github.com/microsoft/amplifier-module-context-simple@main
 
 providers:
   - module: provider-gemini
-    source: file://.
-    name: gemini
     config:
       default_model: gemini-2.5-flash
       max_tokens: 8192
@@ -28,8 +28,6 @@ tools:
     source: git+https://github.com/microsoft/amplifier-module-tool-bash@main
   - module: tool-filesystem
     source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
-  - module: context-simple
-    source: git+https://github.com/microsoft/amplifier-module-context-simple@main
 ---
 
 # Gemini Provider Test Profile
@@ -38,15 +36,20 @@ This profile is configured to test the local Gemini provider with debug logging 
 
 ## Usage
 
-From the Gemini provider repository:
+**IMPORTANT**: To test the local provider code, set the environment variable first:
 
 ```bash
-# Run with this profile
+# From the Gemini provider repository root
+export AMPLIFIER_MODULE_PROVIDER_GEMINI=$(pwd)
+
+# Now run with this profile
 amplifier run --profile gemini-test "Hello, can you test the Gemini provider?"
 
-# Enable raw debug logging
-amplifier run --profile gemini-test "Test with raw debug" # Edit profile to set raw_debug: true first
+# Test with tool usage
+amplifier run --profile gemini-test "List files in the current directory"
 ```
+
+To enable raw debug logging, edit this profile and set `raw_debug: true` in the provider config.
 
 ## Configuration
 

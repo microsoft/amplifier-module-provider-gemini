@@ -13,8 +13,6 @@ from typing import Any
 from typing import Optional
 
 from amplifier_core import ModuleCoordinator
-from amplifier_core import ProviderResponse
-from amplifier_core import ToolCall
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
@@ -23,6 +21,7 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
 from amplifier_core.message_models import Usage
+from amplifier_core.models import ToolCall
 from google import genai
 
 logger = logging.getLogger(__name__)
@@ -173,207 +172,46 @@ class GeminiProvider:
             name=tool_name,
         )
 
-    async def complete(self, messages: list[dict] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
+    async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
-        Complete a chat request.
+        Generate completion from ChatRequest.
 
         Args:
-            messages: Either list of message dicts or ChatRequest object
-            **kwargs: Additional parameters (model, temperature, max_tokens)
+            request: Typed chat request with messages, tools, config
+            **kwargs: Provider-specific options (override request fields)
 
         Returns:
-            ProviderResponse or ChatResponse depending on input type
+            ChatResponse with content blocks, tool calls, usage
         """
-        # Handle ChatRequest format with validation
-        if isinstance(messages, ChatRequest):
-            # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
-            missing = self._find_missing_tool_results(messages.messages)
+        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
+        missing = self._find_missing_tool_results(request.messages)
 
-            if missing:
-                logger.warning(
-                    f"[PROVIDER] Gemini: Detected {len(missing)} missing tool result(s). "
-                    f"Injecting synthetic errors. This indicates a bug in context management. "
-                    f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
-                )
-
-                # Inject synthetic results
-                for call_id, tool_name, _ in missing:
-                    synthetic = self._create_synthetic_result(call_id, tool_name)
-                    messages.messages.append(synthetic)
-
-                # Emit observability event
-                if self.coordinator and hasattr(self.coordinator, "hooks"):
-                    await self.coordinator.hooks.emit(
-                        "provider:tool_sequence_repaired",
-                        {
-                            "provider": self.name,
-                            "repair_count": len(missing),
-                            "repairs": [
-                                {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
-                            ],
-                        },
-                    )
-
-            return await self._complete_chat_request(messages, **kwargs)
-
-        # Legacy dict format - convert to Gemini format
-        system_instruction, gemini_contents = self._convert_messages(messages)
-
-        # Prepare request parameters
-        model = kwargs.get("model", self.default_model)
-        temperature = kwargs.get("temperature", self.temperature)
-        max_tokens = kwargs.get("max_tokens", self.max_tokens)
-
-        # Build Gemini config
-        config = genai.types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens)
-
-        if system_instruction:
-            config.system_instruction = system_instruction
-
-        # Emit llm:request event
-        if self.coordinator and hasattr(self.coordinator, "hooks"):
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": "gemini",
-                    "model": model,
-                    "message_count": len(gemini_contents),
-                },
+        if missing:
+            logger.warning(
+                f"[PROVIDER] Gemini: Detected {len(missing)} missing tool result(s). "
+                f"Injecting synthetic errors. This indicates a bug in context management. "
+                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
             )
 
-            # DEBUG level: With truncated values
-            if self.debug:
-                request_dict = {
-                    "model": model,
-                    "messages": gemini_contents,
-                    "system_instruction": system_instruction,
-                    "temperature": temperature,
-                    "max_output_tokens": max_tokens,
-                }
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "gemini",
-                        "request": self._truncate_values(request_dict),
-                    },
-                )
+            # Inject synthetic results
+            for call_id, tool_name, _ in missing:
+                synthetic = self._create_synthetic_result(call_id, tool_name)
+                request.messages.append(synthetic)
 
-            # RAW level: Complete untruncated request (ultra-verbose)
-            if self.debug and self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "gemini",
-                        "request": {
-                            "model": model,
-                            "messages": gemini_contents,
-                            "system_instruction": system_instruction,
-                            "temperature": temperature,
-                            "max_output_tokens": max_tokens,
-                        },
-                    },
-                )
-
-        start_time = time.time()
-        try:
-            # Call Gemini API (use .aio for async)
-            response = await asyncio.wait_for(
-                self.client.aio.models.generate_content(model=model, contents=gemini_contents, config=config),
-                timeout=self.timeout,
-            )
-
-            elapsed_ms = int((time.time() - start_time) * 1000)
-
-            # Validate response structure
-            if not response.candidates or len(response.candidates) == 0:
-                raise ValueError("Gemini API returned no candidates in response")
-
-            if not hasattr(response.candidates[0], "content") or not response.candidates[0].content:
-                raise ValueError("Gemini API response candidate has no content")
-
-            # Parse response - text only for now (no tools/thinking yet)
-            content_blocks = []
-            text_parts = []
-
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, "text") and part.text:
-                    text_parts.append(part.text)
-                    content_blocks.append(TextContent(text=part.text, raw=part))
-
-            content = "\n\n".join(text_parts)
-
-            # Emit llm:response event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                usage_data = {}
-                if hasattr(response, "usage_metadata"):
-                    usage_data = {
-                        "input": response.usage_metadata.prompt_token_count,
-                        "output": response.usage_metadata.candidates_token_count,
-                    }
-
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "gemini",
-                        "model": model,
-                        "usage": usage_data,
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                    },
-                )
-
-                # DEBUG level: With truncated values
-                if self.debug:
-                    response_dict = {"content": content}
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "gemini",
-                            "response": self._truncate_values(response_dict),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
-
-                # RAW level: Complete untruncated response (ultra-verbose)
-                if self.debug and self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "gemini",
-                            "response": {"content": content, "raw": str(response)[:1000]},
-                        },
-                    )
-
-            return ProviderResponse(
-                content=content,
-                raw=response,
-                usage=usage_data,
-                content_blocks=content_blocks if content_blocks else None,
-            )
-
-        except Exception as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"Gemini API error: {e}")
-
+            # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
-                    "llm:response",
+                    "provider:tool_sequence_repaired",
                     {
-                        "provider": "gemini",
-                        "model": model,
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": str(e),
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                        ],
                     },
                 )
 
-            raise
+        return await self._complete_chat_request(request, **kwargs)
 
     async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
         """
@@ -644,27 +482,32 @@ class GeminiProvider:
         # Build metadata with usage including thought tokens
         metadata = {"raw_response": response}
         usage = None
-        if hasattr(response, "usage_metadata"):
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
             # Gemini includes thoughtsTokenCount in usage metadata when thinking is used
+            # Use getattr with defaults to handle missing fields
+            input_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            output_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
+
             usage = Usage(
-                input_tokens=response.usage_metadata.prompt_token_count,
-                output_tokens=response.usage_metadata.candidates_token_count,
-                total_tokens=response.usage_metadata.total_token_count,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
             )
 
         return ChatResponse(
             content=content_blocks, tool_calls=tool_calls if tool_calls else None, usage=usage, metadata=metadata
         )
 
-    def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
+    def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
         """
-        Parse tool calls from provider response.
+        Parse tool calls from ChatResponse.
 
         Filters out tool calls with empty/missing arguments to handle
         Gemini API quirk where empty function_call blocks are sometimes generated.
 
         Args:
-            response: Provider response
+            response: Chat response
 
         Returns:
             List of valid tool calls (with non-empty arguments)
@@ -672,20 +515,7 @@ class GeminiProvider:
         if not response.tool_calls:
             return []
 
-        # Filter out tool calls with empty arguments (Gemini API quirk)
-        # Gemini sometimes generates function_call blocks with empty args {}
-        valid_calls = []
-        for tc in response.tool_calls:
-            # Skip tool calls with no arguments or empty dict
-            if not tc.arguments:
-                logger.debug(f"Filtering out tool '{tc.tool}' with empty arguments")
-                continue
-            valid_calls.append(tc)
-
-        if len(valid_calls) < len(response.tool_calls):
-            logger.info(f"Filtered {len(response.tool_calls) - len(valid_calls)} tool calls with empty arguments")
-
-        return valid_calls
+        return response.tool_calls
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
         """
@@ -730,20 +560,31 @@ class GeminiProvider:
 
                 # Add text content if present
                 if content:
-                    parts.append({"text": content})
+                    if isinstance(content, list):
+                        # Content is a list of blocks - extract text blocks only
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                parts.append({"text": block.get("text", "")})
+                            elif isinstance(block, dict) and block.get("type") == "thinking":
+                                # Gemini doesn't have thinking in input, skip
+                                pass
+                            elif isinstance(block, dict) and block.get("type") == "tool_call":
+                                # Tool calls handled separately below
+                                pass
+                    else:
+                        # Content is a simple string
+                        parts.append({"text": content})
 
                 # Handle tool calls
                 if "tool_calls" in msg and msg["tool_calls"]:
                     for tc in msg["tool_calls"]:
-                        # Generate synthetic ID if not present
-                        tool_call_id = tc.get("id")
-                        if not tool_call_id:
-                            tool_call_id = self._generate_tool_call_id()
+                        # Extract name - handle both old format (tool) and new format (name)
+                        tool_name = tc.get("name") or tc.get("tool", "")
 
                         parts.append(
                             {
                                 "function_call": {
-                                    "name": tc.get("tool", ""),
+                                    "name": tool_name,
                                     "args": tc.get("arguments", {}),
                                 }
                             }
