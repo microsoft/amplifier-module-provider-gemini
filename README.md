@@ -42,8 +42,34 @@ name = "gemini"
 config = {
     default_model = "gemini-2.5-flash",
     max_tokens = 8192,
-    temperature = 0.7
+    temperature = 0.7,
+    debug = false,
+    raw_debug = false
 }
+```
+
+### Debug Configuration
+
+**Standard Debug** (`debug: true`):
+- Emits `llm:request:debug` and `llm:response:debug` events
+- Contains request/response summaries with truncated values (default 180 chars)
+- Moderate log volume, suitable for development
+
+**Raw Debug** (`debug: true, raw_debug: true`):
+- Emits `llm:request:raw` and `llm:response:raw` events
+- Contains complete, unmodified request params and response objects
+- Extreme log volume, use only for deep provider integration debugging
+- Captures the exact data sent to/from Gemini API before any processing
+
+**Example**:
+```yaml
+providers:
+  - module: provider-gemini
+    config:
+      debug: true           # Enable debug events
+      raw_debug: true       # Enable raw API I/O capture
+      debug_truncate_length: 180  # Control truncation length
+      default_model: gemini-2.5-flash
 ```
 
 ### Configuration Options
@@ -56,7 +82,9 @@ config = {
 | `temperature` | float | 0.7 | Sampling temperature (0.0-1.0) |
 | `timeout` | float | 300.0 | API timeout in seconds |
 | `priority` | int | 100 | Provider selection priority |
-| `debug` | bool | false | Enable full request/response logging |
+| `debug` | bool | false | Enable debug-level logging with truncated values |
+| `raw_debug` | bool | false | Enable ultra-verbose raw API I/O logging (requires debug=true) |
+| `debug_truncate_length` | int | 180 | Maximum string length in debug logs |
 
 ## Environment Variables
 

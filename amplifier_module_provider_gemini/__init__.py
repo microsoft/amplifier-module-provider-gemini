@@ -22,6 +22,7 @@ from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
+from amplifier_core.message_models import Usage
 from google import genai
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     return cleanup
 
 
+class GeminiChatResponse(ChatResponse):
+    """ChatResponse with additional fields for streaming UI compatibility."""
+
+    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    text: str | None = None
+
+
 class GeminiProvider:
     """Google Gemini API integration."""
 
@@ -86,6 +94,84 @@ class GeminiProvider:
         self.timeout = self.config.get("timeout", 300.0)
         self.priority = self.config.get("priority", 100)
         self.debug = self.config.get("debug", False)
+        self.raw_debug = self.config.get("raw_debug", False)
+        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
+
+    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
+        """Recursively truncate string values in nested structures.
+
+        Preserves structure, only truncates leaf string values longer than max_length.
+        Uses self.debug_truncate_length if max_length not specified.
+
+        Args:
+            obj: Any JSON-serializable structure (dict, list, primitives)
+            max_length: Maximum string length (defaults to self.debug_truncate_length)
+
+        Returns:
+            Structure with truncated string values
+        """
+        if max_length is None:
+            max_length = self.debug_truncate_length
+
+        # Type guard: max_length is guaranteed to be int after this point
+        assert max_length is not None, "max_length should never be None after initialization"
+
+        if isinstance(obj, str):
+            if len(obj) > max_length:
+                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+            return obj
+        if isinstance(obj, dict):
+            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._truncate_values(item, max_length) for item in obj]
+        return obj  # Numbers, booleans, None pass through unchanged
+
+    def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[str, str, dict]]:
+        """Find tool calls without matching results.
+
+        Scans conversation for assistant tool calls and validates each has
+        a corresponding tool result message. Returns missing pairs.
+
+        Returns:
+            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+        """
+        tool_calls = {}  # {call_id: (name, args)}
+        tool_results = set()  # {call_id}
+
+        for msg in messages:
+            # Check assistant messages for ToolCallBlock in content
+            if msg.role == "assistant" and isinstance(msg.content, list):
+                for block in msg.content:
+                    if hasattr(block, "type") and block.type == "tool_call":
+                        tool_calls[block.id] = (block.name, block.input)
+
+            # Check tool messages for tool_call_id
+            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+                tool_results.add(msg.tool_call_id)
+
+        return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
+
+    def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
+        """Create synthetic error result for missing tool response.
+
+        This is a BACKUP for when tool results go missing AFTER execution.
+        The orchestrator should handle tool execution errors at runtime,
+        so this should only trigger on context/parsing bugs.
+        """
+        return Message(
+            role="tool",
+            content=(
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Call ID: {call_id}\n\n"
+                f"This indicates the tool result was lost after execution.\n"
+                f"Likely causes: context compaction bug, message parsing error, or state corruption.\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and offer to retry the operation."
+            ),
+            tool_call_id=call_id,
+            name=tool_name,
+        )
 
     async def complete(self, messages: list[dict] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
         """
@@ -98,8 +184,36 @@ class GeminiProvider:
         Returns:
             ProviderResponse or ChatResponse depending on input type
         """
-        # Handle ChatRequest format
+        # Handle ChatRequest format with validation
         if isinstance(messages, ChatRequest):
+            # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
+            missing = self._find_missing_tool_results(messages.messages)
+
+            if missing:
+                logger.warning(
+                    f"[PROVIDER] Gemini: Detected {len(missing)} missing tool result(s). "
+                    f"Injecting synthetic errors. This indicates a bug in context management. "
+                    f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+                )
+
+                # Inject synthetic results
+                for call_id, tool_name, _ in missing:
+                    synthetic = self._create_synthetic_result(call_id, tool_name)
+                    messages.messages.append(synthetic)
+
+                # Emit observability event
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:tool_sequence_repaired",
+                        {
+                            "provider": self.name,
+                            "repair_count": len(missing),
+                            "repairs": [
+                                {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                            ],
+                        },
+                    )
+
             return await self._complete_chat_request(messages, **kwargs)
 
         # Legacy dict format - convert to Gemini format
@@ -121,28 +235,43 @@ class GeminiProvider:
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "data": {
-                        "provider": "gemini",
-                        "model": model,
-                        "message_count": len(gemini_contents),
-                    }
+                    "provider": "gemini",
+                    "model": model,
+                    "message_count": len(gemini_contents),
                 },
             )
 
+            # DEBUG level: With truncated values
             if self.debug:
+                request_dict = {
+                    "model": model,
+                    "messages": gemini_contents,
+                    "system_instruction": system_instruction,
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                }
                 await self.coordinator.hooks.emit(
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "gemini",
-                            "request": {
-                                "model": model,
-                                "messages": gemini_contents,
-                                "system_instruction": system_instruction,
-                                "temperature": temperature,
-                                "max_output_tokens": max_tokens,
-                            },
+                        "provider": "gemini",
+                        "request": self._truncate_values(request_dict),
+                    },
+                )
+
+            # RAW level: Complete untruncated request (ultra-verbose)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "gemini",
+                        "request": {
+                            "model": model,
+                            "messages": gemini_contents,
+                            "system_instruction": system_instruction,
+                            "temperature": temperature,
+                            "max_output_tokens": max_tokens,
                         },
                     },
                 )
@@ -184,32 +313,40 @@ class GeminiProvider:
                         "output": response.usage_metadata.candidates_token_count,
                     }
 
+                # INFO level: Summary only
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "gemini",
-                            "model": model,
-                            "usage": usage_data,
-                        },
+                        "provider": "gemini",
+                        "model": model,
+                        "usage": usage_data,
                         "status": "ok",
                         "duration_ms": elapsed_ms,
                     },
                 )
 
+                # DEBUG level: With truncated values
                 if self.debug:
+                    response_dict = {"content": content}
                     await self.coordinator.hooks.emit(
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "gemini",
-                                "response": {
-                                    "content": content[:500] + "..." if len(content) > 500 else content,
-                                },
-                            },
+                            "provider": "gemini",
+                            "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Complete untruncated response (ultra-verbose)
+                if self.debug and self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "gemini",
+                            "response": {"content": content, "raw": str(response)[:1000]},
                         },
                     )
 
@@ -316,32 +453,48 @@ class GeminiProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # INFO level: Summary only
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
-                    "data": {
-                        "provider": "gemini",
-                        "model": model,
-                        "message_count": len(all_messages),
-                        "has_system": bool(system_instruction),
-                    }
+                    "provider": "gemini",
+                    "model": model,
+                    "message_count": len(all_messages),
+                    "has_system": bool(system_instruction),
                 },
             )
 
+            # DEBUG level: With truncated values
             if self.debug:
+                request_dict = {
+                    "model": model,
+                    "messages": all_messages,
+                    "system_instruction": system_instruction,
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                }
                 await self.coordinator.hooks.emit(
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
-                        "data": {
-                            "provider": "gemini",
-                            "request": {
-                                "model": model,
-                                "messages": all_messages,
-                                "system_instruction": system_instruction,
-                                "temperature": temperature,
-                                "max_output_tokens": max_tokens,
-                            },
+                        "provider": "gemini",
+                        "request": self._truncate_values(request_dict),
+                    },
+                )
+
+            # RAW level: Complete untruncated request (ultra-verbose)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "gemini",
+                        "request": {
+                            "model": model,
+                            "messages": all_messages,
+                            "system_instruction": system_instruction,
+                            "temperature": temperature,
+                            "max_output_tokens": max_tokens,
                         },
                     },
                 )
@@ -376,37 +529,45 @@ class GeminiProvider:
                         "output": response.usage_metadata.candidates_token_count,
                     }
 
+                # INFO level: Summary only
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
-                        "data": {
-                            "provider": "gemini",
-                            "model": model,
-                            "usage": usage_data,
-                        },
+                        "provider": "gemini",
+                        "model": model,
+                        "usage": usage_data,
                         "status": "ok",
                         "duration_ms": elapsed_ms,
                     },
                 )
 
+                # DEBUG level: With truncated values
                 if self.debug:
-                    # Truncate content preview to avoid huge debug logs
-                    content_preview = str(response.candidates[0].content.parts)[:500]
-                    if len(str(response.candidates[0].content.parts)) > 500:
-                        content_preview += "... (truncated)"
-
+                    response_dict = {
+                        "content_parts": str(response.candidates[0].content.parts),
+                    }
                     await self.coordinator.hooks.emit(
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
-                            "data": {
-                                "provider": "gemini",
-                                "response": {
-                                    "content_preview": content_preview,
-                                },
-                            },
+                            "provider": "gemini",
+                            "response": self._truncate_values(response_dict),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Complete untruncated response (ultra-verbose)
+                if self.debug and self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "gemini",
+                            "response": {
+                                "content_parts": str(response.candidates[0].content.parts),
+                                "raw": str(response)[:1000],
+                            },
                         },
                     )
 
@@ -482,15 +643,18 @@ class GeminiProvider:
 
         # Build metadata with usage including thought tokens
         metadata = {"raw_response": response}
+        usage = None
         if hasattr(response, "usage_metadata"):
             # Gemini includes thoughtsTokenCount in usage metadata when thinking is used
-            metadata["usage"] = {
-                "input_tokens": response.usage_metadata.prompt_token_count,
-                "output_tokens": response.usage_metadata.candidates_token_count,
-                "total_tokens": response.usage_metadata.total_token_count,
-            }
+            usage = Usage(
+                input_tokens=response.usage_metadata.prompt_token_count,
+                output_tokens=response.usage_metadata.candidates_token_count,
+                total_tokens=response.usage_metadata.total_token_count,
+            )
 
-        return ChatResponse(content=content_blocks, tool_calls=tool_calls if tool_calls else None, metadata=metadata)
+        return ChatResponse(
+            content=content_blocks, tool_calls=tool_calls if tool_calls else None, usage=usage, metadata=metadata
+        )
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
         """
