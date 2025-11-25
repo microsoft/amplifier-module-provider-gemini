@@ -35,6 +35,12 @@ If you have Amplifier installed via `uv tool install amplifier`, add the Gemini 
    ---
    ```
 
+   **Available models with this provider:**
+   - **Gemini Flash** - `gemini-2.5-flash` - Balanced performance with 1M token context
+   - **Gemini Flash-Lite** - `gemini-2.5-flash-lite` - Fastest and most cost-efficient model
+   - **Gemini Pro** - `gemini-2.5-pro` - Most powerful model with extended thinking capabilities
+   - **Gemini 3.0 (Preview)** - `gemini-3-pro-preview` - Best model for advanced reasoning and text generation
+
 3. **Use it**:
    ```bash
    amplifier run --profile gemini "Hello from Gemini!"
