@@ -171,7 +171,7 @@ providers:
       max_tokens: 65536  # Full 65K output capacity
 ```
 
-**Thinking** (complex reasoning):
+**Thinking** (complex reasoning with full 1M context):
 ```yaml
 session:
   orchestrator:
@@ -179,6 +179,7 @@ session:
     source: git+https://github.com/microsoft/amplifier-module-loop-streaming@main
     config:
       extended_thinking: true  # Show thinking content
+      max_context_tokens: 1048576  # Use full 1M input context
 
 providers:
   - module: provider-gemini
