@@ -21,9 +21,9 @@ If you have Amplifier installed via `uv tool install amplifier`, add the Gemini 
      extends: developer-expertise:dev
 
    session:
-     orchestrator:
+     context:
        config:
-         max_context_tokens: 1048576  # Full 1M input context
+         max_tokens: 1048576  # Full 1M input context
 
    providers:
      - module: provider-gemini
@@ -212,12 +212,15 @@ providers:
 **Thinking** (complex reasoning with full 1M context):
 ```yaml
 session:
+  context:
+    config:
+      max_tokens: 1048576  # Full 1M input context
+
   orchestrator:
     module: loop-streaming
     source: git+https://github.com/microsoft/amplifier-module-loop-streaming@main
     config:
       extended_thinking: true  # Show thinking content
-      max_context_tokens: 1048576  # Use full 1M input context
 
 providers:
   - module: provider-gemini
