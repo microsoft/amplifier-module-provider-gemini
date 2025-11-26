@@ -32,6 +32,7 @@ If you have Amplifier installed via `uv tool install amplifier`, add the Gemini 
          default_model: gemini-2.5-flash
          max_tokens: 65536  # Full 65K output capacity
          temperature: 0.7
+         priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
    ---
 
    ## Available models with this provider
@@ -182,6 +183,7 @@ If you have Amplifier installed via `uv tool install amplifier`, add the Gemini 
          default_model: gemini-2.5-flash
          max_tokens: 65536  # Use full 65K output capacity
          temperature: 0.7
+         priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
    ---
    ```
 
@@ -202,6 +204,7 @@ providers:
       default_model: gemini-2.5-flash
       max_tokens: 65536  # Use full 65K output capacity
       temperature: 0.7
+      priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
 ```
 
 ### Example Profiles
@@ -214,6 +217,7 @@ providers:
     config:
       default_model: gemini-2.5-flash
       max_tokens: 65536  # Full 65K output capacity
+      priority: 50  # Lower number = higher priority
 ```
 
 **Thinking** (complex reasoning with full 1M context):
@@ -236,6 +240,7 @@ providers:
       default_model: gemini-2.5-pro
       max_tokens: 65536  # Full 65K output capacity
       temperature: 1.0
+      priority: 50  # Lower number = higher priority
 ```
 
 **Fast** (simple queries, low cost):
@@ -247,6 +252,7 @@ providers:
       default_model: gemini-2.5-flash-lite
       max_tokens: 65536  # Full 65K output capacity
       temperature: 0.5
+      priority: 50  # Lower number = higher priority
 ```
 
 ## Features
