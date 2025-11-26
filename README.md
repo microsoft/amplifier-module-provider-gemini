@@ -2,8 +2,38 @@
 
 Google Gemini model integration for Amplifier via Google AI API.
 
-## Quick start
-If you have Amplifier installed via `uv tool install amplifier`, add the Gemini provider to your profiles:
+## Quick Start
+
+### Option 1: Install as Module (Recommended)
+
+The simplest way to use Gemini with Amplifier. Once installed, Amplifier will automatically discover it.
+
+1. **Set your API key**:
+   ```bash
+   export GOOGLE_API_KEY="your-api-key-here"
+   ```
+   Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
+
+2. **Add the module**:
+   ```bash
+   amplifier module add provider-gemini --source git+https://github.com/microsoft/amplifier-module-provider-gemini@main --global
+   ```
+
+3. **Use Gemini as your provider**:
+   ```bash
+   amplifier provider use gemini --global
+   ```
+
+4. **Start using it**:
+   ```bash
+   amplifier run "Hello from Gemini!"
+   ```
+
+That's it! The module is now available for all your projects. Use `--project` instead of `--global` to install for just the current project.
+
+### Option 2: Via Profile
+
+For more control over configuration, add the Gemini provider to a profile:
 
 1. **Set your API key**:
    ```bash
@@ -159,42 +189,11 @@ Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
 ### For End Users
 
-If you have Amplifier installed via `uv tool install amplifier`, add the Gemini provider to your profiles:
-
-1. **Set your API key**:
-   ```bash
-   export GOOGLE_API_KEY="your-api-key-here"
-   ```
-   Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
-
-2. **Create a profile** in `~/.amplifier/profiles/gemini.md`:
-   ```yaml
-   ---
-   profile:
-     name: gemini
-     version: 1.0.0
-     description: Gemini provider profile
-     extends: developer-expertise:dev
-
-   providers:
-     - module: provider-gemini
-       source: git+https://github.com/robotdad/amplifier-module-provider-gemini@main
-       config:
-         default_model: gemini-2.5-flash
-         max_tokens: 65536  # Use full 65K output capacity
-         temperature: 0.7
-         priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
-   ---
-   ```
-
-3. **Use it**:
-   ```bash
-   amplifier run --profile gemini "Hello from Gemini!"
-   ```
+See the [Quick Start](#quick-start) section above for the simplest installation method using `amplifier module add`.
 
 ### In Profile Configuration
 
-To add Gemini to any existing profile:
+For advanced configuration, add Gemini to any existing profile:
 
 ```yaml
 providers:
