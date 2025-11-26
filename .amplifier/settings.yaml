@@ -1,0 +1,4 @@
+# Local development settings
+# This tells amplifier to use the local provider code instead of fetching from git
+sources:
+  provider-gemini: file://.

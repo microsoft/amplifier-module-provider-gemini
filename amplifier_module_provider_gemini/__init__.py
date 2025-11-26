@@ -12,7 +12,10 @@ from contextlib import suppress
 from typing import Any
 from typing import Optional
 
+from amplifier_core import ConfigField
+from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
+from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
@@ -95,6 +98,138 @@ class GeminiProvider:
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="gemini",
+            display_name="Google Gemini",
+            credential_env_vars=["GOOGLE_API_KEY"],
+            capabilities=["streaming", "tools", "thinking", "json_mode", "batch"],
+            defaults={
+                "model": "gemini-2.5-flash",
+                "max_tokens": 8192,
+                "temperature": 0.7,
+                "timeout": 300.0,
+            },
+            config_fields=[
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="Enter your Google AI API key",
+                    env_var="GOOGLE_API_KEY",
+                ),
+                ConfigField(
+                    id="thinking_budget",
+                    display_name="Thinking Budget",
+                    field_type="choice",
+                    prompt="Select thinking budget (-1 = dynamic, 0 = disabled)",
+                    choices=["-1 (dynamic)", "0 (disabled)", "8192", "16384", "32768"],
+                    default="-1 (dynamic)",
+                    required=False,
+                    requires_model=True,
+                    show_when={"default_model": "gemini-2.5-flash"},
+                ),
+            ],
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available Gemini models.
+
+        Attempts to query the API dynamically, falls back to hardcoded list.
+        """
+        try:
+            models = []
+            async for model in await self.client.aio.models.list():
+                model_name = getattr(model, "name", "")
+                # Filter to gemini models only (exclude tuned models, etc.)
+                if not model_name or "gemini" not in model_name.lower():
+                    continue
+
+                # Extract model ID from name (format: models/gemini-2.5-flash)
+                model_id = model_name.split("/")[-1] if "/" in model_name else model_name
+
+                # Skip experimental/deprecated models
+                if "exp" in model_id or "001" in model_id or "002" in model_id:
+                    continue
+
+                display_name = getattr(model, "display_name", model_id)
+                input_limit = getattr(model, "input_token_limit", 1048576)
+                output_limit = getattr(model, "output_token_limit", 8192)
+                supports_thinking = getattr(model, "thinking", False)
+
+                # Determine capabilities based on model
+                capabilities = ["streaming", "json_mode"]
+                if supports_thinking or "2.5" in model_id or "3" in model_id:
+                    capabilities.append("thinking")
+                # All gemini models except 2.0-flash-lite support tools
+                if "2.0-flash-lite" not in model_id:
+                    capabilities.append("tools")
+                if "flash" in model_id.lower():
+                    capabilities.append("fast")
+
+                models.append(
+                    ModelInfo(
+                        id=model_id,
+                        display_name=display_name,
+                        context_window=input_limit,
+                        max_output_tokens=output_limit,
+                        capabilities=capabilities,
+                        defaults={"temperature": 0.7, "max_tokens": min(8192, output_limit)},
+                    )
+                )
+
+            if models:
+                return models
+
+        except Exception as e:
+            logger.debug(f"Failed to list Gemini models dynamically: {e}")
+
+        # Fallback to hardcoded list based on official docs
+        return [
+            ModelInfo(
+                id="gemini-2.5-flash",
+                display_name="Gemini 2.5 Flash",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-2.5-pro",
+                display_name="Gemini 2.5 Pro",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-2.5-flash-lite",
+                display_name="Gemini 2.5 Flash-Lite",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-2.0-flash",
+                display_name="Gemini 2.0 Flash",
+                context_window=1048576,
+                max_output_tokens=8192,
+                capabilities=["tools", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-3-pro-preview",
+                display_name="Gemini 3 Pro (Preview)",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 1.0, "max_tokens": 8192},
+            ),
+        ]
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
