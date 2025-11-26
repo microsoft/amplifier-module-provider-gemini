@@ -5,16 +5,28 @@ profile:
   description: Test profile for Gemini provider with debug logging enabled
   extends: developer-expertise:dev
 
+session:
+  context:
+    config:
+      max_tokens: 1048576  # Full 1M input context
+
+  orchestrator:
+    module: loop-streaming
+    source: git+https://github.com/microsoft/amplifier-module-loop-streaming@main
+    config:
+      extended_thinking: true  # Display thinking content
+
 providers:
   - module: provider-gemini
     config:
-      default_model: gemini-2.5-flash
-      max_tokens: 8192
+      default_model: gemini-3-pro-preview
+      max_tokens: 65536     # Full 65K output capacity
       temperature: 0.7
       timeout: 300.0
       debug: true           # Enable debug-level logging
       raw_debug: true       # Enable ultra-verbose raw API logging
       debug_truncate_length: 180
+      priority: 1
 ---
 
 # Gemini Provider Test Profile
@@ -41,9 +53,12 @@ To enable raw debug logging, edit this profile and set `raw_debug: true` in the 
 ## Configuration
 
 - **Provider**: Local Gemini provider (file://.)
-- **Model**: gemini-2.5-flash (balanced performance)
+- **Model**: gemini-3-pro-preview (latest with advanced reasoning)
+- **Context**: 1M tokens input capacity
+- **Output**: 65K tokens max output
+- **Thinking**: Extended thinking display enabled
 - **Debug**: Enabled (debug=true) for detailed logging
-- **Raw Debug**: Disabled by default (set to true for ultra-verbose API I/O)
+- **Raw Debug**: Enabled (raw_debug=true) for ultra-verbose API I/O
 
 ## Features Being Tested
 
