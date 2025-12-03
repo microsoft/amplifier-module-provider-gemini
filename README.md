@@ -16,7 +16,7 @@ The simplest way to use Gemini with Amplifier. Once installed, Amplifier will au
 
 2. **Add the module**:
    ```bash
-   amplifier module add provider-gemini --source git+https://github.com/microsoft/amplifier-module-provider-gemini@main --global
+   amplifier module add provider-gemini --source git+https://github.com/robotdad/amplifier-module-provider-gemini@main --global
    ```
 
 3. **Use Gemini as your provider**:
