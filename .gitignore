@@ -39,5 +39,5 @@ Thumbs.db
 *.local
 .env
 
-# Amplifier local state (do not commit developer's profile choice)
-.amplifier/profile
+# Amplifier local state (do not commit developer's local config)
+.amplifier/
