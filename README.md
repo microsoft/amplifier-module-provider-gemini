@@ -325,53 +325,48 @@ The provider implements text generation, tool calling, and thinking support. Mul
 
 ## Development
 
-### Local Testing with UV-Installed Amplifier Tool
+### Local Testing with Installed Amplifier CLI
 
-When testing a local provider with a uv-installed amplifier tool (not a local build), you need to:
-
-1. **Configure module resolution** to find your local code
-2. **Install the provider's unique dependencies** into the tool's isolated Python environment
-
-**Why this is needed**: The `amplifier` tool installed via `uv tool install` runs in an isolated Python environment at `~/.local/share/uv/tools/amplifier/`. This environment has `amplifier-core` and other core libraries, but NOT your provider's specific dependencies (like `google-genai`).
-
-#### Step 1: Create Settings File
-
-Create `.amplifier/settings.yaml` in the provider repository:
-
-```yaml
-# .amplifier/settings.yaml
-sources:
-  provider-gemini: file://.
-```
-
-This tells the module resolver to use your local code instead of fetching from git/packages.
-
-#### Step 2: Install Provider Dependencies in Tool Environment
+Test your local provider changes with the installed `amplifier` CLI:
 
 ```bash
-# Install google-genai into the amplifier tool's Python environment
-uv pip install --python ~/.local/share/uv/tools/amplifier/bin/python google-genai
+# From the provider repository root
+cd amplifier-module-provider-gemini
+
+# Add your local provider (use --local for development, not --global)
+amplifier module add provider-gemini --source file://. --local
+
+# Set your API key
+export GOOGLE_API_KEY="your-api-key-here"
+
+# Now you can use amplifier init and see your local provider in the menu
+amplifier init
+
+# Or configure it directly
+amplifier provider use gemini --local
+
+# Test your local changes
+amplifier run "Hello, testing local Gemini provider!"
+
+# List modules to verify your local provider is registered
+amplifier module list -t provider
 ```
 
-**Note**: This is a one-time setup. The dependency stays installed until you reinstall the amplifier tool.
-
-#### Step 3: Test with Profile
+**When you're done testing:**
 
 ```bash
-# Use the included test profile
-amplifier run --profile gemini-test "Hello, test the Gemini provider"
-
-# Or create your own test profile in your project
+# Remove the local provider registration
+amplifier module remove provider-gemini --local
 ```
 
-**Alternative**: Use environment variables (but note they only work in the same shell session):
+**Why `--local` instead of `--global`?**
+- `--local` registers the provider only for the current working directory
+- `--global` would affect all your projects (not ideal during development)
+- `--project` works if you want to share with your team
 
-```bash
-export AMPLIFIER_MODULE_PROVIDER_GEMINI=$(pwd)
-amplifier run --profile gemini-test "test"
-```
+### Unit Testing (Fastest)
 
-### Unit Testing (No Amplifier Tool Required)
+For rapid iteration without the CLI:
 
 ```bash
 cd amplifier-module-provider-gemini
@@ -379,25 +374,14 @@ cd amplifier-module-provider-gemini
 # Install dependencies
 uv sync --dev
 
-# Run tests
+# Run validation tests (protocol compliance)
 uv run pytest
 
 # Test with coverage
 uv run pytest --cov
 ```
 
-### Cleaning Up After Local Development
-
-When you're done testing locally:
-
-```bash
-# Remove the settings file (if you want to use published version)
-rm .amplifier/settings.yaml
-
-# Optional: Uninstall google-genai from tool environment
-# (Only if you're not testing other Google-based providers)
-uv pip uninstall --python ~/.local/share/uv/tools/amplifier/bin/python google-genai
-```
+These tests validate the provider implements the required protocol without needing the full CLI.
 
 ## Contributing
 
