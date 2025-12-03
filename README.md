@@ -16,7 +16,7 @@ The simplest way to use Gemini with Amplifier. Once installed, Amplifier will au
 
 2. **Add the module**:
    ```bash
-   amplifier module add provider-gemini --source git+https://github.com/robotdad/amplifier-module-provider-gemini@main --global
+   amplifier module add provider-gemini --source git+https://github.com/microsoft/amplifier-module-provider-gemini@main --global
    ```
 
 3. **Use Gemini as your provider**:
@@ -57,7 +57,7 @@ For more control over configuration, add the Gemini provider to a profile:
 
    providers:
      - module: provider-gemini
-       source: git+https://github.com/robotdad/amplifier-module-provider-gemini@main
+       source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
        config:
          default_model: gemini-2.5-flash
          max_tokens: 65536  # Full 65K output capacity
@@ -202,7 +202,7 @@ For advanced configuration, add Gemini to any existing profile:
 ```yaml
 providers:
   - module: provider-gemini
-    source: git+https://github.com/robotdad/amplifier-module-provider-gemini@main
+    source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-flash
       max_tokens: 65536  # Use full 65K output capacity
@@ -214,7 +214,7 @@ providers:
 ```yaml
 providers:
   - module: provider-gemini
-    source: git+https://github.com/robotdad/amplifier-module-provider-gemini@main
+    source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-flash
       max_tokens: 65536  # Full 65K output capacity
@@ -236,7 +236,7 @@ session:
 
 providers:
   - module: provider-gemini
-    source: git+https://github.com/robotdad/amplifier-module-provider-gemini@main
+    source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-pro
       max_tokens: 65536  # Full 65K output capacity
@@ -248,7 +248,7 @@ providers:
 ```yaml
 providers:
   - module: provider-gemini
-    source: git+https://github.com/robotdad/amplifier-module-provider-gemini@main
+    source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
       default_model: gemini-2.5-flash-lite
       max_tokens: 65536  # Full 65K output capacity
