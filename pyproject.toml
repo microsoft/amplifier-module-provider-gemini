@@ -9,12 +9,8 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "amplifier-core",
     "google-genai>=1.40.0",
 ]
-
-[tool.uv.sources]
-amplifier-core = { path = "../amplifier-core", editable = true }
 
 [project.entry-points."amplifier.modules"]
 provider-gemini = "amplifier_module_provider_gemini:mount"
