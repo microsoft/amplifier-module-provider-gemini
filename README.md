@@ -185,16 +185,20 @@ export GOOGLE_API_KEY="your-api-key-here"
 
 Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-## Getting Started
+## Usage
 
-### For End Users
+```python
+# In amplifier configuration
+[provider]
+name = "gemini"
+default_model = "gemini-2.5-flash"
+```
 
-See the [Quick Start](#quick-start) section above for the simplest installation method using `amplifier module add`.
-
-### In Profile Configuration
+## Example Profiles
 
 For advanced configuration, add Gemini to any existing profile:
 
+**Basic Configuration**:
 ```yaml
 providers:
   - module: provider-gemini
@@ -205,8 +209,6 @@ providers:
       temperature: 0.7
       priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
 ```
-
-### Example Profiles
 
 **Balanced** (1M context, cost-effective):
 ```yaml
@@ -306,6 +308,45 @@ tools = [{
 ```
 
 The provider handles tool call marshaling and response integration automatically.
+
+## Graceful Error Recovery
+
+The provider implements automatic repair for incomplete tool call sequences:
+
+**The Problem**: If tool results are missing from conversation history (due to context compaction bugs, parsing errors, or state corruption), the Gemini API rejects the entire request, breaking the user's session.
+
+**The Solution**: The provider automatically detects and repairs missing tool_results by injecting synthetic results:
+
+1. **Repair before API call** - Detects missing tool_results and injects synthetic ones
+2. **Make failures visible** - Synthetic results contain `[SYSTEM ERROR: Tool result missing]` messages
+3. **Maintain conversation validity** - API accepts repaired messages, session continues
+4. **Enable recovery** - LLM acknowledges error and can ask user to retry
+5. **Provide observability** - Emits `provider:tool_sequence_repaired` event with repair details
+
+**Example**:
+```python
+# Conversation with missing tool result
+messages = [
+    {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_call", "id": "gemini_call_abc123", "name": "get_weather", "input": {...}}
+        ]
+    },
+    # MISSING: {"role": "tool", "tool_call_id": "gemini_call_abc123", "content": "..."}
+    {"role": "user", "content": "Thanks"}
+]
+
+# Provider repairs by injecting synthetic result:
+{
+    "role": "tool",
+    "tool_call_id": "gemini_call_abc123",
+    "name": "get_weather",
+    "content": "[SYSTEM ERROR: Tool result missing from conversation history]\n\nTool: get_weather\nCall ID: gemini_call_abc123\n\nThis indicates the tool result was lost after execution.\nLikely causes: context compaction bug, message parsing error, or state corruption.\n\nThe tool may have executed successfully, but the result was lost.\nPlease acknowledge this error and offer to retry the operation."
+}
+```
+
+This is a **defense-in-depth safety net**. The orchestrator should handle tool execution errors at runtime, so this repair only triggers when results go missing due to bugs in context management.
 
 ## Known Limitations
 
