@@ -56,6 +56,22 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     await coordinator.mount("providers", provider, name="gemini")
     logger.info("Mounted GeminiProvider")
 
+    # Register observability events via contribution channels
+    coordinator.register_contributor(
+        "observability.events",
+        "provider-gemini",
+        lambda: [
+            "llm:request",
+            "llm:response",
+            "llm:request:debug",
+            "llm:response:debug",
+            "llm:request:raw",
+            "llm:response:raw",
+            "provider:tool_sequence_repaired",
+            "thinking:final",
+        ],
+    )
+
     # Return cleanup function
     async def cleanup():
         # genai.Client doesn't require explicit cleanup
