@@ -571,9 +571,11 @@ class GeminiProvider:
             # Convert to ChatResponse
             return self._convert_to_chat_response(response)
 
-        except Exception as e:
+        except TimeoutError:
+            # Handle timeout specifically - TimeoutError has empty str() representation
             elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"Gemini API error: {e}")
+            error_msg = f"Request timed out after {self.timeout}s"
+            logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
@@ -583,9 +585,31 @@ class GeminiProvider:
                         "model": model,
                         "status": "error",
                         "duration_ms": elapsed_ms,
-                        "error": str(e),
+                        "error": error_msg,
                     },
                 )
+            raise TimeoutError(error_msg) from None
+
+        except Exception as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            # Ensure error message is never empty
+            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
+
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "gemini",
+                        "model": model,
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": error_msg,
+                    },
+                )
+            # Re-raise with meaningful message if original was empty
+            if not str(e):
+                raise type(e)(error_msg) from e
             raise
 
     def _convert_to_chat_response(self, response) -> GeminiChatResponse:
