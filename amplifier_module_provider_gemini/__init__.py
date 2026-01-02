@@ -23,8 +23,8 @@ from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
-from amplifier_core.message_models import Usage
 from amplifier_core.message_models import ToolCall
+from amplifier_core.message_models import Usage
 from google import genai
 
 logger = logging.getLogger(__name__)
@@ -93,21 +93,17 @@ class GeminiProvider:
     name = "gemini"
 
     def __init__(
-        self, api_key: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
     ):
         """
         Initialize Gemini provider.
 
-        The SDK client is created lazily on first use, allowing get_info()
-        to work without valid credentials.
-
         Args:
-            api_key: Google AI API key (can be None for get_info() calls)
+            api_key: Google AI API key
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
-        self._api_key = api_key
-        self._client: genai.Client | None = None  # Lazy init
+        self.client = genai.Client(api_key=api_key)
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
@@ -118,16 +114,6 @@ class GeminiProvider:
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
-        self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
-
-    @property
-    def client(self) -> genai.Client:
-        """Lazily initialize the Gemini client on first access."""
-        if self._client is None:
-            if self._api_key is None:
-                raise ValueError("api_key must be provided for API calls. Set GEMINI_API_KEY environment variable.")
-            self._client = genai.Client(api_key=self._api_key)
-        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -168,73 +154,98 @@ class GeminiProvider:
         """
         List available Gemini models.
 
-        When filtered=True (default), returns only standard text generation models.
-        When filtered=False, returns all Gemini models including specialized ones
-        (TTS, audio, image generation) that may require special configuration.
-
-        Raises exception if API query fails (no fallback - caller handles errors).
+        Attempts to query the API dynamically, falls back to hardcoded list.
         """
-        # Patterns for specialized models that need config we don't implement
-        # These use generateContent but require responseModalities or other special setup
-        specialized_patterns = [
-            "tts",           # Text-to-speech - needs responseModalities: ["AUDIO"]
-            "native-audio",  # Audio models - needs audio config
-            "-image",        # Image generation (Nano Banana) - needs responseModalities: ["IMAGE"]
-            "robotics",      # Specialized robotics models
-            "computer-use",  # Computer use models
-        ]
-
-        models = []
-        async for model in await self.client.aio.models.list():
-            model_name = getattr(model, "name", "")
-            # Filter to gemini models only (exclude tuned models, etc.)
-            if not model_name or "gemini" not in model_name.lower():
-                continue
-
-            # Extract model ID from name (format: models/gemini-2.5-flash)
-            model_id = model_name.split("/")[-1] if "/" in model_name else model_name
-
-            # Skip experimental/deprecated models (always filter these)
-            if "exp" in model_id or "001" in model_id or "002" in model_id:
-                continue
-
-            # When filtered, skip specialized models that need config we don't support
-            if self.filtered:
-                model_id_lower = model_id.lower()
-                if any(pattern in model_id_lower for pattern in specialized_patterns):
-                    continue
-                # Also skip preview variants when we have stable versions
-                if "preview" in model_id_lower and "gemini-3" not in model_id_lower:
+        try:
+            models = []
+            async for model in await self.client.aio.models.list():
+                model_name = getattr(model, "name", "")
+                # Filter to gemini models only (exclude tuned models, etc.)
+                if not model_name or "gemini" not in model_name.lower():
                     continue
 
-            display_name = getattr(model, "display_name", model_id)
-            input_limit = getattr(model, "input_token_limit", 1048576)
-            output_limit = getattr(model, "output_token_limit", 8192)
-            supports_thinking = getattr(model, "thinking", False)
+                # Extract model ID from name (format: models/gemini-2.5-flash)
+                model_id = model_name.split("/")[-1] if "/" in model_name else model_name
 
-            # Determine capabilities based on model
-            capabilities = ["streaming", "json_mode"]
-            if supports_thinking or "2.5" in model_id or "3" in model_id:
-                capabilities.append("thinking")
-            # All gemini models except 2.0-flash-lite support tools
-            if "2.0-flash-lite" not in model_id:
-                capabilities.append("tools")
-            if "flash" in model_id.lower():
-                capabilities.append("fast")
+                # Skip experimental/deprecated models
+                if "exp" in model_id or "001" in model_id or "002" in model_id:
+                    continue
 
-            models.append(
-                ModelInfo(
-                    id=model_id,
-                    display_name=display_name,
-                    context_window=input_limit,
-                    max_output_tokens=output_limit,
-                    capabilities=capabilities,
-                    defaults={"temperature": 0.7, "max_tokens": min(8192, output_limit)},
+                display_name = getattr(model, "display_name", model_id)
+                input_limit = getattr(model, "input_token_limit", 1048576)
+                output_limit = getattr(model, "output_token_limit", 8192)
+                supports_thinking = getattr(model, "thinking", False)
+
+                # Determine capabilities based on model
+                capabilities = ["streaming", "json_mode"]
+                if supports_thinking or "2.5" in model_id or "3" in model_id:
+                    capabilities.append("thinking")
+                # All gemini models except 2.0-flash-lite support tools
+                if "2.0-flash-lite" not in model_id:
+                    capabilities.append("tools")
+                if "flash" in model_id.lower():
+                    capabilities.append("fast")
+
+                models.append(
+                    ModelInfo(
+                        id=model_id,
+                        display_name=display_name,
+                        context_window=input_limit,
+                        max_output_tokens=output_limit,
+                        capabilities=capabilities,
+                        defaults={"temperature": 0.7, "max_tokens": min(8192, output_limit)},
+                    )
                 )
-            )
 
-        # Sort alphabetically by display name
-        return sorted(models, key=lambda m: m.display_name.lower())
+            if models:
+                return models
+
+        except Exception as e:
+            logger.debug(f"Failed to list Gemini models dynamically: {e}")
+
+        # Fallback to hardcoded list based on official docs
+        return [
+            ModelInfo(
+                id="gemini-2.5-flash",
+                display_name="Gemini 2.5 Flash",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-2.5-pro",
+                display_name="Gemini 2.5 Pro",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-2.5-flash-lite",
+                display_name="Gemini 2.5 Flash-Lite",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-2.0-flash",
+                display_name="Gemini 2.0 Flash",
+                context_window=1048576,
+                max_output_tokens=8192,
+                capabilities=["tools", "streaming", "json_mode"],
+                defaults={"temperature": 0.7, "max_tokens": 8192},
+            ),
+            ModelInfo(
+                id="gemini-3-pro-preview",
+                display_name="Gemini 3 Pro (Preview)",
+                context_window=1048576,
+                max_output_tokens=65536,
+                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                defaults={"temperature": 1.0, "max_tokens": 8192},
+            ),
+        ]
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
