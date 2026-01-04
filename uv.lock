@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 [[package]]
 name = "amplifier-core"
 version = "1.0.0"
-source = { editable = "../amplifier-core" }
+source = { directory = "../amplifier-core" }
 dependencies = [
     { name = "click" },
     { name = "pydantic" },
@@ -34,7 +34,6 @@ name = "amplifier-module-provider-gemini"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
-    { name = "amplifier-core" },
     { name = "google-genai" },
 ]
 
@@ -47,14 +46,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "amplifier-core", editable = "../amplifier-core" },
-    { name = "google-genai", specifier = ">=1.40.0" },
-]
+requires-dist = [{ name = "google-genai", specifier = ">=1.40.0" }]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "amplifier-core", editable = "../amplifier-core" },
+    { name = "amplifier-core", directory = "../amplifier-core" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", specifier = ">=1.2.0" },
     { name = "ruff", specifier = ">=0.14.6" },

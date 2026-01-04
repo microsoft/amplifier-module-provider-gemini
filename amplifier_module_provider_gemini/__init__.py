@@ -846,7 +846,32 @@ class GeminiProvider:
 
             # Regular user message
             else:
-                gemini_contents.append({"role": "user", "parts": [{"text": content}]})
+                # Handle structured content (list of blocks including text and images)
+                if isinstance(content, list):
+                    parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                parts.append({"text": block.get("text", "")})
+                            elif block_type == "image":
+                                # Convert ImageBlock to Gemini inline_data format
+                                source = block.get("source", {})
+                                if source.get("type") == "base64":
+                                    parts.append({
+                                        "inline_data": {
+                                            "mime_type": source.get("media_type", "image/jpeg"),
+                                            "data": source.get("data")
+                                        }
+                                    })
+                                else:
+                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
+                    
+                    if parts:
+                        gemini_contents.append({"role": "user", "parts": parts})
+                else:
+                    # Simple string content
+                    gemini_contents.append({"role": "user", "parts": [{"text": content}]})
 
         # Combine system messages
         system_instruction = "\n\n".join(system_messages) if system_messages else None
