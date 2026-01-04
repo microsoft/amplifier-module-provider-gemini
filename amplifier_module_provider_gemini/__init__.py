@@ -93,17 +93,21 @@ class GeminiProvider:
     name = "gemini"
 
     def __init__(
-        self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self, api_key: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
     ):
         """
         Initialize Gemini provider.
 
+        The SDK client is created lazily on first use, allowing get_info()
+        to work without valid credentials.
+
         Args:
-            api_key: Google AI API key
+            api_key: Google AI API key (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
-        self.client = genai.Client(api_key=api_key)
+        self._api_key = api_key
+        self._client: genai.Client | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
@@ -115,6 +119,15 @@ class GeminiProvider:
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
         self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
+
+    @property
+    def client(self) -> genai.Client:
+        """Lazily initialize the Gemini client on first access."""
+        if self._client is None:
+            if self._api_key is None:
+                raise ValueError("api_key must be provided for API calls. Set GEMINI_API_KEY environment variable.")
+            self._client = genai.Client(api_key=self._api_key)
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
