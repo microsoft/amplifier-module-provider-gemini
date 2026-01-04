@@ -114,6 +114,7 @@ class GeminiProvider:
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
+        self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -154,9 +155,22 @@ class GeminiProvider:
         """
         List available Gemini models.
 
-        Queries the API dynamically. Raises exception if API query fails
-        (no fallback - caller handles empty lists and errors).
+        When filtered=True (default), returns only standard text generation models.
+        When filtered=False, returns all Gemini models including specialized ones
+        (TTS, audio, image generation) that may require special configuration.
+
+        Raises exception if API query fails (no fallback - caller handles errors).
         """
+        # Patterns for specialized models that need config we don't implement
+        # These use generateContent but require responseModalities or other special setup
+        specialized_patterns = [
+            "tts",           # Text-to-speech - needs responseModalities: ["AUDIO"]
+            "native-audio",  # Audio models - needs audio config
+            "-image",        # Image generation (Nano Banana) - needs responseModalities: ["IMAGE"]
+            "robotics",      # Specialized robotics models
+            "computer-use",  # Computer use models
+        ]
+
         models = []
         async for model in await self.client.aio.models.list():
             model_name = getattr(model, "name", "")
@@ -167,9 +181,18 @@ class GeminiProvider:
             # Extract model ID from name (format: models/gemini-2.5-flash)
             model_id = model_name.split("/")[-1] if "/" in model_name else model_name
 
-            # Skip experimental/deprecated models
+            # Skip experimental/deprecated models (always filter these)
             if "exp" in model_id or "001" in model_id or "002" in model_id:
                 continue
+
+            # When filtered, skip specialized models that need config we don't support
+            if self.filtered:
+                model_id_lower = model_id.lower()
+                if any(pattern in model_id_lower for pattern in specialized_patterns):
+                    continue
+                # Also skip preview variants when we have stable versions
+                if "preview" in model_id_lower and "gemini-3" not in model_id_lower:
+                    continue
 
             display_name = getattr(model, "display_name", model_id)
             input_limit = getattr(model, "input_token_limit", 1048576)
