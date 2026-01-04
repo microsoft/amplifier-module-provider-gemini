@@ -31,9 +31,9 @@ The simplest way to use Gemini with Amplifier. Once installed, Amplifier will au
 
 That's it! The module is now available for all your projects. Use `--project` instead of `--global` to install for just the current project.
 
-### Option 2: Via Profile
+### Option 2: Via Bundle
 
-For more control over configuration, add the Gemini provider to a profile:
+For more control over configuration or to compose with other capabilities, use a bundle:
 
 1. **Set your API key**:
    ```bash
@@ -41,14 +41,16 @@ For more control over configuration, add the Gemini provider to a profile:
    ```
    Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-2. **Create a profile** in `~/.amplifier/profiles/gemini.md`:
+2. **Create a bundle** in your project or home directory (e.g., `gemini-bundle/bundle.md`):
    ```yaml
    ---
-   profile:
-     name: gemini
+   bundle:
+     name: gemini-dev
      version: 1.0.0
-     description: Gemini provider profile with full 1M context
-     extends: developer-expertise:dev
+     description: Gemini provider with full 1M context
+   
+   includes:
+     - bundle: foundation
 
    session:
      context:
@@ -62,10 +64,14 @@ For more control over configuration, add the Gemini provider to a profile:
          default_model: gemini-2.5-flash
          max_tokens: 65536  # Full 65K output capacity
          temperature: 0.7
-         priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
+         priority: 50  # Lower number = higher priority (beats default 100)
    ---
 
-   ## Available models with this provider
+   # Gemini Development Bundle
+
+   This bundle configures Gemini with full context windows and includes foundation capabilities.
+
+   ## Available Models
 
    - **Gemini Flash** - `gemini-2.5-flash` - Balanced performance with 1M token context
    - **Gemini Flash-Lite** - `gemini-2.5-flash-lite` - Fastest and most cost-efficient model
@@ -75,7 +81,7 @@ For more control over configuration, add the Gemini provider to a profile:
 
 3. **Use it**:
    ```bash
-   amplifier run --profile gemini "Hello from Gemini!"
+   amplifier run --bundle ./gemini-bundle "Hello from Gemini!"
    ```
 
 ## Prerequisites
@@ -194,9 +200,9 @@ name = "gemini"
 default_model = "gemini-2.5-flash"
 ```
 
-## Example Profiles
+## Example Bundle Configurations
 
-For advanced configuration, add Gemini to any existing profile:
+For advanced configuration, add Gemini to any bundle. These examples show the YAML configuration section (the frontmatter between `---` markers in your bundle.md file):
 
 **Basic Configuration**:
 ```yaml
