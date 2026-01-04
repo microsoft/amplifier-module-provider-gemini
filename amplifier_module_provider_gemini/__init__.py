@@ -220,7 +220,8 @@ class GeminiProvider:
                 )
             )
 
-        return models
+        # Sort alphabetically by display name
+        return sorted(models, key=lambda m: m.display_name.lower())
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
