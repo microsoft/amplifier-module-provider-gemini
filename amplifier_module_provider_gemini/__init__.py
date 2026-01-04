@@ -154,98 +154,50 @@ class GeminiProvider:
         """
         List available Gemini models.
 
-        Attempts to query the API dynamically, falls back to hardcoded list.
+        Queries the API dynamically. Raises exception if API query fails
+        (no fallback - caller handles empty lists and errors).
         """
-        try:
-            models = []
-            async for model in await self.client.aio.models.list():
-                model_name = getattr(model, "name", "")
-                # Filter to gemini models only (exclude tuned models, etc.)
-                if not model_name or "gemini" not in model_name.lower():
-                    continue
+        models = []
+        async for model in await self.client.aio.models.list():
+            model_name = getattr(model, "name", "")
+            # Filter to gemini models only (exclude tuned models, etc.)
+            if not model_name or "gemini" not in model_name.lower():
+                continue
 
-                # Extract model ID from name (format: models/gemini-2.5-flash)
-                model_id = model_name.split("/")[-1] if "/" in model_name else model_name
+            # Extract model ID from name (format: models/gemini-2.5-flash)
+            model_id = model_name.split("/")[-1] if "/" in model_name else model_name
 
-                # Skip experimental/deprecated models
-                if "exp" in model_id or "001" in model_id or "002" in model_id:
-                    continue
+            # Skip experimental/deprecated models
+            if "exp" in model_id or "001" in model_id or "002" in model_id:
+                continue
 
-                display_name = getattr(model, "display_name", model_id)
-                input_limit = getattr(model, "input_token_limit", 1048576)
-                output_limit = getattr(model, "output_token_limit", 8192)
-                supports_thinking = getattr(model, "thinking", False)
+            display_name = getattr(model, "display_name", model_id)
+            input_limit = getattr(model, "input_token_limit", 1048576)
+            output_limit = getattr(model, "output_token_limit", 8192)
+            supports_thinking = getattr(model, "thinking", False)
 
-                # Determine capabilities based on model
-                capabilities = ["streaming", "json_mode"]
-                if supports_thinking or "2.5" in model_id or "3" in model_id:
-                    capabilities.append("thinking")
-                # All gemini models except 2.0-flash-lite support tools
-                if "2.0-flash-lite" not in model_id:
-                    capabilities.append("tools")
-                if "flash" in model_id.lower():
-                    capabilities.append("fast")
+            # Determine capabilities based on model
+            capabilities = ["streaming", "json_mode"]
+            if supports_thinking or "2.5" in model_id or "3" in model_id:
+                capabilities.append("thinking")
+            # All gemini models except 2.0-flash-lite support tools
+            if "2.0-flash-lite" not in model_id:
+                capabilities.append("tools")
+            if "flash" in model_id.lower():
+                capabilities.append("fast")
 
-                models.append(
-                    ModelInfo(
-                        id=model_id,
-                        display_name=display_name,
-                        context_window=input_limit,
-                        max_output_tokens=output_limit,
-                        capabilities=capabilities,
-                        defaults={"temperature": 0.7, "max_tokens": min(8192, output_limit)},
-                    )
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    display_name=display_name,
+                    context_window=input_limit,
+                    max_output_tokens=output_limit,
+                    capabilities=capabilities,
+                    defaults={"temperature": 0.7, "max_tokens": min(8192, output_limit)},
                 )
+            )
 
-            if models:
-                return models
-
-        except Exception as e:
-            logger.debug(f"Failed to list Gemini models dynamically: {e}")
-
-        # Fallback to hardcoded list based on official docs
-        return [
-            ModelInfo(
-                id="gemini-2.5-flash",
-                display_name="Gemini 2.5 Flash",
-                context_window=1048576,
-                max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
-                defaults={"temperature": 0.7, "max_tokens": 8192},
-            ),
-            ModelInfo(
-                id="gemini-2.5-pro",
-                display_name="Gemini 2.5 Pro",
-                context_window=1048576,
-                max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode"],
-                defaults={"temperature": 0.7, "max_tokens": 8192},
-            ),
-            ModelInfo(
-                id="gemini-2.5-flash-lite",
-                display_name="Gemini 2.5 Flash-Lite",
-                context_window=1048576,
-                max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
-                defaults={"temperature": 0.7, "max_tokens": 8192},
-            ),
-            ModelInfo(
-                id="gemini-2.0-flash",
-                display_name="Gemini 2.0 Flash",
-                context_window=1048576,
-                max_output_tokens=8192,
-                capabilities=["tools", "streaming", "json_mode"],
-                defaults={"temperature": 0.7, "max_tokens": 8192},
-            ),
-            ModelInfo(
-                id="gemini-3-pro-preview",
-                display_name="Gemini 3 Pro (Preview)",
-                context_window=1048576,
-                max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode"],
-                defaults={"temperature": 1.0, "max_tokens": 8192},
-            ),
-        ]
+        return models
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
