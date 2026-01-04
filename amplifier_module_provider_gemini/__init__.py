@@ -24,7 +24,7 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
 from amplifier_core.message_models import Usage
-from amplifier_core.models import ToolCall
+from amplifier_core.message_models import ToolCall
 from google import genai
 
 logger = logging.getLogger(__name__)
