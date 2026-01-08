@@ -44,12 +44,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     config = config or {}
 
     # Get API key from config or environment
+    # Per Google GenAI SDK: supports both GEMINI_API_KEY and GOOGLE_API_KEY
+    # If both are set, GOOGLE_API_KEY takes precedence
     api_key = config.get("api_key")
     if not api_key:
-        api_key = os.environ.get("GOOGLE_API_KEY")
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
     if not api_key:
-        logger.warning("No API key found for Gemini provider")
+        logger.warning("No API key found for Gemini provider (set GOOGLE_API_KEY or GEMINI_API_KEY)")
         return None
 
     provider = GeminiProvider(api_key, config, coordinator)
@@ -120,7 +122,7 @@ class GeminiProvider:
         return ProviderInfo(
             id="gemini",
             display_name="Google Gemini",
-            credential_env_vars=["GOOGLE_API_KEY"],
+            credential_env_vars=["GOOGLE_API_KEY", "GEMINI_API_KEY"],
             capabilities=["streaming", "tools", "thinking", "json_mode", "batch"],
             defaults={
                 "model": "gemini-2.5-flash",
