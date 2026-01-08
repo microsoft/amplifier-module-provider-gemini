@@ -173,7 +173,7 @@ providers:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `api_key` | string | env: `GOOGLE_API_KEY` | Google AI API key |
+| `api_key` | string | env: `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Google AI API key |
 | `default_model` | string | `gemini-2.5-flash` | Default model to use |
 | `max_tokens` | int | 8192 | Maximum output tokens |
 | `temperature` | float | 0.7 | Sampling temperature (0.0-1.0) |
@@ -185,7 +185,12 @@ providers:
 
 ## Environment Variables
 
+The provider supports both environment variables (matching the official Google GenAI SDK):
+
 ```bash
+# Either of these works (GOOGLE_API_KEY takes precedence if both are set)
+export GEMINI_API_KEY="your-api-key-here"
+# or
 export GOOGLE_API_KEY="your-api-key-here"
 ```
 
