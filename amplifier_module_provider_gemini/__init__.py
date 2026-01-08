@@ -3,6 +3,11 @@ Gemini provider module for Amplifier.
 Integrates with Google's Gemini API.
 """
 
+__all__ = ["mount", "GeminiProvider"]
+
+# Amplifier module metadata
+__amplifier_module_type__ = "provider"
+
 import asyncio
 import logging
 import os
@@ -11,6 +16,7 @@ import uuid
 from contextlib import suppress
 from typing import Any
 from typing import Optional
+from typing import TYPE_CHECKING
 
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
@@ -25,7 +31,9 @@ from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
 from amplifier_core.message_models import ToolCall
 from amplifier_core.message_models import Usage
-from google import genai
+
+if TYPE_CHECKING:
+    from google import genai
 
 logger = logging.getLogger(__name__)
 
@@ -95,17 +103,21 @@ class GeminiProvider:
     name = "gemini"
 
     def __init__(
-        self, api_key: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self, api_key: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
     ):
         """
         Initialize Gemini provider.
 
+        The SDK client is created lazily on first use, allowing get_info()
+        to work without valid credentials.
+
         Args:
-            api_key: Google AI API key
+            api_key: Google AI API key (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
-        self.client = genai.Client(api_key=api_key)
+        self._api_key = api_key
+        self._client = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
@@ -116,6 +128,16 @@ class GeminiProvider:
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
+
+    @property
+    def client(self):
+        """Lazily initialize the Gemini client on first access."""
+        if self._client is None:
+            if self._api_key is None:
+                raise ValueError("api_key must be provided for API calls")
+            from google import genai
+            self._client = genai.Client(api_key=self._api_key)
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -377,6 +399,7 @@ class GeminiProvider:
         Returns:
             ChatResponse with content blocks
         """
+        from google import genai
 
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
 
