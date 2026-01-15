@@ -59,7 +59,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
 
     if not api_key:
-        logger.warning("No API key found for Gemini provider (set GOOGLE_API_KEY or GEMINI_API_KEY)")
+        logger.warning(
+            "No API key found for Gemini provider (set GOOGLE_API_KEY or GEMINI_API_KEY)"
+        )
         return None
 
     provider = GeminiProvider(api_key, config, coordinator)
@@ -103,7 +105,10 @@ class GeminiProvider:
     name = "gemini"
 
     def __init__(
-        self, api_key: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None
+        self,
+        api_key: str | None = None,
+        config: dict[str, Any] | None = None,
+        coordinator: ModuleCoordinator | None = None,
     ):
         """
         Initialize Gemini provider.
@@ -136,6 +141,7 @@ class GeminiProvider:
             if self._api_key is None:
                 raise ValueError("api_key must be provided for API calls")
             from google import genai
+
             self._client = genai.Client(api_key=self._api_key)
         return self._client
 
@@ -189,7 +195,9 @@ class GeminiProvider:
                     continue
 
                 # Extract model ID from name (format: models/gemini-2.5-flash)
-                model_id = model_name.split("/")[-1] if "/" in model_name else model_name
+                model_id = (
+                    model_name.split("/")[-1] if "/" in model_name else model_name
+                )
 
                 # Skip experimental/deprecated models
                 if "exp" in model_id or "001" in model_id or "002" in model_id:
@@ -217,7 +225,10 @@ class GeminiProvider:
                         context_window=input_limit,
                         max_output_tokens=output_limit,
                         capabilities=capabilities,
-                        defaults={"temperature": 0.7, "max_tokens": min(8192, output_limit)},
+                        defaults={
+                            "temperature": 0.7,
+                            "max_tokens": min(8192, output_limit),
+                        },
                     )
                 )
 
@@ -288,11 +299,15 @@ class GeminiProvider:
             max_length = self.debug_truncate_length
 
         # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, "max_length should never be None after initialization"
+        assert max_length is not None, (
+            "max_length should never be None after initialization"
+        )
 
         if isinstance(obj, str):
             if len(obj) > max_length:
-                return obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                return (
+                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
+                )
             return obj
         if isinstance(obj, dict):
             return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
@@ -300,7 +315,9 @@ class GeminiProvider:
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
 
-    def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[str, str, dict]]:
+    def _find_missing_tool_results(
+        self, messages: list[Message]
+    ) -> list[tuple[str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
@@ -320,10 +337,16 @@ class GeminiProvider:
                         tool_calls[block.id] = (block.name, block.input)
 
             # Check tool messages for tool_call_id
-            elif msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id:
+            elif (
+                msg.role == "tool" and hasattr(msg, "tool_call_id") and msg.tool_call_id
+            ):
                 tool_results.add(msg.tool_call_id)
 
-        return [(call_id, name, args) for call_id, (name, args) in tool_calls.items() if call_id not in tool_results]
+        return [
+            (call_id, name, args)
+            for call_id, (name, args) in tool_calls.items()
+            if call_id not in tool_results
+        ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
         """Create synthetic error result for missing tool response.
@@ -381,14 +404,17 @@ class GeminiProvider:
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
-                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                            {"tool_call_id": call_id, "tool_name": tool_name}
+                            for call_id, tool_name, _ in missing
                         ],
                     },
                 )
 
         return await self._complete_chat_request(request, **kwargs)
 
-    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    async def _complete_chat_request(
+        self, request: ChatRequest, **kwargs
+    ) -> ChatResponse:
         """
         Handle ChatRequest format with developer message conversion.
 
@@ -406,11 +432,17 @@ class GeminiProvider:
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
+        conversation = [
+            m for m in request.messages if m.role in ("user", "assistant", "tool")
+        ]
 
         # Combine system messages
         system_instruction = (
-            "\n\n".join(m.content if isinstance(m.content, str) else "" for m in system_msgs) if system_msgs else None
+            "\n\n".join(
+                m.content if isinstance(m.content, str) else "" for m in system_msgs
+            )
+            if system_msgs
+            else None
         )
 
         # Convert developer messages to XML-wrapped user messages
@@ -423,7 +455,9 @@ class GeminiProvider:
         # Convert conversation messages
         conversation_msgs = []
         if conversation:
-            _, conversation_msgs = self._convert_messages([m.model_dump() for m in conversation])
+            _, conversation_msgs = self._convert_messages(
+                [m.model_dump() for m in conversation]
+            )
 
         # Combine: context THEN conversation
         all_messages = context_user_msgs + conversation_msgs
@@ -431,7 +465,9 @@ class GeminiProvider:
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
         temperature = request.temperature or kwargs.get("temperature", self.temperature)
-        max_tokens = request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens)
+        max_tokens = request.max_output_tokens or kwargs.get(
+            "max_tokens", self.max_tokens
+        )
 
         # Extract thinking parameters from request metadata or kwargs
         # Default: Enable dynamic thinking with text summaries for 2.5+ models
@@ -450,7 +486,9 @@ class GeminiProvider:
             include_thoughts = kwargs["include_thoughts"]
 
         # Build Gemini config with thinking support
-        config = genai.types.GenerateContentConfig(temperature=temperature, max_output_tokens=max_tokens)
+        config = genai.types.GenerateContentConfig(
+            temperature=temperature, max_output_tokens=max_tokens
+        )
 
         # Add thinking configuration (enabled by default for 2.5+ models)
         if thinking_budget != 0:  # 0 explicitly disables thinking
@@ -463,9 +501,17 @@ class GeminiProvider:
 
         # Add tools if provided
         if request.tools:
-            config.tools = [genai.types.Tool(function_declarations=self._convert_tools_from_request(request.tools))]
+            config.tools = [
+                genai.types.Tool(
+                    function_declarations=self._convert_tools_from_request(
+                        request.tools
+                    )
+                )
+            ]
             # CRITICAL: Disable automatic function calling - Amplifier handles tool execution
-            config.automatic_function_calling = genai.types.AutomaticFunctionCallingConfig(disable=True)
+            config.automatic_function_calling = (
+                genai.types.AutomaticFunctionCallingConfig(disable=True)
+            )
 
         logger.info(f"Gemini API call - model: {model}, messages: {len(all_messages)}")
 
@@ -522,7 +568,9 @@ class GeminiProvider:
         try:
             # Call Gemini API (use .aio for async)
             response = await asyncio.wait_for(
-                self.client.aio.models.generate_content(model=model, contents=all_messages, config=config),
+                self.client.aio.models.generate_content(
+                    model=model, contents=all_messages, config=config
+                ),
                 timeout=self.timeout,
             )
 
@@ -532,13 +580,21 @@ class GeminiProvider:
             if not response.candidates or len(response.candidates) == 0:
                 raise ValueError("Gemini API returned no candidates in response")
 
-            if not hasattr(response.candidates[0], "content") or not response.candidates[0].content:
+            if (
+                not hasattr(response.candidates[0], "content")
+                or not response.candidates[0].content
+            ):
                 # Log more details about what we got
                 logger.error(f"Response structure: {response}")
-                logger.error(f"Candidate: {response.candidates[0] if response.candidates else 'None'}")
+                logger.error(
+                    f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
+                )
                 raise ValueError("Gemini API response candidate has no content")
 
-            if not hasattr(response.candidates[0].content, "parts"):
+            if (
+                not hasattr(response.candidates[0].content, "parts")
+                or not response.candidates[0].content.parts
+            ):
                 logger.error(f"Content: {response.candidates[0].content}")
                 raise ValueError("Gemini API response content has no parts")
 
@@ -587,7 +643,9 @@ class GeminiProvider:
                             "lvl": "DEBUG",
                             "provider": "gemini",
                             "response": {
-                                "content_parts": str(response.candidates[0].content.parts),
+                                "content_parts": str(
+                                    response.candidates[0].content.parts
+                                ),
                                 "raw": str(response)[:1000],
                             },
                         },
@@ -676,7 +734,11 @@ class GeminiProvider:
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
                         # Skip event emission if no event loop running (sync context)
                         with suppress(RuntimeError):
-                            asyncio.create_task(self.coordinator.hooks.emit("thinking:final", {"text": part.text}))
+                            asyncio.create_task(
+                                self.coordinator.hooks.emit(
+                                    "thinking:final", {"text": part.text}
+                                )
+                            )
                 else:
                     # Regular text (including final answer with thought_signature)
                     content_blocks.append(TextBlock(text=part.text))
@@ -699,8 +761,14 @@ class GeminiProvider:
                 # Create ToolCall for tool_calls list
                 from amplifier_core.message_models import ToolCall as TCModel
 
-                tool_calls.append(TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args)))
-                event_blocks.append(ToolCallContent(id=tool_call_id, name=fc.name, arguments=dict(fc.args)))
+                tool_calls.append(
+                    TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args))
+                )
+                event_blocks.append(
+                    ToolCallContent(
+                        id=tool_call_id, name=fc.name, arguments=dict(fc.args)
+                    )
+                )
 
         # Build metadata with usage including thought tokens
         metadata = {"raw_response": response}
@@ -708,8 +776,12 @@ class GeminiProvider:
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             # Gemini includes thoughtsTokenCount in usage metadata when thinking is used
             # Use getattr with defaults to handle missing fields
-            input_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-            output_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            input_tokens = (
+                getattr(response.usage_metadata, "prompt_token_count", 0) or 0
+            )
+            output_tokens = (
+                getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            )
             total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
 
             usage = Usage(
@@ -747,7 +819,9 @@ class GeminiProvider:
 
         return response.tool_calls
 
-    def _convert_messages(self, messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
+    def _convert_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[str | None, list[dict[str, Any]]]:
         """
         Convert Amplifier messages to Gemini format.
 
@@ -795,10 +869,16 @@ class GeminiProvider:
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 parts.append({"text": block.get("text", "")})
-                            elif isinstance(block, dict) and block.get("type") == "thinking":
+                            elif (
+                                isinstance(block, dict)
+                                and block.get("type") == "thinking"
+                            ):
                                 # Gemini doesn't have thinking in input, skip
                                 pass
-                            elif isinstance(block, dict) and block.get("type") == "tool_call":
+                            elif (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_call"
+                            ):
                                 # Tool calls handled separately below
                                 pass
                     else:
@@ -837,7 +917,9 @@ class GeminiProvider:
                     tool_call_id = "unknown"
 
                 if not tool_name:
-                    logger.debug("Tool result missing name field, recovering from function_call history")
+                    logger.debug(
+                        "Tool result missing name field, recovering from function_call history"
+                    )
                     # Try to find the tool name from earlier function_call in conversation
                     # Scan backwards to find matching function_call
                     for prev_msg in reversed(gemini_contents):
@@ -846,13 +928,17 @@ class GeminiProvider:
                                 if "function_call" in part:
                                     # Found the function call - use its name
                                     tool_name = part["function_call"]["name"]
-                                    logger.info(f"Recovered tool name '{tool_name}' from function_call history")
+                                    logger.info(
+                                        f"Recovered tool name '{tool_name}' from function_call history"
+                                    )
                                     break
                         if tool_name:
                             break
 
                     if not tool_name:
-                        logger.error(f"Could not determine tool name for tool_call_id: {tool_call_id}")
+                        logger.error(
+                            f"Could not determine tool name for tool_call_id: {tool_call_id}"
+                        )
                         tool_name = "unknown"
 
                 gemini_contents.append(
@@ -883,20 +969,28 @@ class GeminiProvider:
                                 # Convert ImageBlock to Gemini inline_data format
                                 source = block.get("source", {})
                                 if source.get("type") == "base64":
-                                    parts.append({
-                                        "inline_data": {
-                                            "mime_type": source.get("media_type", "image/jpeg"),
-                                            "data": source.get("data")
+                                    parts.append(
+                                        {
+                                            "inline_data": {
+                                                "mime_type": source.get(
+                                                    "media_type", "image/jpeg"
+                                                ),
+                                                "data": source.get("data"),
+                                            }
                                         }
-                                    })
+                                    )
                                 else:
-                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
-                    
+                                    logger.warning(
+                                        f"Unsupported image source type: {source.get('type')}"
+                                    )
+
                     if parts:
                         gemini_contents.append({"role": "user", "parts": parts})
                 else:
                     # Simple string content
-                    gemini_contents.append({"role": "user", "parts": [{"text": content}]})
+                    gemini_contents.append(
+                        {"role": "user", "parts": [{"text": content}]}
+                    )
 
         # Combine system messages
         system_instruction = "\n\n".join(system_messages) if system_messages else None
@@ -929,7 +1023,11 @@ class GeminiProvider:
 
         for tool in tools:
             # Get schema from tool if available, otherwise use empty schema
-            input_schema = getattr(tool, "input_schema", {"type": "object", "properties": {}, "required": []})
+            input_schema = getattr(
+                tool,
+                "input_schema",
+                {"type": "object", "properties": {}, "required": []},
+            )
 
             gemini_tools.append(
                 {
