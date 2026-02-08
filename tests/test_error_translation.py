@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 from amplifier_core import ModuleCoordinator
 from amplifier_core.llm_errors import (
     AuthenticationError,
+    ContentFilterError,
+    ContextLengthError,
     InvalidRequestError,
     LLMError,
     LLMTimeoutError,
@@ -138,6 +140,42 @@ def test_client_error_400_becomes_invalid_request_error():
     except InvalidRequestError as e:
         assert e.provider == "gemini"
         assert e.retryable is False
+        assert e.__cause__ is exc
+        assert e.status_code == 400
+
+
+def test_client_error_token_limit_becomes_context_length_error():
+    """ClientError with 'token limit' in message -> ContextLengthError."""
+    provider = _make_provider()
+
+    exc = _make_client_error(400, "token limit exceeded for this model")
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except ContextLengthError as e:
+        assert e.provider == "gemini"
+        assert e.__cause__ is exc
+        assert e.status_code == 400
+
+
+def test_client_error_safety_becomes_content_filter_error():
+    """ClientError with 'safety' in message -> ContentFilterError."""
+    provider = _make_provider()
+
+    exc = _make_client_error(400, "Response blocked due to safety settings")
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except ContentFilterError as e:
+        assert e.provider == "gemini"
         assert e.__cause__ is exc
         assert e.status_code == 400
 

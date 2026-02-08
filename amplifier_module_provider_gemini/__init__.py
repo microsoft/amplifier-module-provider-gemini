@@ -26,6 +26,8 @@ from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
 from amplifier_core.llm_errors import AuthenticationError
+from amplifier_core.llm_errors import ContentFilterError
+from amplifier_core.llm_errors import ContextLengthError
 from amplifier_core.llm_errors import InvalidRequestError
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.llm_errors import LLMTimeoutError
@@ -681,7 +683,30 @@ class GeminiProvider:
                                 raise AuthenticationError(
                                     str(e), provider="gemini", status_code=403
                                 ) from e
-                            # All other 4xx → InvalidRequestError
+                            # Sub-classify 4xx by message body
+                            msg = str(e).lower()
+                            if (
+                                "context length" in msg
+                                or "too many tokens" in msg
+                                or "token limit" in msg
+                                or "exceeds" in msg
+                            ):
+                                raise ContextLengthError(
+                                    str(e),
+                                    provider="gemini",
+                                    status_code=getattr(e, "status_code", 400),
+                                ) from e
+                            if (
+                                "content filter" in msg
+                                or "safety" in msg
+                                or "blocked" in msg
+                                or "harm" in msg
+                            ):
+                                raise ContentFilterError(
+                                    str(e),
+                                    provider="gemini",
+                                    status_code=getattr(e, "status_code", 400),
+                                ) from e
                             raise InvalidRequestError(
                                 str(e),
                                 provider="gemini",
