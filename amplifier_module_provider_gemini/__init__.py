@@ -128,7 +128,7 @@ class GeminiProvider:
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
         self.max_tokens = self.config.get("max_tokens", 8192)
         self.temperature = self.config.get("temperature", 0.7)
-        self.timeout = self.config.get("timeout", 300.0)
+        self.timeout = self.config.get("timeout", 600.0)
         self.priority = self.config.get("priority", 100)
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
@@ -156,7 +156,7 @@ class GeminiProvider:
                 "model": "gemini-2.5-flash",
                 "max_tokens": 8192,
                 "temperature": 0.7,
-                "timeout": 300.0,
+                "timeout": 600.0,
             },
             config_fields=[
                 ConfigField(
