@@ -33,7 +33,7 @@ def gemini_provider():
 
 def test_image_block_conversion_to_gemini_format(gemini_provider, test_image_base64):
     """Test that ImageBlock in ChatRequest converts to Gemini inline_data format.
-    
+
     This test verifies the core conversion logic:
     - ImageBlock with base64 source → Gemini parts array with inline_data
     - Text + Image in same message → multiple parts in correct order
@@ -66,7 +66,7 @@ def test_image_block_conversion_to_gemini_format(gemini_provider, test_image_bas
     assert system_instruction is None  # No system message
     assert len(gemini_contents) == 1  # One user message
     assert gemini_contents[0]["role"] == "user"
-    
+
     parts = gemini_contents[0]["parts"]
     assert len(parts) == 2  # Text part + Image part
 
@@ -82,7 +82,7 @@ def test_image_block_conversion_to_gemini_format(gemini_provider, test_image_bas
 def test_image_block_with_png(gemini_provider):
     """Test ImageBlock with PNG mime type."""
     fake_png_data = base64.b64encode(b"fake_png_bytes").decode("utf-8")
-    
+
     request = ChatRequest(
         messages=[
             Message(
@@ -107,12 +107,12 @@ def test_image_block_with_png(gemini_provider):
 
     parts = gemini_contents[0]["parts"]
     assert len(parts) == 2
-    
+
     # Image should come first (order matters)
     assert "inline_data" in parts[0]
     assert parts[0]["inline_data"]["mime_type"] == "image/png"
     assert parts[0]["inline_data"]["data"] == fake_png_data
-    
+
     # Text should come second
     assert parts[1] == {"text": "Describe this image"}
 
@@ -121,7 +121,7 @@ def test_multiple_images_in_message(gemini_provider):
     """Test handling multiple ImageBlocks in a single message."""
     fake_data_1 = base64.b64encode(b"image1").decode("utf-8")
     fake_data_2 = base64.b64encode(b"image2").decode("utf-8")
-    
+
     request = ChatRequest(
         messages=[
             Message(
@@ -153,7 +153,7 @@ def test_multiple_images_in_message(gemini_provider):
 
     parts = gemini_contents[0]["parts"]
     assert len(parts) == 3  # Text + 2 images
-    
+
     assert parts[0] == {"text": "Compare these images:"}
     assert parts[1]["inline_data"]["data"] == fake_data_1
     assert parts[2]["inline_data"]["data"] == fake_data_2
@@ -182,24 +182,24 @@ def test_text_only_message_still_works(gemini_provider):
 @pytest.mark.asyncio
 async def test_image_vision_integration_with_real_api(test_image_base64):
     """Integration test: Verify ImageBlock works with real Gemini API.
-    
+
     This test validates end-to-end image understanding:
     - ImageBlock → Gemini API format conversion
     - Real API call with vision
     - Response parsing
-    
+
     Requires GOOGLE_API_KEY environment variable.
     Skip if not available (unit tests still validate conversion logic).
     """
     import os
-    
+
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         pytest.skip("GOOGLE_API_KEY not set - skipping integration test")
-    
+
     # Create provider with real API key
     provider = GeminiProvider(api_key=api_key)
-    
+
     # Create request with image of Macbeth stage production
     request = ChatRequest(
         messages=[
@@ -226,27 +226,32 @@ async def test_image_vision_integration_with_real_api(test_image_base64):
     assert response is not None
     assert response.content is not None
     assert len(response.content) > 0
-    
+
     # Extract text from response
     response_text = ""
     for block in response.content:
         if hasattr(block, "type") and block.type == "text":
             response_text += block.text
-    
+
     # Verify the model actually saw the image and understood it
     # The test image contains specific elements we can check for
     response_lower = response_text.lower()
-    
+
     # Should mention it's a stage production/theatrical scene
-    assert any(keyword in response_lower for keyword in ["stage", "theater", "theatre", "production", "performance"]), \
-        f"Expected stage/theater reference in response: {response_text[:200]}"
-    
+    assert any(
+        keyword in response_lower
+        for keyword in ["stage", "theater", "theatre", "production", "performance"]
+    ), f"Expected stage/theater reference in response: {response_text[:200]}"
+
     # Should recognize the witches/women
-    assert any(keyword in response_lower for keyword in ["witch", "women", "woman", "people", "person"]), \
-        f"Expected people/witches reference in response: {response_text[:200]}"
-    
+    assert any(
+        keyword in response_lower
+        for keyword in ["witch", "women", "woman", "people", "person"]
+    ), f"Expected people/witches reference in response: {response_text[:200]}"
+
     # Should mention Macbeth or the text visible in the image
-    assert any(keyword in response_lower for keyword in ["macbeth", "text", "act", "scene"]), \
-        f"Expected Macbeth/text reference in response: {response_text[:200]}"
-    
+    assert any(
+        keyword in response_lower for keyword in ["macbeth", "text", "act", "scene"]
+    ), f"Expected Macbeth/text reference in response: {response_text[:200]}"
+
     print(f"\n✅ Vision test passed! Model response:\n{response_text[:500]}...")
