@@ -81,16 +81,20 @@ def test_missing_fields_are_none():
     assert chat_response.usage.cache_read_tokens is None
 
 
-def test_zero_values_become_none():
-    """Zero values should be normalized to None (0 means absent, not zero)."""
+def test_zero_values_preserved():
+    """Zero values are preserved — 0 means 'measured, none used', not absent.
+
+    Consistent with OpenAI/vLLM providers.  None means the field was not
+    reported by the API at all (tested in test_missing_fields_are_none).
+    """
     provider = GeminiProvider(api_key="test-key")
     response = _make_response(thoughts_token_count=0, cached_content_token_count=0)
 
     chat_response = provider._convert_to_chat_response(response)
 
     assert chat_response.usage is not None
-    assert chat_response.usage.reasoning_tokens is None
-    assert chat_response.usage.cache_read_tokens is None
+    assert chat_response.usage.reasoning_tokens == 0
+    assert chat_response.usage.cache_read_tokens == 0
 
 
 def test_standard_usage_fields_still_work():

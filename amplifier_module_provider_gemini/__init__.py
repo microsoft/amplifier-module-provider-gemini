@@ -378,6 +378,35 @@ class GeminiProvider:
             delay *= random.uniform(0.8, 1.2)
         return delay
 
+    @staticmethod
+    def _extract_retry_after(exc: Exception) -> float | None:
+        """Extract Retry-After value from a Gemini SDK exception.
+
+        The GenAI SDK's APIError stores the underlying httpx.Response on
+        ``exc.response``.  When a 429 is returned, the Gemini API *may*
+        include a ``Retry-After`` header (seconds).
+
+        Returns:
+            Parsed delay in seconds, or None if the header is absent or
+            unparseable.
+        """
+        response = getattr(exc, "response", None)
+        if response is None:
+            return None
+
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return None
+
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+        if raw is None:
+            return None
+
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
     def _find_missing_tool_results(
         self, messages: list[Message]
     ) -> list[tuple[str, str, dict]]:
@@ -672,8 +701,14 @@ class GeminiProvider:
                         if isinstance(e, genai_errors.ClientError):
                             code = getattr(e, "code", None)
                             if code == 429:
+                                # Try to extract Retry-After from httpx response headers.
+                                # The GenAI SDK stores the httpx.Response on APIError.response.
+                                retry_after_val = self._extract_retry_after(e)
                                 raise RateLimitError(
-                                    str(e), provider="gemini", status_code=429
+                                    str(e),
+                                    provider="gemini",
+                                    status_code=429,
+                                    retry_after=retry_after_val,
                                 ) from e
                             if code == 401:
                                 raise AuthenticationError(
@@ -689,7 +724,14 @@ class GeminiProvider:
                                 "context length" in msg
                                 or "too many tokens" in msg
                                 or "token limit" in msg
-                                or "exceeds" in msg
+                                or (
+                                    "exceeds" in msg
+                                    and (
+                                        "token" in msg
+                                        or "context" in msg
+                                        or "length" in msg
+                                    )
+                                )
                             ):
                                 raise ContextLengthError(
                                     str(e),
@@ -998,13 +1040,14 @@ class GeminiProvider:
             # Extract new usage fields (Phase 2)
             # thoughts_token_count: reasoning/thinking tokens (maps to reasoning_tokens)
             # cached_content_token_count: cached input tokens (maps to cache_read_tokens)
-            # Use `or None` to normalize 0 to None (no reasoning/cache = absent, not zero)
-            thoughts_tokens = (
-                getattr(response.usage_metadata, "thoughts_token_count", None) or None
+            # Preserve 0 as a valid measurement — 0 means "measured, none used",
+            # while None means "not reported by the API".  Consistent with
+            # OpenAI/vLLM providers.
+            thoughts_tokens = getattr(
+                response.usage_metadata, "thoughts_token_count", None
             )
-            cached_tokens = (
-                getattr(response.usage_metadata, "cached_content_token_count", None)
-                or None
+            cached_tokens = getattr(
+                response.usage_metadata, "cached_content_token_count", None
             )
 
             usage = Usage(
