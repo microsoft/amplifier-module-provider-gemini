@@ -11,11 +11,11 @@ __amplifier_module_type__ = "provider"
 import asyncio
 import logging
 import os
+import random
 import time
 import uuid
 from contextlib import suppress
 from typing import Any
-from typing import Optional
 from typing import TYPE_CHECKING
 
 from amplifier_core import ConfigField
@@ -25,12 +25,34 @@ from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
+from amplifier_core.llm_errors import AuthenticationError
+from amplifier_core.llm_errors import ContentFilterError
+from amplifier_core.llm_errors import ContextLengthError
+from amplifier_core.llm_errors import InvalidRequestError
+from amplifier_core.llm_errors import LLMError
+from amplifier_core.llm_errors import LLMTimeoutError
+from amplifier_core.llm_errors import ProviderUnavailableError
+from amplifier_core.llm_errors import RateLimitError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
 from amplifier_core.message_models import ToolCall
 from amplifier_core.message_models import Usage
+
+# google.genai.errors provides the native exception hierarchy for the GenAI SDK.
+# Guard the import so the module still loads in unusual environments.
+try:
+    from google.genai import errors as genai_errors
+except ImportError:
+    genai_errors = None  # type: ignore[assignment]
+
+# google.api_core.exceptions may be available as a transitive dependency.
+# Some environments install it alongside google-genai; others don't.
+try:
+    from google.api_core import exceptions as google_exceptions
+except ImportError:
+    google_exceptions = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from google import genai
@@ -133,6 +155,18 @@ class GeminiProvider:
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
+
+        # Retry configuration
+        self.max_retries = self.config.get("max_retries", 5)
+        self.min_retry_delay = self.config.get("min_retry_delay", 1.0)
+        self.max_retry_delay = self.config.get("max_retry_delay", 60.0)
+        self.retry_jitter = self.config.get("retry_jitter", True)
+
+        # Track repaired tool call IDs to prevent infinite detection loops.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations (since synthetic results
+        # are injected into request.messages but not persisted to message store).
+        self._repaired_tool_ids: set[str] = set()
 
     @property
     def client(self):
@@ -315,6 +349,64 @@ class GeminiProvider:
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
 
+    @staticmethod
+    def _calculate_retry_delay(
+        retry_after: float | None,
+        attempt: int,
+        min_delay: float,
+        max_delay: float,
+        jitter: bool,
+    ) -> float:
+        """Calculate delay before next retry using exponential backoff.
+
+        Args:
+            retry_after: Server-suggested delay (from Retry-After header), or None.
+            attempt: Current attempt number (1-based).
+            min_delay: Minimum base delay in seconds.
+            max_delay: Maximum delay cap in seconds.
+            jitter: Whether to add random jitter (+-20%).
+
+        Returns:
+            Delay in seconds.
+        """
+        if retry_after is not None and retry_after > 0:
+            delay = retry_after
+        else:
+            delay = min_delay * (2 ** (attempt - 1))
+        delay = min(delay, max_delay)
+        if jitter:
+            delay *= random.uniform(0.8, 1.2)
+        return delay
+
+    @staticmethod
+    def _extract_retry_after(exc: Exception) -> float | None:
+        """Extract Retry-After value from a Gemini SDK exception.
+
+        The GenAI SDK's APIError stores the underlying httpx.Response on
+        ``exc.response``.  When a 429 is returned, the Gemini API *may*
+        include a ``Retry-After`` header (seconds).
+
+        Returns:
+            Parsed delay in seconds, or None if the header is absent or
+            unparseable.
+        """
+        response = getattr(exc, "response", None)
+        if response is None:
+            return None
+
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return None
+
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+        if raw is None:
+            return None
+
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return None
+
     def _find_missing_tool_results(
         self, messages: list[Message]
     ) -> list[tuple[str, str, dict]]:
@@ -322,6 +414,7 @@ class GeminiProvider:
 
         Scans conversation for assistant tool calls and validates each has
         a corresponding tool result message. Returns missing pairs.
+        Filters out IDs already repaired in previous iterations.
 
         Returns:
             List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
@@ -345,7 +438,7 @@ class GeminiProvider:
         return [
             (call_id, name, args)
             for call_id, (name, args) in tool_calls.items()
-            if call_id not in tool_results
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
         ]
 
     def _create_synthetic_result(self, call_id: str, tool_name: str) -> Message:
@@ -395,6 +488,8 @@ class GeminiProvider:
             for call_id, tool_name, _ in missing:
                 synthetic = self._create_synthetic_result(call_id, tool_name)
                 request.messages.append(synthetic)
+                # Track this ID so we don't detect it as missing again in future iterations
+                self._repaired_tool_ids.add(call_id)
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -417,6 +512,9 @@ class GeminiProvider:
     ) -> ChatResponse:
         """
         Handle ChatRequest format with developer message conversion.
+
+        Includes error translation (native SDK errors -> kernel types) and
+        retry with exponential backoff for transient failures.
 
         Args:
             request: ChatRequest with messages
@@ -479,7 +577,16 @@ class GeminiProvider:
                 thinking_budget = request.metadata.get("thinking_budget")
             include_thoughts = request.metadata.get("include_thoughts", True)
 
-        # Allow kwargs to override
+        # reasoning_effort support (portable interface, checked after metadata but before kwargs)
+        # Maps reasoning_effort to thinking_budget values per design doc.
+        if request.reasoning_effort and "thinking_budget" not in kwargs:
+            effort = request.reasoning_effort.lower()
+            if effort == "low":
+                thinking_budget = 4096
+            elif effort in ("medium", "high"):
+                thinking_budget = -1  # dynamic
+
+        # Allow kwargs to override (backward compat — takes absolute precedence)
         if "thinking_budget" in kwargs:
             thinking_budget = kwargs["thinking_budget"]
         if "include_thoughts" in kwargs:
@@ -565,135 +672,281 @@ class GeminiProvider:
 
         start_time = time.time()
 
-        try:
-            # Call Gemini API (use .aio for async)
-            response = await asyncio.wait_for(
-                self.client.aio.models.generate_content(
-                    model=model, contents=all_messages, config=config
-                ),
-                timeout=self.timeout,
-            )
+        # --- Retry loop with error translation ---
+        last_error: LLMError | None = None
 
-            elapsed_ms = int((time.time() - start_time) * 1000)
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                # --- Inner try: error translation (native SDK -> kernel types) ---
+                try:
+                    # Call Gemini API (use .aio for async)
+                    response = await asyncio.wait_for(
+                        self.client.aio.models.generate_content(
+                            model=model, contents=all_messages, config=config
+                        ),
+                        timeout=self.timeout,
+                    )
+                except asyncio.TimeoutError as e:
+                    raise LLMTimeoutError(
+                        f"Request timed out after {self.timeout}s",
+                        provider="gemini",
+                    ) from e
+                except Exception as e:
+                    # Already a kernel error (e.g. re-raised from a nested call) — pass through
+                    if isinstance(e, LLMError):
+                        raise
 
-            # Validate response structure
-            if not response.candidates or len(response.candidates) == 0:
-                raise ValueError("Gemini API returned no candidates in response")
+                    # --- Primary path: google.genai.errors (always available) ---
+                    if genai_errors is not None:
+                        if isinstance(e, genai_errors.ClientError):
+                            code = getattr(e, "code", None)
+                            if code == 429:
+                                # Try to extract Retry-After from httpx response headers.
+                                # The GenAI SDK stores the httpx.Response on APIError.response.
+                                retry_after_val = self._extract_retry_after(e)
+                                raise RateLimitError(
+                                    str(e),
+                                    provider="gemini",
+                                    status_code=429,
+                                    retry_after=retry_after_val,
+                                ) from e
+                            if code == 401:
+                                raise AuthenticationError(
+                                    str(e), provider="gemini", status_code=401
+                                ) from e
+                            if code == 403:
+                                raise AuthenticationError(
+                                    str(e), provider="gemini", status_code=403
+                                ) from e
+                            # Sub-classify 4xx by message body
+                            msg = str(e).lower()
+                            if (
+                                "context length" in msg
+                                or "too many tokens" in msg
+                                or "token limit" in msg
+                                or (
+                                    "exceeds" in msg
+                                    and (
+                                        "token" in msg
+                                        or "context" in msg
+                                        or "length" in msg
+                                    )
+                                )
+                            ):
+                                raise ContextLengthError(
+                                    str(e),
+                                    provider="gemini",
+                                    status_code=getattr(e, "status_code", 400),
+                                ) from e
+                            if (
+                                "content filter" in msg
+                                or "safety" in msg
+                                or "blocked" in msg
+                                or "harm" in msg
+                            ):
+                                raise ContentFilterError(
+                                    str(e),
+                                    provider="gemini",
+                                    status_code=getattr(e, "status_code", 400),
+                                ) from e
+                            raise InvalidRequestError(
+                                str(e),
+                                provider="gemini",
+                                status_code=code or 400,
+                            ) from e
+                        if isinstance(e, genai_errors.ServerError):
+                            code = getattr(e, "code", None)
+                            raise ProviderUnavailableError(
+                                str(e),
+                                provider="gemini",
+                                status_code=code or 500,
+                            ) from e
 
-            if (
-                not hasattr(response.candidates[0], "content")
-                or not response.candidates[0].content
-            ):
-                # Log more details about what we got
-                logger.error(f"Response structure: {response}")
-                logger.error(
-                    f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
-                )
-                raise ValueError("Gemini API response candidate has no content")
+                    # --- Fallback: google.api_core.exceptions (if installed) ---
+                    if google_exceptions is not None:
+                        if isinstance(e, google_exceptions.ResourceExhausted):
+                            raise RateLimitError(
+                                str(e), provider="gemini", status_code=429
+                            ) from e
+                        if isinstance(e, google_exceptions.Unauthenticated):
+                            raise AuthenticationError(
+                                str(e), provider="gemini", status_code=401
+                            ) from e
+                        if isinstance(e, google_exceptions.PermissionDenied):
+                            raise AuthenticationError(
+                                str(e), provider="gemini", status_code=403
+                            ) from e
+                        if isinstance(e, google_exceptions.InvalidArgument):
+                            raise InvalidRequestError(
+                                str(e), provider="gemini", status_code=400
+                            ) from e
+                        if isinstance(e, google_exceptions.ServiceUnavailable):
+                            raise ProviderUnavailableError(
+                                str(e), provider="gemini", status_code=503
+                            ) from e
+                        if isinstance(e, google_exceptions.DeadlineExceeded):
+                            raise LLMTimeoutError(str(e), provider="gemini") from e
 
-            if (
-                not hasattr(response.candidates[0].content, "parts")
-                or not response.candidates[0].content.parts
-            ):
-                logger.error(f"Content: {response.candidates[0].content}")
-                raise ValueError("Gemini API response content has no parts")
+                    # Unknown errors default to retryable per design doc
+                    raise LLMError(
+                        str(e) or f"{type(e).__name__}: (no message)",
+                        provider="gemini",
+                        retryable=True,
+                    ) from e
 
-            # Emit llm:response event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                usage_data = {}
-                if hasattr(response, "usage_metadata"):
-                    usage_data = {
-                        "input": response.usage_metadata.prompt_token_count,
-                        "output": response.usage_metadata.candidates_token_count,
-                    }
+                elapsed_ms = int((time.time() - start_time) * 1000)
 
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "gemini",
-                        "model": model,
-                        "usage": usage_data,
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                    },
-                )
+                # Validate response structure
+                if not response.candidates or len(response.candidates) == 0:
+                    raise ValueError("Gemini API returned no candidates in response")
 
-                # DEBUG level: With truncated values
-                if self.debug:
-                    response_dict = {
-                        "content_parts": str(response.candidates[0].content.parts),
-                    }
+                if (
+                    not hasattr(response.candidates[0], "content")
+                    or not response.candidates[0].content
+                ):
+                    logger.error(f"Response structure: {response}")
+                    logger.error(
+                        f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
+                    )
+                    raise ValueError("Gemini API response candidate has no content")
+
+                if (
+                    not hasattr(response.candidates[0].content, "parts")
+                    or not response.candidates[0].content.parts
+                ):
+                    logger.error(f"Content: {response.candidates[0].content}")
+                    raise ValueError("Gemini API response content has no parts")
+
+                # Emit llm:response event
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    usage_data = {}
+                    if hasattr(response, "usage_metadata"):
+                        usage_data = {
+                            "input": response.usage_metadata.prompt_token_count,
+                            "output": response.usage_metadata.candidates_token_count,
+                        }
+
+                    # INFO level: Summary only
                     await self.coordinator.hooks.emit(
-                        "llm:response:debug",
+                        "llm:response",
                         {
-                            "lvl": "DEBUG",
                             "provider": "gemini",
-                            "response": self._truncate_values(response_dict),
+                            "model": model,
+                            "usage": usage_data,
                             "status": "ok",
                             "duration_ms": elapsed_ms,
                         },
                     )
 
-                # RAW level: Complete untruncated response (ultra-verbose)
-                if self.debug and self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "gemini",
-                            "response": {
-                                "content_parts": str(
-                                    response.candidates[0].content.parts
-                                ),
-                                "raw": str(response)[:1000],
+                    # DEBUG level: With truncated values
+                    if self.debug:
+                        response_dict = {
+                            "content_parts": str(response.candidates[0].content.parts),
+                        }
+                        await self.coordinator.hooks.emit(
+                            "llm:response:debug",
+                            {
+                                "lvl": "DEBUG",
+                                "provider": "gemini",
+                                "response": self._truncate_values(response_dict),
+                                "status": "ok",
+                                "duration_ms": elapsed_ms,
                             },
+                        )
+
+                    # RAW level: Complete untruncated response (ultra-verbose)
+                    if self.debug and self.raw_debug:
+                        await self.coordinator.hooks.emit(
+                            "llm:response:raw",
+                            {
+                                "lvl": "DEBUG",
+                                "provider": "gemini",
+                                "response": {
+                                    "content_parts": str(
+                                        response.candidates[0].content.parts
+                                    ),
+                                    "raw": str(response)[:1000],
+                                },
+                            },
+                        )
+
+                # Convert to ChatResponse
+                return self._convert_to_chat_response(response)
+
+            except LLMError as e:
+                # --- Outer try: retry logic ---
+                if not e.retryable or attempt > self.max_retries:
+                    # Emit error event before raising
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
+                    logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "llm:response",
+                            {
+                                "provider": "gemini",
+                                "model": model,
+                                "status": "error",
+                                "duration_ms": elapsed_ms,
+                                "error": error_msg,
+                            },
+                        )
+                    raise
+
+                last_error = e
+                retry_after = getattr(e, "retry_after", None)
+
+                # If server says wait longer than our max, fail fast
+                if retry_after is not None and retry_after > self.max_retry_delay:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
+                    logger.error(
+                        f"[PROVIDER] Gemini: retry_after ({retry_after}s) exceeds "
+                        f"max_retry_delay ({self.max_retry_delay}s), failing fast"
+                    )
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "llm:response",
+                            {
+                                "provider": "gemini",
+                                "model": model,
+                                "status": "error",
+                                "duration_ms": elapsed_ms,
+                                "error": error_msg,
+                            },
+                        )
+                    raise
+
+                delay = self._calculate_retry_delay(
+                    retry_after,
+                    attempt,
+                    self.min_retry_delay,
+                    self.max_retry_delay,
+                    self.retry_jitter,
+                )
+
+                logger.warning(
+                    f"[PROVIDER] Gemini: retrying after {type(e).__name__} "
+                    f"(attempt {attempt}/{self.max_retries}, delay {delay:.1f}s)"
+                )
+
+                # Emit provider:retry event
+                if self.coordinator and hasattr(self.coordinator, "hooks"):
+                    await self.coordinator.hooks.emit(
+                        "provider:retry",
+                        {
+                            "provider": self.name,
+                            "attempt": attempt,
+                            "delay": delay,
+                            "error_type": type(e).__name__,
                         },
                     )
 
-            # Convert to ChatResponse
-            return self._convert_to_chat_response(response)
+                await asyncio.sleep(delay)
 
-        except TimeoutError:
-            # Handle timeout specifically - TimeoutError has empty str() representation
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = f"Request timed out after {self.timeout}s"
-            logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
-
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "gemini",
-                        "model": model,
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                    },
-                )
-            raise TimeoutError(error_msg) from None
-
-        except Exception as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            # Ensure error message is never empty
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
-            logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
-
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "gemini",
-                        "model": model,
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": error_msg,
-                    },
-                )
-            # Re-raise with meaningful message if original was empty
-            if not str(e):
-                raise type(e)(error_msg) from e
-            raise
+        # Should not reach here, but satisfy type checker
+        assert last_error is not None
+        raise last_error
 
     def _convert_to_chat_response(self, response) -> GeminiChatResponse:
         """
@@ -784,10 +1037,25 @@ class GeminiProvider:
             )
             total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
 
+            # Extract new usage fields (Phase 2)
+            # thoughts_token_count: reasoning/thinking tokens (maps to reasoning_tokens)
+            # cached_content_token_count: cached input tokens (maps to cache_read_tokens)
+            # Preserve 0 as a valid measurement — 0 means "measured, none used",
+            # while None means "not reported by the API".  Consistent with
+            # OpenAI/vLLM providers.
+            thoughts_tokens = getattr(
+                response.usage_metadata, "thoughts_token_count", None
+            )
+            cached_tokens = getattr(
+                response.usage_metadata, "cached_content_token_count", None
+            )
+
             usage = Usage(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
+                reasoning_tokens=thoughts_tokens,
+                cache_read_tokens=cached_tokens,
             )
 
         combined_text = "\n\n".join(text_accumulator).strip()
