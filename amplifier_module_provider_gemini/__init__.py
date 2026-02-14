@@ -11,7 +11,6 @@ __amplifier_module_type__ = "provider"
 import asyncio
 import logging
 import os
-import random
 import time
 import uuid
 from contextlib import suppress
@@ -25,6 +24,8 @@ from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
+from amplifier_core.events import PROVIDER_RETRY
+from amplifier_core.llm_errors import AccessDeniedError
 from amplifier_core.llm_errors import AuthenticationError
 from amplifier_core.llm_errors import ContentFilterError
 from amplifier_core.llm_errors import ContextLengthError
@@ -33,6 +34,7 @@ from amplifier_core.llm_errors import LLMError
 from amplifier_core.llm_errors import LLMTimeoutError
 from amplifier_core.llm_errors import ProviderUnavailableError
 from amplifier_core.llm_errors import RateLimitError
+from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
@@ -156,11 +158,18 @@ class GeminiProvider:
         self.raw_debug = self.config.get("raw_debug", False)
         self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
 
-        # Retry configuration
-        self.max_retries = self.config.get("max_retries", 5)
-        self.min_retry_delay = self.config.get("min_retry_delay", 1.0)
-        self.max_retry_delay = self.config.get("max_retry_delay", 60.0)
-        self.retry_jitter = self.config.get("retry_jitter", True)
+        # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
+        # Backward compat: retry_jitter used to be bool (True/False). Now it's a float
+        # for RetryConfig.jitter (0.0-1.0). Accept both: True→0.2, False→0.0, float→as-is.
+        jitter_cfg = self.config.get("retry_jitter", 0.2)
+        if isinstance(jitter_cfg, bool):
+            jitter_cfg = 0.2 if jitter_cfg else 0.0
+        self._retry_config = RetryConfig(
+            max_retries=int(self.config.get("max_retries", 5)),
+            min_delay=float(self.config.get("min_retry_delay", 1.0)),
+            max_delay=float(self.config.get("max_retry_delay", 60.0)),
+            jitter=float(jitter_cfg),
+        )
 
         # Track repaired tool call IDs to prevent infinite detection loops.
         # This prevents infinite loops when the same missing tool results are
@@ -348,35 +357,6 @@ class GeminiProvider:
         if isinstance(obj, list):
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
-
-    @staticmethod
-    def _calculate_retry_delay(
-        retry_after: float | None,
-        attempt: int,
-        min_delay: float,
-        max_delay: float,
-        jitter: bool,
-    ) -> float:
-        """Calculate delay before next retry using exponential backoff.
-
-        Args:
-            retry_after: Server-suggested delay (from Retry-After header), or None.
-            attempt: Current attempt number (1-based).
-            min_delay: Minimum base delay in seconds.
-            max_delay: Maximum delay cap in seconds.
-            jitter: Whether to add random jitter (+-20%).
-
-        Returns:
-            Delay in seconds.
-        """
-        if retry_after is not None and retry_after > 0:
-            delay = retry_after
-        else:
-            delay = min_delay * (2 ** (attempt - 1))
-        delay = min(delay, max_delay)
-        if jitter:
-            delay *= random.uniform(0.8, 1.2)
-        return delay
 
     @staticmethod
     def _extract_retry_after(exc: Exception) -> float | None:
@@ -672,281 +652,247 @@ class GeminiProvider:
 
         start_time = time.time()
 
-        # --- Retry loop with error translation ---
-        last_error: LLMError | None = None
+        # Call Gemini API with shared retry_with_backoff from amplifier-core.
+        # Error translation happens inside _do_complete() so that retry_with_backoff
+        # sees LLMError (and checks retryable) rather than raw SDK exceptions.
 
-        for attempt in range(1, self.max_retries + 2):
+        async def _do_complete():
+            """Single API call attempt with SDK → kernel error translation."""
             try:
-                # --- Inner try: error translation (native SDK -> kernel types) ---
-                try:
-                    # Call Gemini API (use .aio for async)
-                    response = await asyncio.wait_for(
-                        self.client.aio.models.generate_content(
-                            model=model, contents=all_messages, config=config
-                        ),
-                        timeout=self.timeout,
-                    )
-                except asyncio.TimeoutError as e:
-                    raise LLMTimeoutError(
-                        f"Request timed out after {self.timeout}s",
-                        provider="gemini",
-                    ) from e
-                except Exception as e:
-                    # Already a kernel error (e.g. re-raised from a nested call) — pass through
-                    if isinstance(e, LLMError):
-                        raise
-
-                    # --- Primary path: google.genai.errors (always available) ---
-                    if genai_errors is not None:
-                        if isinstance(e, genai_errors.ClientError):
-                            code = getattr(e, "code", None)
-                            if code == 429:
-                                # Try to extract Retry-After from httpx response headers.
-                                # The GenAI SDK stores the httpx.Response on APIError.response.
-                                retry_after_val = self._extract_retry_after(e)
-                                raise RateLimitError(
-                                    str(e),
-                                    provider="gemini",
-                                    status_code=429,
-                                    retry_after=retry_after_val,
-                                ) from e
-                            if code == 401:
-                                raise AuthenticationError(
-                                    str(e), provider="gemini", status_code=401
-                                ) from e
-                            if code == 403:
-                                raise AuthenticationError(
-                                    str(e), provider="gemini", status_code=403
-                                ) from e
-                            # Sub-classify 4xx by message body
-                            msg = str(e).lower()
-                            if (
-                                "context length" in msg
-                                or "too many tokens" in msg
-                                or "token limit" in msg
-                                or (
-                                    "exceeds" in msg
-                                    and (
-                                        "token" in msg
-                                        or "context" in msg
-                                        or "length" in msg
-                                    )
-                                )
-                            ):
-                                raise ContextLengthError(
-                                    str(e),
-                                    provider="gemini",
-                                    status_code=getattr(e, "status_code", 400),
-                                ) from e
-                            if (
-                                "content filter" in msg
-                                or "safety" in msg
-                                or "blocked" in msg
-                                or "harm" in msg
-                            ):
-                                raise ContentFilterError(
-                                    str(e),
-                                    provider="gemini",
-                                    status_code=getattr(e, "status_code", 400),
-                                ) from e
-                            raise InvalidRequestError(
-                                str(e),
-                                provider="gemini",
-                                status_code=code or 400,
-                            ) from e
-                        if isinstance(e, genai_errors.ServerError):
-                            code = getattr(e, "code", None)
-                            raise ProviderUnavailableError(
-                                str(e),
-                                provider="gemini",
-                                status_code=code or 500,
-                            ) from e
-
-                    # --- Fallback: google.api_core.exceptions (if installed) ---
-                    if google_exceptions is not None:
-                        if isinstance(e, google_exceptions.ResourceExhausted):
+                # Call Gemini API (use .aio for async)
+                return await asyncio.wait_for(
+                    self.client.aio.models.generate_content(
+                        model=model, contents=all_messages, config=config
+                    ),
+                    timeout=self.timeout,
+                )
+            except asyncio.TimeoutError as e:
+                raise LLMTimeoutError(
+                    f"Request timed out after {self.timeout}s",
+                    provider="gemini",
+                ) from e
+            except LLMError:
+                # Already a kernel error (e.g. re-raised from a nested call) — pass through
+                raise
+            except Exception as e:
+                # --- Primary path: google.genai.errors (always available) ---
+                if genai_errors is not None:
+                    if isinstance(e, genai_errors.ClientError):
+                        code = getattr(e, "code", None)
+                        if code == 429:
+                            retry_after_val = self._extract_retry_after(e)
                             raise RateLimitError(
-                                str(e), provider="gemini", status_code=429
+                                str(e),
+                                provider="gemini",
+                                status_code=429,
+                                retry_after=retry_after_val,
                             ) from e
-                        if isinstance(e, google_exceptions.Unauthenticated):
+                        if code == 401:
                             raise AuthenticationError(
                                 str(e), provider="gemini", status_code=401
                             ) from e
-                        if isinstance(e, google_exceptions.PermissionDenied):
-                            raise AuthenticationError(
+                        if code == 403:
+                            raise AccessDeniedError(
                                 str(e), provider="gemini", status_code=403
                             ) from e
-                        if isinstance(e, google_exceptions.InvalidArgument):
-                            raise InvalidRequestError(
-                                str(e), provider="gemini", status_code=400
+                        # Sub-classify 4xx by message body
+                        msg = str(e).lower()
+                        if (
+                            "context length" in msg
+                            or "too many tokens" in msg
+                            or "token limit" in msg
+                            or (
+                                "exceeds" in msg
+                                and (
+                                    "token" in msg
+                                    or "context" in msg
+                                    or "length" in msg
+                                )
+                            )
+                        ):
+                            raise ContextLengthError(
+                                str(e),
+                                provider="gemini",
+                                status_code=getattr(e, "status_code", 400),
                             ) from e
-                        if isinstance(e, google_exceptions.ServiceUnavailable):
-                            raise ProviderUnavailableError(
-                                str(e), provider="gemini", status_code=503
+                        if (
+                            "content filter" in msg
+                            or "safety" in msg
+                            or "blocked" in msg
+                            or "harm" in msg
+                        ):
+                            raise ContentFilterError(
+                                str(e),
+                                provider="gemini",
+                                status_code=getattr(e, "status_code", 400),
                             ) from e
-                        if isinstance(e, google_exceptions.DeadlineExceeded):
-                            raise LLMTimeoutError(str(e), provider="gemini") from e
+                        raise InvalidRequestError(
+                            str(e),
+                            provider="gemini",
+                            status_code=code or 400,
+                        ) from e
+                    if isinstance(e, genai_errors.ServerError):
+                        code = getattr(e, "code", None)
+                        raise ProviderUnavailableError(
+                            str(e),
+                            provider="gemini",
+                            status_code=code or 500,
+                        ) from e
 
-                    # Unknown errors default to retryable per design doc
-                    raise LLMError(
-                        str(e) or f"{type(e).__name__}: (no message)",
-                        provider="gemini",
-                        retryable=True,
-                    ) from e
+                # --- Fallback: google.api_core.exceptions (if installed) ---
+                if google_exceptions is not None:
+                    if isinstance(e, google_exceptions.ResourceExhausted):
+                        raise RateLimitError(
+                            str(e), provider="gemini", status_code=429
+                        ) from e
+                    if isinstance(e, google_exceptions.Unauthenticated):
+                        raise AuthenticationError(
+                            str(e), provider="gemini", status_code=401
+                        ) from e
+                    if isinstance(e, google_exceptions.PermissionDenied):
+                        raise AccessDeniedError(
+                            str(e), provider="gemini", status_code=403
+                        ) from e
+                    if isinstance(e, google_exceptions.InvalidArgument):
+                        raise InvalidRequestError(
+                            str(e), provider="gemini", status_code=400
+                        ) from e
+                    if isinstance(e, google_exceptions.ServiceUnavailable):
+                        raise ProviderUnavailableError(
+                            str(e), provider="gemini", status_code=503
+                        ) from e
+                    if isinstance(e, google_exceptions.DeadlineExceeded):
+                        raise LLMTimeoutError(str(e), provider="gemini") from e
 
-                elapsed_ms = int((time.time() - start_time) * 1000)
+                # Unknown errors default to retryable per design doc
+                raise LLMError(
+                    str(e) or f"{type(e).__name__}: (no message)",
+                    provider="gemini",
+                    retryable=True,
+                ) from e
 
-                # Validate response structure
-                if not response.candidates or len(response.candidates) == 0:
-                    raise ValueError("Gemini API returned no candidates in response")
+        async def _on_retry(attempt: int, delay: float, error: LLMError):
+            """Callback invoked before each retry sleep."""
+            logger.warning(
+                "[PROVIDER] Gemini: retrying after %s (attempt %d/%d, delay %.1fs)",
+                type(error).__name__,
+                attempt,
+                self._retry_config.max_retries,
+                delay,
+            )
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    PROVIDER_RETRY,
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
 
-                if (
-                    not hasattr(response.candidates[0], "content")
-                    or not response.candidates[0].content
-                ):
-                    logger.error(f"Response structure: {response}")
-                    logger.error(
-                        f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
-                    )
-                    raise ValueError("Gemini API response candidate has no content")
+        try:
+            response = await retry_with_backoff(
+                _do_complete,
+                self._retry_config,
+                on_retry=_on_retry,
+            )
+        except LLMError as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "gemini",
+                        "model": model,
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": error_msg,
+                    },
+                )
+            raise
 
-                if (
-                    not hasattr(response.candidates[0].content, "parts")
-                    or not response.candidates[0].content.parts
-                ):
-                    logger.error(f"Content: {response.candidates[0].content}")
-                    raise ValueError("Gemini API response content has no parts")
+        # Request succeeded — continue with response handling
+        elapsed_ms = int((time.time() - start_time) * 1000)
 
-                # Emit llm:response event
-                if self.coordinator and hasattr(self.coordinator, "hooks"):
-                    usage_data = {}
-                    if hasattr(response, "usage_metadata"):
-                        usage_data = {
-                            "input": response.usage_metadata.prompt_token_count,
-                            "output": response.usage_metadata.candidates_token_count,
-                        }
+        # Validate response structure
+        if not response.candidates or len(response.candidates) == 0:
+            raise ValueError("Gemini API returned no candidates in response")
 
-                    # INFO level: Summary only
-                    await self.coordinator.hooks.emit(
-                        "llm:response",
-                        {
-                            "provider": "gemini",
-                            "model": model,
-                            "usage": usage_data,
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
-                    )
+        if (
+            not hasattr(response.candidates[0], "content")
+            or not response.candidates[0].content
+        ):
+            logger.error(f"Response structure: {response}")
+            logger.error(
+                f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
+            )
+            raise ValueError("Gemini API response candidate has no content")
 
-                    # DEBUG level: With truncated values
-                    if self.debug:
-                        response_dict = {
+        if (
+            not hasattr(response.candidates[0].content, "parts")
+            or not response.candidates[0].content.parts
+        ):
+            logger.error(f"Content: {response.candidates[0].content}")
+            raise ValueError("Gemini API response content has no parts")
+
+        # Emit llm:response event
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            usage_data = {}
+            if hasattr(response, "usage_metadata"):
+                usage_data = {
+                    "input": response.usage_metadata.prompt_token_count,
+                    "output": response.usage_metadata.candidates_token_count,
+                }
+
+            # INFO level: Summary only
+            await self.coordinator.hooks.emit(
+                "llm:response",
+                {
+                    "provider": "gemini",
+                    "model": model,
+                    "usage": usage_data,
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                },
+            )
+
+            # DEBUG level: With truncated values
+            if self.debug:
+                response_dict = {
+                    "content_parts": str(response.candidates[0].content.parts),
+                }
+                await self.coordinator.hooks.emit(
+                    "llm:response:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "gemini",
+                        "response": self._truncate_values(response_dict),
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+
+            # RAW level: Complete untruncated response (ultra-verbose)
+            if self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:response:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "gemini",
+                        "response": {
                             "content_parts": str(response.candidates[0].content.parts),
-                        }
-                        await self.coordinator.hooks.emit(
-                            "llm:response:debug",
-                            {
-                                "lvl": "DEBUG",
-                                "provider": "gemini",
-                                "response": self._truncate_values(response_dict),
-                                "status": "ok",
-                                "duration_ms": elapsed_ms,
-                            },
-                        )
-
-                    # RAW level: Complete untruncated response (ultra-verbose)
-                    if self.debug and self.raw_debug:
-                        await self.coordinator.hooks.emit(
-                            "llm:response:raw",
-                            {
-                                "lvl": "DEBUG",
-                                "provider": "gemini",
-                                "response": {
-                                    "content_parts": str(
-                                        response.candidates[0].content.parts
-                                    ),
-                                    "raw": str(response)[:1000],
-                                },
-                            },
-                        )
-
-                # Convert to ChatResponse
-                return self._convert_to_chat_response(response)
-
-            except LLMError as e:
-                # --- Outer try: retry logic ---
-                if not e.retryable or attempt > self.max_retries:
-                    # Emit error event before raising
-                    elapsed_ms = int((time.time() - start_time) * 1000)
-                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
-                    logger.error(f"[PROVIDER] Gemini API error: {error_msg}")
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit(
-                            "llm:response",
-                            {
-                                "provider": "gemini",
-                                "model": model,
-                                "status": "error",
-                                "duration_ms": elapsed_ms,
-                                "error": error_msg,
-                            },
-                        )
-                    raise
-
-                last_error = e
-                retry_after = getattr(e, "retry_after", None)
-
-                # If server says wait longer than our max, fail fast
-                if retry_after is not None and retry_after > self.max_retry_delay:
-                    elapsed_ms = int((time.time() - start_time) * 1000)
-                    error_msg = str(e) or f"{type(e).__name__}: (no message)"
-                    logger.error(
-                        f"[PROVIDER] Gemini: retry_after ({retry_after}s) exceeds "
-                        f"max_retry_delay ({self.max_retry_delay}s), failing fast"
-                    )
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit(
-                            "llm:response",
-                            {
-                                "provider": "gemini",
-                                "model": model,
-                                "status": "error",
-                                "duration_ms": elapsed_ms,
-                                "error": error_msg,
-                            },
-                        )
-                    raise
-
-                delay = self._calculate_retry_delay(
-                    retry_after,
-                    attempt,
-                    self.min_retry_delay,
-                    self.max_retry_delay,
-                    self.retry_jitter,
-                )
-
-                logger.warning(
-                    f"[PROVIDER] Gemini: retrying after {type(e).__name__} "
-                    f"(attempt {attempt}/{self.max_retries}, delay {delay:.1f}s)"
-                )
-
-                # Emit provider:retry event
-                if self.coordinator and hasattr(self.coordinator, "hooks"):
-                    await self.coordinator.hooks.emit(
-                        "provider:retry",
-                        {
-                            "provider": self.name,
-                            "attempt": attempt,
-                            "delay": delay,
-                            "error_type": type(e).__name__,
+                            "raw": str(response)[:1000],
                         },
-                    )
+                    },
+                )
 
-                await asyncio.sleep(delay)
-
-        # Should not reach here, but satisfy type checker
-        assert last_error is not None
-        raise last_error
+        # Convert to ChatResponse
+        return self._convert_to_chat_response(response)
 
     def _convert_to_chat_response(self, response) -> GeminiChatResponse:
         """

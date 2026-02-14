@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core.llm_errors import (
+    AccessDeniedError,
     AuthenticationError,
     ContentFilterError,
     ContextLengthError,
@@ -106,8 +107,8 @@ def test_client_error_401_becomes_authentication_error():
         assert e.status_code == 401
 
 
-def test_client_error_403_becomes_authentication_error():
-    """ClientError with code 403 -> AuthenticationError."""
+def test_client_error_403_becomes_access_denied_error():
+    """ClientError with code 403 -> AccessDeniedError (subclass of AuthenticationError)."""
     provider = _make_provider()
 
     exc = _make_client_error(403, "Forbidden")
@@ -118,7 +119,7 @@ def test_client_error_403_becomes_authentication_error():
     try:
         asyncio.run(provider.complete(_simple_request()))
         assert False, "Should have raised"
-    except AuthenticationError as e:
+    except AccessDeniedError as e:
         assert e.provider == "gemini"
         assert e.retryable is False
         assert e.__cause__ is exc

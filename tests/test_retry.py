@@ -1,13 +1,13 @@
 """Tests for Gemini retry pattern (Phase 2).
 
-Verifies exponential backoff, jitter, retry-after handling, and
-provider:retry event emission.
+Verifies exponential backoff, retry-after handling, and
+provider:retry event emission using shared retry_with_backoff.
 """
 
 import asyncio
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from amplifier_core import ModuleCoordinator
 from amplifier_core.llm_errors import (
@@ -131,38 +131,32 @@ def test_no_retry_on_non_retryable_error():
     assert len(retry_events) == 0
 
 
-def test_retry_after_exceeds_max_delay_raises_immediately():
-    """If retry_after > max_retry_delay, fail fast instead of waiting."""
+def test_retry_after_honored_by_shared_utility():
+    """RateLimitError with retry_after should be honored by shared retry utility."""
     provider = GeminiProvider(
         api_key="test-key",
-        config={"max_retries": 5, "max_retry_delay": 60.0, "min_retry_delay": 0.01},
+        config={"max_retries": 2, "max_retry_delay": 60.0, "min_retry_delay": 0.01},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
 
-    # Simulate a RateLimitError with a very long retry_after.
-    # The inner try translates native errors to kernel types. Here we inject
-    # a pre-translated kernel error to test the outer retry logic.
-    # LLMError subclasses pass through the inner except block as-is.
-    exc = RateLimitError("Rate limited", retry_after=120.0, provider="gemini")
+    # RateLimitError with moderate retry_after (within max_delay)
+    exc = RateLimitError("Rate limited", retry_after=5.0, provider="gemini")
     mock_client = MagicMock()
-    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    mock_client.aio.models.generate_content = AsyncMock(
+        side_effect=[exc, _make_gemini_response()]
+    )
     provider._client = mock_client
 
-    try:
-        asyncio.run(provider.complete(_simple_request()))
-        assert False, "Should have raised"
-    except RateLimitError as e:
-        assert e.retry_after == 120.0
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        result = asyncio.run(provider.complete(_simple_request()))
 
-    # Should have called API exactly once (no retry due to retry_after > max_delay)
-    assert mock_client.aio.models.generate_content.await_count == 1
+    assert result is not None
+    assert mock_client.aio.models.generate_content.await_count == 2
 
-    # No retry events (failed fast)
-    retry_events = [
-        e for e in fake_coordinator.hooks.events if e[0] == "provider:retry"
-    ]
-    assert len(retry_events) == 0
+    # The sleep delay should respect retry_after (at least 5.0)
+    sleep_delay = mock_sleep.call_args[0][0]
+    assert sleep_delay >= 4.0  # retry_after=5.0 minus jitter
 
 
 def test_exhausts_all_retries_then_raises():
@@ -193,42 +187,6 @@ def test_exhausts_all_retries_then_raises():
         e for e in fake_coordinator.hooks.events if e[0] == "provider:retry"
     ]
     assert len(retry_events) == 2
-
-
-def test_calculate_retry_delay_exponential_backoff():
-    """Delay should follow exponential backoff pattern."""
-    # Without jitter for deterministic testing
-    delay1 = GeminiProvider._calculate_retry_delay(None, 1, 1.0, 60.0, False)
-    delay2 = GeminiProvider._calculate_retry_delay(None, 2, 1.0, 60.0, False)
-    delay3 = GeminiProvider._calculate_retry_delay(None, 3, 1.0, 60.0, False)
-
-    assert delay1 == 1.0  # 1.0 * 2^0
-    assert delay2 == 2.0  # 1.0 * 2^1
-    assert delay3 == 4.0  # 1.0 * 2^2
-
-
-def test_calculate_retry_delay_respects_max():
-    """Delay should be capped at max_delay."""
-    delay = GeminiProvider._calculate_retry_delay(None, 10, 1.0, 60.0, False)
-    assert delay == 60.0  # 1.0 * 2^9 = 512 -> capped to 60
-
-
-def test_calculate_retry_delay_honors_retry_after():
-    """Server-suggested retry_after should be used when present."""
-    delay = GeminiProvider._calculate_retry_delay(5.0, 1, 1.0, 60.0, False)
-    assert delay == 5.0  # Uses retry_after instead of backoff
-
-
-def test_calculate_retry_delay_jitter():
-    """Jitter should add +-20% variation."""
-    delays = set()
-    for _ in range(50):
-        delay = GeminiProvider._calculate_retry_delay(None, 1, 1.0, 60.0, True)
-        delays.add(round(delay, 3))
-        assert 0.8 <= delay <= 1.2  # base=1.0 * [0.8, 1.2]
-
-    # With 50 samples, we should get some variation (not all the same)
-    assert len(delays) > 1, "Jitter should produce varying delays"
 
 
 def test_timeout_error_retried():
