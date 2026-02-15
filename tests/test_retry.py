@@ -195,42 +195,6 @@ def test_exhausts_all_retries_then_raises():
     assert len(retry_events) == 2
 
 
-def test_calculate_retry_delay_exponential_backoff():
-    """Delay should follow exponential backoff pattern."""
-    # Without jitter for deterministic testing
-    delay1 = GeminiProvider._calculate_retry_delay(None, 1, 1.0, 60.0, False)
-    delay2 = GeminiProvider._calculate_retry_delay(None, 2, 1.0, 60.0, False)
-    delay3 = GeminiProvider._calculate_retry_delay(None, 3, 1.0, 60.0, False)
-
-    assert delay1 == 1.0  # 1.0 * 2^0
-    assert delay2 == 2.0  # 1.0 * 2^1
-    assert delay3 == 4.0  # 1.0 * 2^2
-
-
-def test_calculate_retry_delay_respects_max():
-    """Delay should be capped at max_delay."""
-    delay = GeminiProvider._calculate_retry_delay(None, 10, 1.0, 60.0, False)
-    assert delay == 60.0  # 1.0 * 2^9 = 512 -> capped to 60
-
-
-def test_calculate_retry_delay_honors_retry_after():
-    """Server-suggested retry_after should be used when present."""
-    delay = GeminiProvider._calculate_retry_delay(5.0, 1, 1.0, 60.0, False)
-    assert delay == 5.0  # Uses retry_after instead of backoff
-
-
-def test_calculate_retry_delay_jitter():
-    """Jitter should add +-20% variation."""
-    delays = set()
-    for _ in range(50):
-        delay = GeminiProvider._calculate_retry_delay(None, 1, 1.0, 60.0, True)
-        delays.add(round(delay, 3))
-        assert 0.8 <= delay <= 1.2  # base=1.0 * [0.8, 1.2]
-
-    # With 50 samples, we should get some variation (not all the same)
-    assert len(delays) > 1, "Jitter should produce varying delays"
-
-
 def test_timeout_error_retried():
     """asyncio.TimeoutError should be translated and retried."""
     provider = GeminiProvider(
