@@ -200,6 +200,10 @@ class GeminiProvider:
                 "max_tokens": 8192,
                 "temperature": 0.7,
                 "timeout": 600.0,
+                "context_window": 1_048_576,
+                "max_output_tokens": 65_536,
+                # Gemini charges 2x input / 1.5x output above 200k tokens
+                "context_budget_cap": 200_000,
             },
             config_fields=[
                 ConfigField(
