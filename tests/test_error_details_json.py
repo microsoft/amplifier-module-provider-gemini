@@ -200,8 +200,9 @@ def test_unknown_error_with_details_uses_json_details():
 
     # Create a RuntimeError with a .details attribute
     exc = RuntimeError("Something unexpected")
-    exc.details = {"custom": "structured data"}
-    expected_msg = json.dumps(exc.details)
+    details = {"custom": "structured data"}
+    setattr(exc, "details", details)
+    expected_msg = json.dumps(details)
 
     mock_client = MagicMock()
     mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
