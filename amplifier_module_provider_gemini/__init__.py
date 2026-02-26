@@ -9,6 +9,7 @@ __all__ = ["mount", "GeminiProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -687,6 +688,10 @@ class GeminiProvider:
                 if genai_errors is not None:
                     if isinstance(e, genai_errors.ClientError):
                         code = getattr(e, "code", None)
+                        details = getattr(e, "details", None)
+                        error_msg = (
+                            json.dumps(details) if details is not None else str(e)
+                        )
                         if code == 429:
                             # Try to extract Retry-After from httpx response headers.
                             retry_after_val = self._extract_retry_after(e)
@@ -698,7 +703,7 @@ class GeminiProvider:
                             ):
                                 retryable = False
                             raise RateLimitError(
-                                str(e),
+                                error_msg,
                                 provider="gemini",
                                 status_code=429,
                                 retryable=retryable,
@@ -706,52 +711,56 @@ class GeminiProvider:
                             ) from e
                         if code == 401:
                             raise AuthenticationError(
-                                str(e), provider="gemini", status_code=401
+                                error_msg, provider="gemini", status_code=401
                             ) from e
                         if code == 403:
                             raise AccessDeniedError(
-                                str(e), provider="gemini", status_code=403
+                                error_msg, provider="gemini", status_code=403
                             ) from e
                         # Sub-classify 4xx by message body
-                        msg = str(e).lower()
+                        raw_msg = str(e).lower()
                         if (
-                            "context length" in msg
-                            or "too many tokens" in msg
-                            or "token limit" in msg
+                            "context length" in raw_msg
+                            or "too many tokens" in raw_msg
+                            or "token limit" in raw_msg
                             or (
-                                "exceeds" in msg
+                                "exceeds" in raw_msg
                                 and (
-                                    "token" in msg
-                                    or "context" in msg
-                                    or "length" in msg
+                                    "token" in raw_msg
+                                    or "context" in raw_msg
+                                    or "length" in raw_msg
                                 )
                             )
                         ):
                             raise ContextLengthError(
-                                str(e),
+                                error_msg,
                                 provider="gemini",
                                 status_code=getattr(e, "status_code", 400),
                             ) from e
                         if (
-                            "content filter" in msg
-                            or "safety" in msg
-                            or "blocked" in msg
-                            or "harm" in msg
+                            "content filter" in raw_msg
+                            or "safety" in raw_msg
+                            or "blocked" in raw_msg
+                            or "harm" in raw_msg
                         ):
                             raise ContentFilterError(
-                                str(e),
+                                error_msg,
                                 provider="gemini",
                                 status_code=getattr(e, "status_code", 400),
                             ) from e
                         raise InvalidRequestError(
-                            str(e),
+                            error_msg,
                             provider="gemini",
                             status_code=code or 400,
                         ) from e
                     if isinstance(e, genai_errors.ServerError):
                         code = getattr(e, "code", None)
+                        details = getattr(e, "details", None)
+                        error_msg = (
+                            json.dumps(details) if details is not None else str(e)
+                        )
                         raise ProviderUnavailableError(
-                            str(e),
+                            error_msg,
                             provider="gemini",
                             status_code=code or 500,
                             retryable=True,
@@ -790,8 +799,14 @@ class GeminiProvider:
                         ) from e
 
                 # Unknown errors default to retryable per design doc
+                details = getattr(e, "details", None)
+                error_msg = (
+                    json.dumps(details)
+                    if details is not None
+                    else (str(e) or f"{type(e).__name__}: (no message)")
+                )
                 raise LLMError(
-                    str(e) or f"{type(e).__name__}: (no message)",
+                    error_msg,
                     provider="gemini",
                     retryable=True,
                 ) from e
