@@ -295,3 +295,90 @@ def test_cause_chain_preserved():
         # The cause chain should be preserved for debugging
         assert e.__cause__ is native_exc
         assert isinstance(e.__cause__, genai_errors.ClientError)
+
+
+# ---------------------------------------------------------------------------
+# Fallback google.api_core.exceptions.ResourceExhausted tests
+# ---------------------------------------------------------------------------
+
+try:
+    from google.api_core import exceptions as google_exceptions
+except ImportError:
+    google_exceptions = None  # type: ignore[assignment]
+
+
+def test_fallback_resource_exhausted_has_retryable_true():
+    """Fallback ResourceExhausted -> RateLimitError with retryable=True."""
+    if google_exceptions is None:
+        import pytest
+
+        pytest.skip("google.api_core not installed")
+
+    provider = _make_provider()
+
+    exc = google_exceptions.ResourceExhausted("Quota exceeded")
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except RateLimitError as e:
+        assert e.provider == "gemini"
+        assert e.retryable is True
+        assert e.status_code == 429
+        assert e.__cause__ is exc
+
+
+def test_fallback_resource_exhausted_extracts_retry_after():
+    """Fallback ResourceExhausted with Retry-After header -> retry_after set."""
+    if google_exceptions is None:
+        import pytest
+
+        pytest.skip("google.api_core not installed")
+
+    provider = _make_provider()
+
+    fake_response = MagicMock()
+    fake_response.headers = {"Retry-After": "30"}
+    exc = google_exceptions.ResourceExhausted(
+        "Quota exceeded", errors=[], response=fake_response
+    )
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except RateLimitError as e:
+        assert e.retry_after == 30.0
+        assert e.retryable is True
+
+
+def test_fallback_resource_exhausted_fail_fast_when_retry_after_exceeds_max():
+    """Fallback ResourceExhausted with retry_after > max_delay -> retryable=False."""
+    if google_exceptions is None:
+        import pytest
+
+        pytest.skip("google.api_core not installed")
+
+    # max_retry_delay defaults to 60
+    provider = _make_provider(max_retry_delay=60)
+
+    fake_response = MagicMock()
+    fake_response.headers = {"Retry-After": "120"}
+    exc = google_exceptions.ResourceExhausted(
+        "Quota exceeded", errors=[], response=fake_response
+    )
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except RateLimitError as e:
+        assert e.retry_after == 120.0
+        assert e.retryable is False
