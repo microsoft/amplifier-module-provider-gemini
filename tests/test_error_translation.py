@@ -382,3 +382,54 @@ def test_fallback_resource_exhausted_fail_fast_when_retry_after_exceeds_max():
     except RateLimitError as e:
         assert e.retry_after == 120.0
         assert e.retryable is False
+
+
+# ---------------------------------------------------------------------------
+# ServerError Retry-After extraction tests
+# ---------------------------------------------------------------------------
+
+
+def test_server_error_extracts_retry_after_from_headers():
+    """ServerError with Retry-After header -> ProviderUnavailableError with retry_after."""
+    provider = _make_provider()
+
+    exc = _make_server_error(503, "Service overloaded")
+    fake_response = MagicMock()
+    fake_response.headers = {"Retry-After": "10"}
+    exc.response = fake_response
+
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except ProviderUnavailableError as e:
+        assert e.provider == "gemini"
+        assert e.retryable is True
+        assert e.status_code == 503
+        assert e.retry_after == 10.0
+        assert e.__cause__ is exc
+
+
+def test_server_error_without_retry_after_preserves_existing_behavior():
+    """ServerError without Retry-After header -> ProviderUnavailableError with retry_after=None."""
+    provider = _make_provider()
+
+    exc = _make_server_error(500, "Internal error")
+    # No .response attribute set — _extract_retry_after should return None
+
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except ProviderUnavailableError as e:
+        assert e.provider == "gemini"
+        assert e.retryable is True
+        assert e.status_code == 500
+        assert e.retry_after is None
+        assert e.__cause__ is exc

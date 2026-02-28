@@ -759,11 +759,13 @@ class GeminiProvider:
                         error_msg = (
                             json.dumps(details) if details is not None else str(e)
                         )
+                        retry_after_val = self._extract_retry_after(e)
                         raise ProviderUnavailableError(
                             error_msg,
                             provider="gemini",
                             status_code=code or 500,
                             retryable=True,
+                            retry_after=retry_after_val,
                         ) from e
 
                 # --- Fallback: google.api_core.exceptions (if installed) ---
