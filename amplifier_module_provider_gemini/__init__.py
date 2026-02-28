@@ -62,6 +62,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Pricing per token (USD) and cost tiers by Gemini model family.
+# Used by list_models() to populate ModelInfo cost fields.
+_GEMINI_PRICING: dict[str, dict[str, Any]] = {
+    "flash": {"input": 0.075e-6, "output": 0.30e-6, "tier": "low"},
+    "pro": {"input": 1.25e-6, "output": 10.0e-6, "tier": "medium"},
+    "default": {"input": 1.25e-6, "output": 10.0e-6, "tier": "medium"},
+}
+
+
+def _gemini_pricing_for_model(model_id: str) -> dict[str, Any]:
+    """Return pricing dict for a Gemini model based on its ID."""
+    mid = model_id.lower()
+    if "flash" in mid:
+        return _GEMINI_PRICING["flash"]
+    if "pro" in mid:
+        return _GEMINI_PRICING["pro"]
+    return _GEMINI_PRICING["default"]
+
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
@@ -261,6 +279,11 @@ class GeminiProvider:
                     capabilities.append("tools")
                 if "flash" in model_id.lower():
                     capabilities.append("fast")
+                # All Gemini 2.x+ models support vision (image input)
+                if "2." in model_id or "3" in model_id:
+                    capabilities.append("vision")
+
+                pricing = _gemini_pricing_for_model(model_id)
 
                 models.append(
                     ModelInfo(
@@ -273,6 +296,9 @@ class GeminiProvider:
                             "temperature": 0.7,
                             "max_tokens": min(8192, output_limit),
                         },
+                        cost_per_input_token=pricing.get("input"),
+                        cost_per_output_token=pricing.get("output"),
+                        metadata={"cost_tier": pricing.get("tier", "medium")},
                     )
                 )
 
@@ -289,40 +315,69 @@ class GeminiProvider:
                 display_name="Gemini 2.5 Flash",
                 context_window=1048576,
                 max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
+                capabilities=[
+                    "tools",
+                    "thinking",
+                    "streaming",
+                    "json_mode",
+                    "fast",
+                    "vision",
+                ],
                 defaults={"temperature": 0.7, "max_tokens": 8192},
+                cost_per_input_token=0.075e-6,
+                cost_per_output_token=0.30e-6,
+                metadata={"cost_tier": "low"},
             ),
             ModelInfo(
                 id="gemini-2.5-pro",
                 display_name="Gemini 2.5 Pro",
                 context_window=1048576,
                 max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                capabilities=["tools", "thinking", "streaming", "json_mode", "vision"],
                 defaults={"temperature": 0.7, "max_tokens": 8192},
+                cost_per_input_token=1.25e-6,
+                cost_per_output_token=10.0e-6,
+                metadata={"cost_tier": "medium"},
             ),
             ModelInfo(
                 id="gemini-2.5-flash-lite",
                 display_name="Gemini 2.5 Flash-Lite",
                 context_window=1048576,
                 max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode", "fast"],
+                capabilities=[
+                    "tools",
+                    "thinking",
+                    "streaming",
+                    "json_mode",
+                    "fast",
+                    "vision",
+                ],
                 defaults={"temperature": 0.7, "max_tokens": 8192},
+                cost_per_input_token=0.075e-6,
+                cost_per_output_token=0.30e-6,
+                metadata={"cost_tier": "low"},
             ),
             ModelInfo(
                 id="gemini-2.0-flash",
                 display_name="Gemini 2.0 Flash",
                 context_window=1048576,
                 max_output_tokens=8192,
-                capabilities=["tools", "streaming", "json_mode"],
+                capabilities=["tools", "streaming", "json_mode", "fast", "vision"],
                 defaults={"temperature": 0.7, "max_tokens": 8192},
+                cost_per_input_token=0.075e-6,
+                cost_per_output_token=0.30e-6,
+                metadata={"cost_tier": "low"},
             ),
             ModelInfo(
                 id="gemini-3-pro-preview",
                 display_name="Gemini 3 Pro (Preview)",
                 context_window=1048576,
                 max_output_tokens=65536,
-                capabilities=["tools", "thinking", "streaming", "json_mode"],
+                capabilities=["tools", "thinking", "streaming", "json_mode", "vision"],
                 defaults={"temperature": 1.0, "max_tokens": 8192},
+                cost_per_input_token=1.25e-6,
+                cost_per_output_token=10.0e-6,
+                metadata={"cost_tier": "medium"},
             ),
         ]
 
