@@ -759,18 +759,31 @@ class GeminiProvider:
                         error_msg = (
                             json.dumps(details) if details is not None else str(e)
                         )
+                        retry_after_val = self._extract_retry_after(e)
                         raise ProviderUnavailableError(
                             error_msg,
                             provider="gemini",
                             status_code=code or 500,
                             retryable=True,
+                            retry_after=retry_after_val,
                         ) from e
 
                 # --- Fallback: google.api_core.exceptions (if installed) ---
                 if google_exceptions is not None:
                     if isinstance(e, google_exceptions.ResourceExhausted):
+                        retry_after_val = self._extract_retry_after(e)
+                        retryable = True
+                        if (
+                            retry_after_val is not None
+                            and retry_after_val > self._retry_config.max_delay
+                        ):
+                            retryable = False
                         raise RateLimitError(
-                            str(e), provider="gemini", status_code=429
+                            str(e),
+                            provider="gemini",
+                            status_code=429,
+                            retryable=retryable,
+                            retry_after=retry_after_val,
                         ) from e
                     if isinstance(e, google_exceptions.Unauthenticated):
                         raise AuthenticationError(
