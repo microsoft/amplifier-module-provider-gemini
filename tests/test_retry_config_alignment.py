@@ -57,24 +57,17 @@ def test_no_jitter_compat_code_in_init():
     """
     source = inspect.getsource(GeminiProvider.__init__)
     assert "jitter_val" not in source, "jitter_val compat variable should be removed"
-    assert (
-        "isinstance" not in source
-        or "jitter" not in source.split("isinstance")[1].split("\n")[0]
-        if "isinstance" in source
-        else True
-    ), "isinstance check for jitter should be removed"
+    for line in source.splitlines():
+        if "isinstance" in line:
+            assert "jitter" not in line, "isinstance check for jitter should be removed"
 
 
 def test_no_deprecation_warnings_from_retry_config(recwarn):
     """Creating GeminiProvider should not trigger deprecation warnings from RetryConfig."""
-    import warnings
-
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        GeminiProvider(api_key="test-key", config={})
-        deprecation_warnings = [
-            x for x in w if issubclass(x.category, DeprecationWarning)
-        ]
-        assert len(deprecation_warnings) == 0, (
-            f"Got deprecation warnings: {[str(x.message) for x in deprecation_warnings]}"
-        )
+    GeminiProvider(api_key="test-key", config={})
+    deprecation_warnings = [
+        w for w in recwarn if issubclass(w.category, DeprecationWarning)
+    ]
+    assert len(deprecation_warnings) == 0, (
+        f"Got deprecation warnings: {[str(w.message) for w in deprecation_warnings]}"
+    )
