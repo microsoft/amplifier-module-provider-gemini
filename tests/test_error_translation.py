@@ -12,8 +12,11 @@ import asyncio
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from amplifier_core import ModuleCoordinator
 from amplifier_core.llm_errors import (
+    AccessDeniedError,
     AuthenticationError,
     ContentFilterError,
     ContextLengthError,
@@ -106,8 +109,8 @@ def test_client_error_401_becomes_authentication_error():
         assert e.status_code == 401
 
 
-def test_client_error_403_becomes_authentication_error():
-    """ClientError with code 403 -> AuthenticationError."""
+def test_client_error_403_with_details_becomes_access_denied():
+    """ClientError with code 403 and details=dict -> AccessDeniedError (not retryable)."""
     provider = _make_provider()
 
     exc = _make_client_error(403, "Forbidden")
@@ -118,7 +121,7 @@ def test_client_error_403_becomes_authentication_error():
     try:
         asyncio.run(provider.complete(_simple_request()))
         assert False, "Should have raised"
-    except AuthenticationError as e:
+    except AccessDeniedError as e:
         assert e.provider == "gemini"
         assert e.retryable is False
         assert e.__cause__ is exc
@@ -432,4 +435,87 @@ def test_server_error_without_retry_after_preserves_existing_behavior():
         assert e.retryable is True
         assert e.status_code == 500
         assert e.retry_after is None
+        assert e.__cause__ is exc
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare / CDN 403 detection
+# ---------------------------------------------------------------------------
+
+
+def _make_client_error_no_details(code: int) -> genai_errors.ClientError:
+    """Create a ClientError with details=None to simulate a CDN 403.
+
+    The SDK constructor requires a dict for response_json, so we create a
+    normal error first, then override ``details`` to None — mimicking the
+    scenario where an intermediary (CDN/proxy) returned a bare 403 with no
+    JSON body.
+    """
+    exc = genai_errors.ClientError(code, {"error": {"message": "placeholder"}})
+    exc.details = None  # type: ignore[assignment]
+    return exc
+
+
+def test_client_error_403_with_no_details_becomes_provider_unavailable():
+    """ClientError 403 with details=None -> ProviderUnavailableError (CDN/proxy)."""
+    provider = _make_provider()
+
+    exc = _make_client_error_no_details(403)
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except ProviderUnavailableError as e:
+        assert e.provider == "gemini"
+        assert e.retryable is True
+        assert e.status_code == 403
+        assert e.__cause__ is exc
+
+
+def test_fallback_permission_denied_no_details_becomes_provider_unavailable():
+    """Fallback PermissionDenied with no details -> ProviderUnavailableError."""
+    if google_exceptions is None:
+        pytest.skip("google.api_core not installed")
+
+    provider = _make_provider()
+
+    exc = google_exceptions.PermissionDenied("Forbidden")
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except ProviderUnavailableError as e:
+        assert e.provider == "gemini"
+        assert e.retryable is True
+        assert e.status_code == 403
+        assert e.__cause__ is exc
+
+
+def test_fallback_permission_denied_with_details_becomes_access_denied():
+    """Fallback PermissionDenied with details -> AccessDeniedError (not retryable)."""
+    if google_exceptions is None:
+        pytest.skip("google.api_core not installed")
+
+    provider = _make_provider()
+
+    exc = google_exceptions.PermissionDenied(
+        "Forbidden", details=[{"type": "some_detail"}]
+    )
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=exc)
+    provider._client = mock_client
+
+    try:
+        asyncio.run(provider.complete(_simple_request()))
+        assert False, "Should have raised"
+    except AccessDeniedError as e:
+        assert e.provider == "gemini"
+        assert e.retryable is False
+        assert e.status_code == 403
         assert e.__cause__ is exc
