@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 _CLOUDFLARE_403_WARNING = (
     "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
-    "with no details). Treating as transient \u2014 will retry."
+    "with no details). Treating as transient — will retry."
 )
 
 
