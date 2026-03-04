@@ -62,6 +62,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CLOUDFLARE_403_WARNING = (
+    "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+    "with no details). Treating as transient — will retry."
+)
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the Gemini provider.
@@ -171,6 +177,28 @@ class GeminiProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+
+    @staticmethod
+    def _is_cloudflare_challenge(error) -> bool:
+        """Detect CDN/proxy challenge responses for Gemini.
+
+        When a CDN/proxy returns a 403, the google-genai SDK wraps it as a
+        ClientError with details=None (no JSON body to parse).  Real Gemini
+        API 403s always include structured details with an 'error' key.
+
+        Note: this method is used for the ClientError (``genai_errors``) path
+        only.  The fallback ``PermissionDenied`` path uses a broader falsy
+        check (``not getattr(e, 'details', None)``) because google.api_core
+        exceptions may carry empty details (``[]``, ``""``, etc.).
+        """
+        details = getattr(error, "details", None)
+        # No details at all → likely CDN/proxy response
+        if details is None:
+            return True
+        # Dict without 'error' key → CDN wrapped as dict
+        if isinstance(details, dict) and "error" not in details:
+            return True
+        return False
 
     @property
     def client(self):
@@ -725,6 +753,15 @@ class GeminiProvider:
                                 error_msg, provider="gemini", status_code=401
                             ) from e
                         if code == 403:
+                            if self._is_cloudflare_challenge(e):
+                                logger.warning(_CLOUDFLARE_403_WARNING)
+                                raise ProviderUnavailableError(
+                                    "CDN/proxy challenge (transient 403). "
+                                    "This typically resolves on retry.",
+                                    provider="gemini",
+                                    status_code=403,
+                                    retryable=True,
+                                ) from e
                             raise AccessDeniedError(
                                 error_msg, provider="gemini", status_code=403
                             ) from e
@@ -801,6 +838,18 @@ class GeminiProvider:
                             str(e), provider="gemini", status_code=401
                         ) from e
                     if isinstance(e, google_exceptions.PermissionDenied):
+                        # Falsy check (not just `is None`) is intentional:
+                        # google.api_core exceptions may have empty details
+                        # ([], "", etc.) which also indicate a CDN/proxy 403.
+                        if not getattr(e, "details", None):
+                            logger.warning(_CLOUDFLARE_403_WARNING)
+                            raise ProviderUnavailableError(
+                                "CDN/proxy challenge (transient 403). "
+                                "This typically resolves on retry.",
+                                provider="gemini",
+                                status_code=403,
+                                retryable=True,
+                            ) from e
                         raise AccessDeniedError(
                             str(e), provider="gemini", status_code=403
                         ) from e
