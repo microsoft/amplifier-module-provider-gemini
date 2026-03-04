@@ -1406,3 +1406,7 @@ class GeminiProvider:
             gemini_tools.append(func_decl)
 
         return gemini_tools
+
+    async def close(self) -> None:
+        """Release the genai client reference."""
+        self._client = None
