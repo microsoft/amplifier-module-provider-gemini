@@ -1410,3 +1410,4 @@ class GeminiProvider:
     async def close(self) -> None:
         """Release the genai client reference."""
         self._client = None
+
