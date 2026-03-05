@@ -37,6 +37,7 @@ from amplifier_core.llm_errors import LLMTimeoutError
 from amplifier_core.llm_errors import ProviderUnavailableError
 from amplifier_core.llm_errors import RateLimitError
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
+from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
@@ -59,7 +60,7 @@ except ImportError:
     google_exceptions = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
-    from google import genai
+    from google import genai  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +107,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         lambda: [
             "llm:request",
             "llm:response",
-            "llm:request:debug",
-            "llm:response:debug",
-            "llm:request:raw",
-            "llm:response:raw",
             "provider:tool_sequence_repaired",
             "thinking:final",
         ],
@@ -161,9 +158,7 @@ class GeminiProvider:
         self.temperature = self.config.get("temperature", 0.7)
         self.timeout = self.config.get("timeout", 600.0)
         self.priority = self.config.get("priority", 100)
-        self.debug = self.config.get("debug", False)
-        self.raw_debug = self.config.get("raw_debug", False)
-        self.debug_truncate_length = self.config.get("debug_truncate_length", 180)
+        self.raw = self.config.get("raw", False)
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
@@ -365,39 +360,6 @@ class GeminiProvider:
                 defaults={"temperature": 1.0, "max_tokens": 8192},
             ),
         ]
-
-    def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
-        """Recursively truncate string values in nested structures.
-
-        Preserves structure, only truncates leaf string values longer than max_length.
-        Uses self.debug_truncate_length if max_length not specified.
-
-        Args:
-            obj: Any JSON-serializable structure (dict, list, primitives)
-            max_length: Maximum string length (defaults to self.debug_truncate_length)
-
-        Returns:
-            Structure with truncated string values
-        """
-        if max_length is None:
-            max_length = self.debug_truncate_length
-
-        # Type guard: max_length is guaranteed to be int after this point
-        assert max_length is not None, (
-            "max_length should never be None after initialization"
-        )
-
-        if isinstance(obj, str):
-            if len(obj) > max_length:
-                return (
-                    obj[:max_length] + f"... (truncated {len(obj) - max_length} chars)"
-                )
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._truncate_values(v, max_length) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._truncate_values(item, max_length) for item in obj]
-        return obj  # Numbers, booleans, None pass through unchanged
 
     @staticmethod
     def _extract_retry_after(exc: Exception) -> float | None:
@@ -686,51 +648,23 @@ class GeminiProvider:
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
-            # INFO level: Summary only
-            await self.coordinator.hooks.emit(
-                "llm:request",
-                {
-                    "provider": "gemini",
-                    "model": model,
-                    "message_count": len(all_messages),
-                    "has_system": bool(system_instruction),
-                },
-            )
-
-            # DEBUG level: With truncated values
-            if self.debug:
-                request_dict = {
-                    "model": model,
-                    "messages": all_messages,
-                    "system_instruction": system_instruction,
-                    "temperature": temperature,
-                    "max_output_tokens": max_tokens,
-                }
-                await self.coordinator.hooks.emit(
-                    "llm:request:debug",
+            request_payload: dict[str, Any] = {
+                "provider": "gemini",
+                "model": model,
+                "message_count": len(all_messages),
+                "has_system": bool(system_instruction),
+            }
+            if self.raw:
+                request_payload["raw"] = redact_secrets(
                     {
-                        "lvl": "DEBUG",
-                        "provider": "gemini",
-                        "request": self._truncate_values(request_dict),
-                    },
+                        "model": model,
+                        "messages": all_messages,
+                        "system_instruction": system_instruction,
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens,
+                    }
                 )
-
-            # RAW level: Complete untruncated request (ultra-verbose)
-            if self.debug and self.raw_debug:
-                await self.coordinator.hooks.emit(
-                    "llm:request:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": "gemini",
-                        "request": {
-                            "model": model,
-                            "messages": all_messages,
-                            "system_instruction": system_instruction,
-                            "temperature": temperature,
-                            "max_output_tokens": max_tokens,
-                        },
-                    },
-                )
+            await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
 
@@ -981,49 +915,21 @@ class GeminiProvider:
                         "output": response.usage_metadata.candidates_token_count,
                     }
 
-                # INFO level: Summary only
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "gemini",
-                        "model": model,
-                        "usage": usage_data,
-                        "status": "ok",
-                        "duration_ms": elapsed_ms,
-                    },
-                )
-
-                # DEBUG level: With truncated values
-                if self.debug:
-                    response_dict = {
-                        "content_parts": str(response.candidates[0].content.parts),
-                    }
-                    await self.coordinator.hooks.emit(
-                        "llm:response:debug",
+                response_payload: dict[str, Any] = {
+                    "provider": "gemini",
+                    "model": model,
+                    "usage": usage_data,
+                    "status": "ok",
+                    "duration_ms": elapsed_ms,
+                }
+                if self.raw:
+                    response_payload["raw"] = redact_secrets(
                         {
-                            "lvl": "DEBUG",
-                            "provider": "gemini",
-                            "response": self._truncate_values(response_dict),
-                            "status": "ok",
-                            "duration_ms": elapsed_ms,
-                        },
+                            "content_parts": str(response.candidates[0].content.parts),
+                            "raw": str(response)[:1000],
+                        }
                     )
-
-                # RAW level: Complete untruncated response (ultra-verbose)
-                if self.debug and self.raw_debug:
-                    await self.coordinator.hooks.emit(
-                        "llm:response:raw",
-                        {
-                            "lvl": "DEBUG",
-                            "provider": "gemini",
-                            "response": {
-                                "content_parts": str(
-                                    response.candidates[0].content.parts
-                                ),
-                                "raw": str(response)[:1000],
-                            },
-                        },
-                    )
+                await self.coordinator.hooks.emit("llm:response", response_payload)
 
             # Convert to ChatResponse
             return self._convert_to_chat_response(response)
