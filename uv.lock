@@ -1,11 +1,15 @@
 version = 1
 revision = 3
 requires-python = ">=3.11"
+resolution-markers = [
+    "python_full_version >= '3.13'",
+    "python_full_version < '3.13'",
+]
 
 [[package]]
 name = "amplifier-core"
 version = "1.0.10"
-source = { directory = "../amplifier-core" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "pydantic" },
@@ -13,21 +17,28 @@ dependencies = [
     { name = "tomli" },
     { name = "typing-extensions" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8.3.1" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "tomli", specifier = ">=2.0" },
-    { name = "typing-extensions", specifier = ">=4.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "maturin", specifier = ">=1.9" },
-    { name = "pytest", specifier = ">=8.4.2" },
-    { name = "pytest-asyncio", specifier = ">=1.3.0" },
+sdist = { url = "https://files.pythonhosted.org/packages/9d/3f/c253e35933376df39a1a26e5a5f7555e55d6edb41ec25def76e53e003b0a/amplifier_core-1.0.10.tar.gz", hash = "sha256:3938d446fd8259ea45bd0dff0713d908662731d39a93321e0008c723b4dc2674", size = 235967, upload-time = "2026-03-04T13:37:23.145Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/b6/d470f1b7fc38014c55ef47de8a1e136981c68b9226ba4db7b53b23aedd35/amplifier_core-1.0.10-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:6a16b975faca7e28731b56ddc2f64872edd89dab5cf5f18e1cbc28b91c18a65f", size = 765543, upload-time = "2026-03-04T13:36:48.888Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/83/f0070db5742693bb2dbaf7b32a9bb00f2381dd39ba2acf10dd61856f731a/amplifier_core-1.0.10-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:cfe1fb8a0326e73ccc3a05d534554765b90b0f14fd824427d6b623cedc1f0e11", size = 790667, upload-time = "2026-03-04T13:36:50.553Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/61/8c1641ced7d95f0100dd295edfd806177dc22c9c6d41e9f4e84b67df31ed/amplifier_core-1.0.10-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ec8ab2ecad8d4ce79b0ef86c81a55201a73a093a55030c748297a9c7539589ab", size = 824412, upload-time = "2026-03-04T13:36:52.358Z" },
+    { url = "https://files.pythonhosted.org/packages/05/67/ffc53717d60b9365fb3e7fe4c42f7d1070f31825b8054f5b5bfabdb0eee5/amplifier_core-1.0.10-cp311-cp311-win_amd64.whl", hash = "sha256:b351aaa1bc33c5c5298edfc77bf453c632aa2562a50695a2fdbb7eef191ecf60", size = 832316, upload-time = "2026-03-04T13:36:54.5Z" },
+    { url = "https://files.pythonhosted.org/packages/83/dd/6b27bc183ba1e6bf1f226a428f8675e16ad8b11e5a332eae25f5ef482bfa/amplifier_core-1.0.10-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:66e900f685257682b04546c28681fadc771c9e5f138bd8490704c7763f3f86d5", size = 764348, upload-time = "2026-03-04T13:36:56.052Z" },
+    { url = "https://files.pythonhosted.org/packages/44/ef/071114e80126e0fd82d9f0511219254f87a0a93cd25f373c14dd6052a1e1/amplifier_core-1.0.10-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:61a5282cbbbee4f59b0f0705e46fdef97f0a05c46859d03599ce990dea2986a2", size = 793215, upload-time = "2026-03-04T13:36:57.811Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/60/3cd123a63985782774087975ca6989e4e9e18a31ad71c87d2e25ca0ea816/amplifier_core-1.0.10-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:91d05d76f19d03affbc7d8a140b38826d08c4aa06d9b218bbd6c95065447a7f4", size = 827881, upload-time = "2026-03-04T13:36:59.625Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/ff/26ee8571eae0b1cfaadbe8860cb0dde0bccdc4fed20b45f7bdae8f7465a7/amplifier_core-1.0.10-cp312-cp312-win_amd64.whl", hash = "sha256:ce29dc188dab970074a4389d9f74788e02eed7d315f4259fd35f1d8f61b40502", size = 829279, upload-time = "2026-03-04T13:37:01.555Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/73/3788548adaa1f854de13a657653d4724e443d2b238f1851522e46ce27fa5/amplifier_core-1.0.10-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:648f84f1aa5fc7e7c75335c5378f1fb3f0e49e7d7d390133f6e7a9b478ad82e4", size = 763740, upload-time = "2026-03-04T13:37:03.217Z" },
+    { url = "https://files.pythonhosted.org/packages/60/f5/c7709e5a680413e8498c051133aaf46f44f78b95f61cf70b79fd22e5eb22/amplifier_core-1.0.10-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8fcb70e36d8d908799761b28a895467a8d1d49b9eb44a20e600bdf16891aba57", size = 792463, upload-time = "2026-03-04T13:37:04.759Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/fa/21ada93dabdfb255695c5d86d85ecad959e8b86781fad4f2e94c793f8b84/amplifier_core-1.0.10-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:29878baf51fbdc6c37121a1ba8c2ae20516cadeea600068151b26e55bb84151d", size = 827325, upload-time = "2026-03-04T13:37:06.176Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/19/742482e9b93c5dc9329b4fe5211b1b2cb0b33359a9f2e53a5b2676d95f56/amplifier_core-1.0.10-cp313-cp313-win_amd64.whl", hash = "sha256:3487a63b35675e408ad63157fb5c0e76bb19533fc5c34402be07690129c1d092", size = 828745, upload-time = "2026-03-04T13:37:08.161Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/0f/46c492805e9f4b9fd9dc8ad49656f140be217a13b0d3455c37f5be8f7f39/amplifier_core-1.0.10-cp313-cp313t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b30a5cc8fef2778d40781ac5c053b11393bda2a1e8d1b0f160a3049cbe5f999d", size = 786745, upload-time = "2026-03-04T13:37:10.009Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/fb/16204db9596c440d993031dffb31b9b09e5402a227bf5862cd8efab5ee4b/amplifier_core-1.0.10-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:5b58c63fef64312831bc10f5ab61321d183810b46a55dbbcf656109d6af2a743", size = 763143, upload-time = "2026-03-04T13:37:11.457Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/f2/43d2c60f6e6b432c659d417a0ea484fa9770cfaa57bf7a96c6f9b4ae2ffc/amplifier_core-1.0.10-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c18f2478d29a96e9e7b74be4919a6a2cd51c39750eddc56fb25354259d177fbb", size = 791646, upload-time = "2026-03-04T13:37:12.903Z" },
+    { url = "https://files.pythonhosted.org/packages/72/88/4991af0f71406d00032783f66d8be48e3088dfb6e99eccbda3511b2e261d/amplifier_core-1.0.10-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:038e1f33d1b49a5e10001f8994aba8e33e923207b710613c255b631450df613b", size = 826816, upload-time = "2026-03-04T13:37:14.626Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/51/afdd1c93bdfc9c590778a3395aedb0b7602753d53669d51439edeae1457c/amplifier_core-1.0.10-cp314-cp314-win_amd64.whl", hash = "sha256:916f95b2e0d9be64f8ba2f7f0d32b5bf9bf04bd5583f14a526642461707ed04c", size = 828660, upload-time = "2026-03-04T13:37:16.994Z" },
+    { url = "https://files.pythonhosted.org/packages/80/73/7b9095f1f331ec366b95d848bbf906198118ace6def43bb0bd718d005be5/amplifier_core-1.0.10-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6ee5e85432fd9b30f3de456448e4e7668e5c97a5d310ed9581d38142847348c5", size = 786502, upload-time = "2026-03-04T13:37:18.721Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/61/a48ee2acfb32f5dc3dbc32390847fb5d833dd6881f52f3435e8eab2c489d/amplifier_core-1.0.10-pp311-pypy311_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b16c88ecc83a83b9f39d4d502aee59bfb0d84f2887522d904b4cf9498a1f7799", size = 791159, upload-time = "2026-03-04T13:37:20.251Z" },
+    { url = "https://files.pythonhosted.org/packages/35/e9/216ba241ce3add419091e70a0510f7a00b357d394c574ed681464e260a24/amplifier_core-1.0.10-pp311-pypy311_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fcc16ce1d8c7b18b8732df464c61f8504e5ee3d34cff2dc378f28e94cc282c03", size = 825456, upload-time = "2026-03-04T13:37:21.866Z" },
 ]
 
 [[package]]
@@ -41,6 +52,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "amplifier-core" },
+    { name = "google-api-core" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -51,7 +63,8 @@ requires-dist = [{ name = "google-genai", specifier = ">=1.40.0" }]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "amplifier-core", directory = "../amplifier-core" },
+    { name = "amplifier-core", specifier = ">=1.0.10" },
+    { name = "google-api-core", specifier = ">=2.0.0" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", specifier = ">=1.2.0" },
     { name = "ruff", specifier = ">=0.14.6" },
@@ -193,6 +206,22 @@ wheels = [
 ]
 
 [[package]]
+name = "google-api-core"
+version = "2.30.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-auth" },
+    { name = "googleapis-common-protos" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/98/586ec94553b569080caef635f98a3723db36a38eac0e3d7eb3ea9d2e4b9a/google_api_core-2.30.0.tar.gz", hash = "sha256:02edfa9fab31e17fc0befb5f161b3bf93c9096d99aed584625f38065c511ad9b", size = 176959, upload-time = "2026-02-18T20:28:11.926Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/45/27/09c33d67f7e0dcf06d7ac17d196594e66989299374bfb0d4331d1038e76b/google_api_core-2.30.0-py3-none-any.whl", hash = "sha256:80be49ee937ff9aba0fd79a6eddfde35fe658b9953ab9b79c57dd7061afa8df5", size = 173288, upload-time = "2026-02-18T20:28:10.367Z" },
+]
+
+[[package]]
 name = "google-auth"
 version = "2.42.0"
 source = { registry = "https://pypi.org/simple" }
@@ -223,6 +252,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c7/2d/d5907af6a46fb0b660291a09bb62f9cbc1365899f7d64a74e7d8d2e056c2/google_genai-1.46.0.tar.gz", hash = "sha256:6824c31149fe3b1c7285b25f79b924c5f89fd52466f62e30f76954f8104fe3a7", size = 239561, upload-time = "2025-10-21T22:55:04.241Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/db/79/8993ec6cbf56e5c8f88c165380e55de34ec74f7b928bc302ff5c370f9c4e/google_genai-1.46.0-py3-none-any.whl", hash = "sha256:879c4a260d630db0dcedb5cc84a9d7b47acd29e43e9dc63541b511b757ea7296", size = 239445, upload-time = "2025-10-21T22:55:03.072Z" },
+]
+
+[[package]]
+name = "googleapis-common-protos"
+version = "1.73.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/99/96/a0205167fa0154f4a542fd6925bdc63d039d88dab3588b875078107e6f06/googleapis_common_protos-1.73.0.tar.gz", hash = "sha256:778d07cd4fbeff84c6f7c72102f0daf98fa2bfd3fa8bea426edc545588da0b5a", size = 147323, upload-time = "2026-03-06T21:53:09.727Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/28/23eea8acd65972bbfe295ce3666b28ac510dfcb115fac089d3edb0feb00a/googleapis_common_protos-1.73.0-py3-none-any.whl", hash = "sha256:dfdaaa2e860f242046be561e6d6cb5c5f1541ae02cfbcb034371aadb2942b4e8", size = 297578, upload-time = "2026-03-06T21:52:33.933Z" },
 ]
 
 [[package]]
@@ -296,6 +337,33 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "proto-plus"
+version = "1.27.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3a/02/8832cde80e7380c600fbf55090b6ab7b62bd6825dbedde6d6657c15a1f8e/proto_plus-1.27.1.tar.gz", hash = "sha256:912a7460446625b792f6448bade9e55cd4e41e6ac10e27009ef71a7f317fa147", size = 56929, upload-time = "2026-02-02T17:34:49.035Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5d/79/ac273cbbf744691821a9cca88957257f41afe271637794975ca090b9588b/proto_plus-1.27.1-py3-none-any.whl", hash = "sha256:e4643061f3a4d0de092d62aa4ad09fa4756b2cbb89d4627f3985018216f9fefc", size = 50480, upload-time = "2026-02-02T17:34:47.339Z" },
+]
+
+[[package]]
+name = "protobuf"
+version = "6.33.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/70/e908e9c5e52ef7c3a6c7902c9dfbb34c7e29c25d2f81ade3856445fd5c94/protobuf-6.33.6.tar.gz", hash = "sha256:a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135", size = 444531, upload-time = "2026-03-18T19:05:00.988Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fc/9f/2f509339e89cfa6f6a4c4ff50438db9ca488dec341f7e454adad60150b00/protobuf-6.33.6-cp310-abi3-win32.whl", hash = "sha256:7d29d9b65f8afef196f8334e80d6bc1d5d4adedb449971fefd3723824e6e77d3", size = 425739, upload-time = "2026-03-18T19:04:48.373Z" },
+    { url = "https://files.pythonhosted.org/packages/76/5d/683efcd4798e0030c1bab27374fd13a89f7c2515fb1f3123efdfaa5eab57/protobuf-6.33.6-cp310-abi3-win_amd64.whl", hash = "sha256:0cd27b587afca21b7cfa59a74dcbd48a50f0a6400cfb59391340ad729d91d326", size = 437089, upload-time = "2026-03-18T19:04:50.381Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/01/a3c3ed5cd186f39e7880f8303cc51385a198a81469d53d0fdecf1f64d929/protobuf-6.33.6-cp39-abi3-macosx_10_9_universal2.whl", hash = "sha256:9720e6961b251bde64edfdab7d500725a2af5280f3f4c87e57c0208376aa8c3a", size = 427737, upload-time = "2026-03-18T19:04:51.866Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/90/b3c01fdec7d2f627b3a6884243ba328c1217ed2d978def5c12dc50d328a3/protobuf-6.33.6-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:e2afbae9b8e1825e3529f88d514754e094278bb95eadc0e199751cdd9a2e82a2", size = 324610, upload-time = "2026-03-18T19:04:53.096Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/ca/25afc144934014700c52e05103c2421997482d561f3101ff352e1292fb81/protobuf-6.33.6-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:c96c37eec15086b79762ed265d59ab204dabc53056e3443e702d2681f4b39ce3", size = 339381, upload-time = "2026-03-18T19:04:54.616Z" },
+    { url = "https://files.pythonhosted.org/packages/16/92/d1e32e3e0d894fe00b15ce28ad4944ab692713f2e7f0a99787405e43533a/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593", size = 323436, upload-time = "2026-03-18T19:04:55.768Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/72/02445137af02769918a93807b2b7890047c32bfb9f90371cbc12688819eb/protobuf-6.33.6-py3-none-any.whl", hash = "sha256:77179e006c476e69bf8e8ce866640091ec42e1beb80b213c3900006ecfba6901", size = 170656, upload-time = "2026-03-18T19:04:59.826Z" },
 ]
 
 [[package]]

@@ -24,8 +24,6 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
-[tool.uv.sources]
-amplifier-core = { path = "../amplifier-core" }
 
 [tool.hatch.build.targets.wheel]
 packages = [
@@ -42,7 +40,7 @@ asyncio_mode = "strict"
 
 [dependency-groups]
 dev = [
-    "amplifier-core",
+    "amplifier-core>=1.0.10",
     "google-api-core>=2.0.0",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
