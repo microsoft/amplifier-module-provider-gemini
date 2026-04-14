@@ -42,7 +42,7 @@ asyncio_mode = "strict"
 dev = [
     "amplifier-core>=1.0.10",
     "google-api-core>=2.0.0",
-    "pytest>=8.4.2",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.2.0",
     "ruff>=0.14.6",
 ]
