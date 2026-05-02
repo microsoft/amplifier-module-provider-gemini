@@ -847,15 +847,19 @@ class GeminiProvider:
                 logger.error(f"Content: {response.candidates[0].content}")
                 raise ValueError("Gemini API response content has no parts")
 
-            # Emit llm:response event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                usage_data = {}
-                if hasattr(response, "usage_metadata"):
-                    usage_data = {
-                        "input": response.usage_metadata.prompt_token_count,
-                        "output": response.usage_metadata.candidates_token_count,
-                    }
+            # Convert to ChatResponse first (ordering fix — emit uses converted usage)
+            chat_response = self._convert_to_chat_response(response)
 
+            # Emit llm:response event after conversion, using canonical keys
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                usage_data: dict[str, Any] = {}
+                if chat_response.usage is not None:
+                    usage_data = {
+                        "input_tokens": chat_response.usage.input_tokens,
+                        "output_tokens": chat_response.usage.output_tokens,
+                    }
+                    if chat_response.usage.cache_read_tokens is not None:
+                        usage_data["cache_read_tokens"] = chat_response.usage.cache_read_tokens
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
@@ -872,8 +876,7 @@ class GeminiProvider:
                     )
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
-            # Convert to ChatResponse
-            return self._convert_to_chat_response(response)
+            return chat_response
 
         except LLMError as e:
             # Kernel error types — emit llm:response error event, then propagate
