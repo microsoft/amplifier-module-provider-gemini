@@ -975,15 +975,11 @@ class GeminiProvider:
                 thought_signature = getattr(fc, "thought_signature", None)
 
                 # Create ToolCallBlock
-                block_extra: dict[str, Any] = {}
-                if thought_signature:
-                    block_extra["thought_signature"] = thought_signature
                 content_blocks.append(
                     ToolCallBlock(
                         id=tool_call_id,
                         name=fc.name,
                         input=dict(fc.args),  # Convert to dict
-                        **block_extra,
                     )
                 )
 
@@ -991,7 +987,7 @@ class GeminiProvider:
                 from amplifier_core.message_models import ToolCall as TCModel
 
                 tc_extra: dict[str, Any] = {}
-                if thought_signature:
+                if thought_signature is not None:
                     tc_extra["thought_signature"] = thought_signature
                 tool_calls.append(
                     TCModel(
@@ -1151,7 +1147,7 @@ class GeminiProvider:
                         # not reject the request with INVALID_ARGUMENT on the
                         # second (and subsequent) tool-using turns.
                         thought_sig = tc.get("thought_signature")
-                        if thought_sig:
+                        if thought_sig is not None:
                             fc_part["thought_signature"] = thought_sig
                         parts.append({"function_call": fc_part})
 

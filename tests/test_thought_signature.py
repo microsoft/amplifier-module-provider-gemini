@@ -110,22 +110,24 @@ def test_parse_preserves_thought_signature_in_tool_call():
     assert tc.thought_signature == sig
 
 
-def test_parse_preserves_thought_signature_in_tool_call_block():
-    """_convert_to_chat_response must store thought_signature on ToolCallBlock."""
+def test_toolcallblock_does_not_store_thought_signature():
+    """ToolCallBlock deliberately does NOT store thought_signature.
+
+    Only ToolCall (msg["tool_calls"]) is read by _convert_messages when
+    building subsequent Gemini requests. Storing the field on ToolCallBlock
+    was dead code and has been removed.
+    """
     provider = _make_provider()
     sig = "xyz789_signature=="
     response = _make_gemini_response(
         [_make_fc_part("another_tool", {}, thought_signature=sig)]
     )
-
     chat_response = provider._convert_to_chat_response(response)
-
-    # Find the ToolCallBlock in content
     blocks = [b for b in chat_response.content if hasattr(b, "type") and b.type == "tool_call"]
     assert blocks, "Expected ToolCallBlock in content"
     block = blocks[0]
-    assert hasattr(block, "thought_signature"), "thought_signature missing from ToolCallBlock"
-    assert block.thought_signature == sig
+    # thought_signature is intentionally NOT on ToolCallBlock — it lives on ToolCall only
+    assert not hasattr(block, "thought_signature")
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +393,49 @@ def test_second_tool_call_turn_does_not_raise_with_thought_signature():
     assert fc_parts[0]["function_call"].get("thought_signature") == sig, (
         "thought_signature must be present in the API request to avoid INVALID_ARGUMENT"
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Edge case: empty-string thought_signature must not be silently dropped
+# ---------------------------------------------------------------------------
+
+
+def test_empty_string_thought_signature_is_preserved():
+    """Empty-string thought_signature must not be silently dropped.
+
+    `if thought_sig:` would treat "" as falsy and drop it.
+    `if thought_sig is not None:` correctly preserves it.
+    """
+    provider = _make_provider()
+    response = _make_gemini_response(
+        [_make_fc_part("my_tool", {}, thought_signature="")]
+    )
+    chat_response = provider._convert_to_chat_response(response)
+    tc = chat_response.tool_calls[0]
+    # The field must be present — even if the value is empty string
+    assert hasattr(tc, "thought_signature")
+    assert tc.thought_signature == ""
+
+
+def test_empty_string_thought_signature_serialized():
+    """Empty-string thought_signature must be re-attached in _convert_messages."""
+    provider = _make_provider()
+    messages = [
+        {
+            "role": "assistant",
+            "content": "calling tool",
+            "tool_calls": [
+                {
+                    "id": "tc-1",
+                    "name": "my_tool",
+                    "arguments": {},
+                    "thought_signature": "",
+                }
+            ],
+        }
+    ]
+    _, gemini_contents = provider._convert_messages(messages)
+    model_turn = next(c for c in gemini_contents if c["role"] == "model")
+    fc_part = next(p for p in model_turn["parts"] if "function_call" in p)
+    assert "thought_signature" in fc_part["function_call"]
+    assert fc_part["function_call"]["thought_signature"] == ""
