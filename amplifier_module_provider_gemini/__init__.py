@@ -966,20 +966,40 @@ class GeminiProvider:
                 fc = part.function_call
                 tool_call_id = self._generate_tool_call_id()
 
+                # Preserve thought_signature if Gemini returned one.  The API
+                # requires it to be re-submitted verbatim in subsequent turns
+                # (inside the functionCall part of the model-role content);
+                # omitting it causes INVALID_ARGUMENT on the second tool-using
+                # turn.  Both ToolCallBlock and ToolCall carry
+                # extra="allow" so the field survives model_dump() round-trips.
+                thought_signature = getattr(fc, "thought_signature", None)
+
                 # Create ToolCallBlock
+                block_extra: dict[str, Any] = {}
+                if thought_signature:
+                    block_extra["thought_signature"] = thought_signature
                 content_blocks.append(
                     ToolCallBlock(
                         id=tool_call_id,
                         name=fc.name,
                         input=dict(fc.args),  # Convert to dict
+                        **block_extra,
                     )
                 )
 
                 # Create ToolCall for tool_calls list
                 from amplifier_core.message_models import ToolCall as TCModel
 
+                tc_extra: dict[str, Any] = {}
+                if thought_signature:
+                    tc_extra["thought_signature"] = thought_signature
                 tool_calls.append(
-                    TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args))
+                    TCModel(
+                        id=tool_call_id,
+                        name=fc.name,
+                        arguments=dict(fc.args),
+                        **tc_extra,
+                    )
                 )
                 event_blocks.append(
                     ToolCallContent(
@@ -1123,14 +1143,17 @@ class GeminiProvider:
                         # Extract name - handle both old format (tool) and new format (name)
                         tool_name = tc.get("name") or tc.get("tool", "")
 
-                        parts.append(
-                            {
-                                "function_call": {
-                                    "name": tool_name,
-                                    "args": tc.get("arguments", {}),
-                                }
-                            }
-                        )
+                        fc_part: dict[str, Any] = {
+                            "name": tool_name,
+                            "args": tc.get("arguments", {}),
+                        }
+                        # Re-attach thought_signature when present so Gemini does
+                        # not reject the request with INVALID_ARGUMENT on the
+                        # second (and subsequent) tool-using turns.
+                        thought_sig = tc.get("thought_signature")
+                        if thought_sig:
+                            fc_part["thought_signature"] = thought_sig
+                        parts.append({"function_call": fc_part})
 
                 gemini_contents.append({"role": gemini_role, "parts": parts})
 
