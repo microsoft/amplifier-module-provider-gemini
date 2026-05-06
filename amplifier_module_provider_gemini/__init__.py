@@ -10,6 +10,7 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 from collections import defaultdict
+from decimal import Decimal
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from amplifier_core.llm_errors import RateLimitError
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
+from ._cost import compute_cost
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
@@ -82,6 +84,28 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         Optional cleanup function
     """
     config = config or {}
+
+    # ---------------------------------------------------------------------------
+    # Cost accumulation hook and session.cost contributor
+    # Registered unconditionally so cost tracking works even if the provider
+    # is not fully mounted (e.g. missing API key in tests).
+    # ---------------------------------------------------------------------------
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    async def _accumulate(event: str, data: dict) -> None:
+        raw = (data.get("usage") or {}).get("cost_usd")
+        if raw is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+                str(raw)
+            )
+            _totals["has_data"] = True
+
+    coordinator.hooks.register("llm:response", _accumulate)
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-gemini",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
 
     # Get API key from config or environment
     # Per Google GenAI SDK: supports both GEMINI_API_KEY and GOOGLE_API_KEY
@@ -859,7 +883,12 @@ class GeminiProvider:
                         "output_tokens": chat_response.usage.output_tokens,
                     }
                     if chat_response.usage.cache_read_tokens is not None:
-                        usage_data["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                        usage_data["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
+                    cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    if cost_usd is not None:
+                        usage_data["cost_usd"] = str(cost_usd)
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
@@ -1024,6 +1053,23 @@ class GeminiProvider:
                 reasoning_tokens=thoughts_tokens,
                 cache_read_tokens=cached_tokens,
             )
+
+            cost = compute_cost(
+                getattr(response, "model", ""),
+                prompt_token_count=getattr(
+                    response.usage_metadata, "prompt_token_count", 0
+                )
+                or 0,
+                candidates_token_count=getattr(
+                    response.usage_metadata, "candidates_token_count", 0
+                )
+                or 0,
+                cached_content_token_count=getattr(
+                    response.usage_metadata, "cached_content_token_count", None
+                )
+                or 0,
+            )
+            usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
