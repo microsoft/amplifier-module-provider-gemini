@@ -152,16 +152,16 @@ def test_fresh_input_subtraction():
 # Test from spec: preserve assertion exactly as specified in the plan
 # ---------------------------------------------------------------------------
 def test_cached_request_does_not_double_charge():
-    # 1M total prompt, all cached → fresh_input = 0 → only cache_read_rate applies
+    # 1M total prompt, all cached → fresh_input = 0 → only cache_read_rate applies.
+    # 1M > 200K threshold → HIGH tier: high_cache_read_per_m = $0.25/MTok
+    # Expected: 1_000_000 × $0.25 / 1_000_000 = $0.25
     result = compute_cost(
         "gemini-2.5-pro",
         prompt_token_count=1_000_000,
         candidates_token_count=0,
         cached_content_token_count=1_000_000,
     )
-    assert (
-        result == Decimal("0.125")
-    )  # ≤200K tier cache_read only — note: 1M > 200K so high tier applies; verify expected per actual tier logic
+    assert result == Decimal("0.25")  # high-tier cache_read only (1M > 200K threshold)
 
 
 # ---------------------------------------------------------------------------

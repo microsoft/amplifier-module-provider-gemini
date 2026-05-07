@@ -148,7 +148,7 @@ def compute_cost(
     if rates is None:
         return None
 
-    fresh_input = prompt_token_count - cached_content_token_count
+    fresh_input = max(0, prompt_token_count - cached_content_token_count)
 
     # Tier selection uses TOTAL prompt_token_count (including cached)
     if rates.get("tier_threshold") and prompt_token_count > rates["tier_threshold"]:
