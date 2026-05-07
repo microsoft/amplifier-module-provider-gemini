@@ -90,25 +90,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # Registered unconditionally so cost tracking works even if the provider
     # is not fully mounted (e.g. missing API key in tests).
     # ---------------------------------------------------------------------------
-    _totals: dict = {"cost_usd": None, "has_data": False}
-
-    async def _accumulate(event: str, data: dict) -> None:
-        if data.get("provider") != "gemini":  # ignore events from other providers
-            return
-        raw = (data.get("usage") or {}).get("cost_usd")
-        if raw is not None:
-            _totals["cost_usd"] = (
-                _totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")
-            ) + Decimal(str(raw))
-            _totals["has_data"] = True
-
-    coordinator.hooks.register("llm:response", _accumulate)
-    coordinator.register_contributor(
-        "session.cost",
-        "provider-gemini",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
-    )
-
     # Get API key from config or environment
     # Per Google GenAI SDK: supports both GEMINI_API_KEY and GOOGLE_API_KEY
     # If both are set, GOOGLE_API_KEY takes precedence
