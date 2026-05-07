@@ -85,11 +85,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
-    # ---------------------------------------------------------------------------
-    # Cost accumulation hook and session.cost contributor
-    # Registered unconditionally so cost tracking works even if the provider
-    # is not fully mounted (e.g. missing API key in tests).
-    # ---------------------------------------------------------------------------
     # Get API key from config or environment
     # Per Google GenAI SDK: supports both GEMINI_API_KEY and GOOGLE_API_KEY
     # If both are set, GOOGLE_API_KEY takes precedence
