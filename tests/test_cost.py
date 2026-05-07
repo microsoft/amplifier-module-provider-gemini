@@ -249,10 +249,10 @@ def test_convert_stamps_cost_on_usage():
     assert result.usage.cost_usd is not None, (
         "cost_usd should be stamped for known model"
     )
-    assert isinstance(result.usage.cost_usd, str), (
-        f"cost_usd should be str, got {type(result.usage.cost_usd)}"
+    assert isinstance(result.usage.cost_usd, Decimal), (
+        f"cost_usd should be Decimal, got {type(result.usage.cost_usd)}"
     )
-    assert Decimal(result.usage.cost_usd) > 0, (
+    assert result.usage.cost_usd > 0, (
         f"cost_usd should be > 0, got {result.usage.cost_usd}"
     )
 
@@ -272,7 +272,7 @@ def test_convert_stamps_cost_with_cache():
     result = provider._convert_to_chat_response(response)
     assert result.usage is not None
     # fresh_input=0, cached=1M: cost = 0 * input + 0 * output + 1M * 0.03/1M = 0.03
-    assert Decimal(result.usage.cost_usd) == Decimal("0.03"), (
+    assert result.usage.cost_usd == Decimal("0.03"), (
         f"Expected Decimal('0.03') for all-cached flash request, got {result.usage.cost_usd!r}"
     )
 

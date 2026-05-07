@@ -888,7 +888,7 @@ class GeminiProvider:
                         )
                     cost_usd = getattr(chat_response.usage, "cost_usd", None)
                     if cost_usd is not None:
-                        usage_data["cost_usd"] = str(cost_usd)
+                        usage_data["cost_usd"] = cost_usd
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
@@ -1069,7 +1069,7 @@ class GeminiProvider:
                 )
                 or 0,
             )
-            usage = usage.model_copy(update={"cost_usd": str(cost) if cost is not None else None})
+            usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
