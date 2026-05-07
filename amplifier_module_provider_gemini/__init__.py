@@ -95,7 +95,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     async def _accumulate(event: str, data: dict) -> None:
         raw = (data.get("usage") or {}).get("cost_usd")
         if raw is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+            _totals["cost_usd"] = (_totals["cost_usd"] if _totals["cost_usd"] is not None else Decimal("0")) + Decimal(
                 str(raw)
             )
             _totals["has_data"] = True
@@ -886,9 +886,7 @@ class GeminiProvider:
                         usage_data["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
-                    cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    if cost_usd is not None:
-                        usage_data["cost_usd"] = cost_usd
+                    usage_data["cost_usd"] = getattr(chat_response.usage, "cost_usd", None)
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
