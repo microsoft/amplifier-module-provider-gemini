@@ -83,6 +83,15 @@ _RATES: dict[str, dict] = {
         "high_cache_read_per_m": Decimal("0.25"),
     },
     # ------------------------------------------------------------------
+    # gemini-3-flash-preview  ($0.50 / $3.00 / $0.05 per 1M — flat rate, no tier)
+    # Used by routing matrix 'vision' and 'fast' roles (gemini-*-flash-preview glob).
+    # ------------------------------------------------------------------
+    "gemini-3-flash-preview": {
+        "input_per_m": Decimal("0.50"),
+        "output_per_m": Decimal("3.00"),
+        "cache_read_per_m": Decimal("0.05"),
+    },
+    # ------------------------------------------------------------------
     # gemini-3-pro-preview  (tiered at 200K total prompt tokens)
     #   ≤200K: $2.00 / $12.00 / $0.20 per 1M
     #   >200K: $4.00 / $18.00 / $0.40 per 1M
