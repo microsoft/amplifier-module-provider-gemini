@@ -124,7 +124,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "session.cost",
         "provider-gemini",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+        lambda: {"cost_usd": str(_totals["cost_usd"]) if _totals["cost_usd"] is not None else None} if _totals["has_data"] else None,
     )
 
     # Return cleanup function
@@ -880,9 +880,8 @@ class GeminiProvider:
                         usage_data["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
-                    usage_data["cost_usd"] = getattr(
-                        chat_response.usage, "cost_usd", None
-                    )
+                    _cost = getattr(chat_response.usage, "cost_usd", None)
+                    usage_data["cost_usd"] = str(_cost) if _cost is not None else None
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
