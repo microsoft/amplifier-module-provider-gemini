@@ -222,7 +222,6 @@ def _make_response(
 
     response = MagicMock()
     response.candidates = [candidate]
-    response.model = model
     response.usage_metadata.prompt_token_count = prompt_token_count
     response.usage_metadata.candidates_token_count = candidates_token_count
     response.usage_metadata.cached_content_token_count = cached_content_token_count
@@ -244,7 +243,7 @@ def test_convert_stamps_cost_on_usage():
         prompt_token_count=1_000,
         candidates_token_count=500,
     )
-    result = provider._convert_to_chat_response(response)
+    result = provider._convert_to_chat_response(response, model="gemini-2.5-flash")
     assert result.usage is not None
     assert result.usage.cost_usd is not None, (
         "cost_usd should be stamped for known model"
@@ -269,7 +268,7 @@ def test_convert_stamps_cost_with_cache():
         candidates_token_count=0,
         cached_content_token_count=1_000_000,
     )
-    result = provider._convert_to_chat_response(response)
+    result = provider._convert_to_chat_response(response, model="gemini-2.5-flash")
     assert result.usage is not None
     # fresh_input=0, cached=1M: cost = 0 * input + 0 * output + 1M * 0.03/1M = 0.03
     assert result.usage.cost_usd == Decimal("0.03"), (
@@ -288,7 +287,7 @@ def test_convert_leaves_cost_none_for_unknown_model():
         prompt_token_count=1_000,
         candidates_token_count=500,
     )
-    result = provider._convert_to_chat_response(response)
+    result = provider._convert_to_chat_response(response, model="gemini-unknown-model-9999")
     assert result.usage is not None
     assert result.usage.cost_usd is None, (
         f"cost_usd should be None for unknown model, got {result.usage.cost_usd!r}"

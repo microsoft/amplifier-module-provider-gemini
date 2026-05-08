@@ -866,7 +866,7 @@ class GeminiProvider:
                 raise ValueError("Gemini API response content has no parts")
 
             # Convert to ChatResponse first (ordering fix — emit uses converted usage)
-            chat_response = self._convert_to_chat_response(response)
+            chat_response = self._convert_to_chat_response(response, model=model)
 
             # Emit llm:response event after conversion, using canonical keys
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -938,7 +938,7 @@ class GeminiProvider:
                 )
             raise
 
-    def _convert_to_chat_response(self, response) -> GeminiChatResponse:
+    def _convert_to_chat_response(self, response, *, model: str = "") -> GeminiChatResponse:
         """
         Convert Gemini response to ChatResponse.
 
@@ -1049,7 +1049,7 @@ class GeminiProvider:
             )
 
             cost = compute_cost(
-                getattr(response, "model", ""),
+                model,
                 prompt_token_count=getattr(
                     response.usage_metadata, "prompt_token_count", 0
                 )
