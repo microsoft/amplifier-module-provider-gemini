@@ -101,19 +101,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     _totals: dict = {"cost_usd": None, "has_data": False}
 
-    async def _accumulate(event: str, data: dict) -> None:
-        raw = (data.get("usage") or {}).get("cost_usd")
-        if raw is not None:
-            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + (
-                raw if isinstance(raw, Decimal) else Decimal(str(raw))
-            )
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
             _totals["has_data"] = True
 
-    provider = GeminiProvider(api_key, config, coordinator)
+    provider = GeminiProvider(api_key, config, coordinator, add_cost=_add_cost)
     await coordinator.mount("providers", provider, name="gemini")
     logger.info("Mounted GeminiProvider")
-
-    coordinator.hooks.register("llm:response", _accumulate)
 
     # Register observability events via contribution channels
     coordinator.register_contributor(
