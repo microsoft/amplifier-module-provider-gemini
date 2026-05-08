@@ -10,6 +10,7 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Callable
 from decimal import Decimal
 import json
 import logging
@@ -98,7 +99,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         return None
 
-    provider = GeminiProvider(api_key, config, coordinator)
+    _totals: dict[str, Decimal] = {"cost_usd": Decimal(0)}
+
+    def _add_cost(cost: Decimal | None) -> None:
+        if cost is not None:
+            _totals["cost_usd"] += cost
+
+    provider = GeminiProvider(api_key, config, coordinator, add_cost=_add_cost)
     await coordinator.mount("providers", provider, name="gemini")
     logger.info("Mounted GeminiProvider")
 
@@ -112,6 +119,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "provider:tool_sequence_repaired",
             "thinking:final",
         ],
+    )
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-gemini",
+        lambda: _totals,
     )
 
     # Return cleanup function
@@ -139,6 +151,7 @@ class GeminiProvider:
         api_key: str | None = None,
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
+        add_cost: Callable[[Decimal | None], None] | None = None,
     ):
         """
         Initialize Gemini provider.
@@ -150,9 +163,11 @@ class GeminiProvider:
             api_key: Google AI API key (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
+            add_cost: Optional callback to accumulate cost_usd into a session total
         """
         self._api_key = api_key
         self._client = None  # Lazy init
+        self._add_cost = add_cost if add_cost is not None else lambda cost: None
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
@@ -1048,6 +1063,7 @@ class GeminiProvider:
                 or 0,
             )
             usage = usage.model_copy(update={"cost_usd": cost})
+            self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
