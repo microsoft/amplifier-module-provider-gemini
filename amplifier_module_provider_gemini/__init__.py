@@ -10,6 +10,8 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Callable
+from decimal import Decimal
 import json
 import logging
 import os
@@ -39,6 +41,7 @@ from amplifier_core.llm_errors import RateLimitError
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
+from ._cost import compute_cost
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
@@ -96,7 +99,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         return None
 
-    provider = GeminiProvider(api_key, config, coordinator)
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    def _add_cost(cost) -> None:
+        if cost is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["has_data"] = True
+
+    provider = GeminiProvider(api_key, config, coordinator, add_cost=_add_cost)
     await coordinator.mount("providers", provider, name="gemini")
     logger.info("Mounted GeminiProvider")
 
@@ -110,6 +120,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "provider:tool_sequence_repaired",
             "thinking:final",
         ],
+    )
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-gemini",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
     )
 
     # Return cleanup function
@@ -137,6 +152,7 @@ class GeminiProvider:
         api_key: str | None = None,
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
+        add_cost: Callable[[Decimal | None], None] | None = None,
     ):
         """
         Initialize Gemini provider.
@@ -148,9 +164,11 @@ class GeminiProvider:
             api_key: Google AI API key (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
+            add_cost: Optional callback to accumulate cost_usd into a session total
         """
         self._api_key = api_key
         self._client = None  # Lazy init
+        self._add_cost = add_cost if add_cost is not None else lambda cost: None
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
@@ -848,7 +866,7 @@ class GeminiProvider:
                 raise ValueError("Gemini API response content has no parts")
 
             # Convert to ChatResponse first (ordering fix — emit uses converted usage)
-            chat_response = self._convert_to_chat_response(response)
+            chat_response = self._convert_to_chat_response(response, model=model)
 
             # Emit llm:response event after conversion, using canonical keys
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -859,7 +877,12 @@ class GeminiProvider:
                         "output_tokens": chat_response.usage.output_tokens,
                     }
                     if chat_response.usage.cache_read_tokens is not None:
-                        usage_data["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                        usage_data["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
+                    usage_data["cost_usd"] = getattr(
+                        chat_response.usage, "cost_usd", None
+                    )
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
@@ -915,7 +938,7 @@ class GeminiProvider:
                 )
             raise
 
-    def _convert_to_chat_response(self, response) -> GeminiChatResponse:
+    def _convert_to_chat_response(self, response, *, model: str = "") -> GeminiChatResponse:
         """
         Convert Gemini response to ChatResponse.
 
@@ -1024,6 +1047,24 @@ class GeminiProvider:
                 reasoning_tokens=thoughts_tokens,
                 cache_read_tokens=cached_tokens,
             )
+
+            cost = compute_cost(
+                model,
+                prompt_token_count=getattr(
+                    response.usage_metadata, "prompt_token_count", 0
+                )
+                or 0,
+                candidates_token_count=getattr(
+                    response.usage_metadata, "candidates_token_count", 0
+                )
+                or 0,
+                cached_content_token_count=getattr(
+                    response.usage_metadata, "cached_content_token_count", None
+                )
+                or 0,
+            )
+            usage = usage.model_copy(update={"cost_usd": cost})
+            self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
