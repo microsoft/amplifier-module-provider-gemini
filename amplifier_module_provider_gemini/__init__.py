@@ -9,6 +9,7 @@ __all__ = ["mount", "GeminiProvider"]
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import base64
 from collections import defaultdict
 import json
 import logging
@@ -118,6 +119,28 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         pass
 
     return cleanup
+
+
+
+def _encode_sig(sig: bytes | str | None) -> str | None:
+    """Encode a Gemini thought_signature for the wire format.
+
+    Gemini 2.5+ attaches an opaque ``thought_signature`` to parts that follow
+    a thinking burst.  The SDK returns raw bytes; the REST API accepts a
+    base64-encoded ASCII string.  Pre-encoded strings (e.g. round-tripped from
+    a ThinkingBlock) are returned as-is.
+
+    Args:
+        sig: Raw bytes from the SDK, an already-encoded str, or None.
+
+    Returns:
+        Base64-encoded ASCII string, or None if sig is falsy.
+    """
+    if not sig:
+        return None
+    if isinstance(sig, bytes):
+        return base64.b64encode(sig).decode("ascii")
+    return sig  # assume already base64-encoded str
 
 
 class GeminiChatResponse(ChatResponse):
@@ -937,10 +960,14 @@ class GeminiProvider:
                 # Parts with thought_signature (but NOT thought=True) are the final answer
                 if hasattr(part, "thought") and part.thought is True:
                     # This is a thinking/reasoning part (internal reasoning process)
+                    # ThinkingBlock.signature is str|None; the SDK gives raw bytes —
+                    # encode to base64 before storing.
                     content_blocks.append(
                         ThinkingBlock(
                             thinking=part.text,
-                            signature=getattr(part, "thought_signature", None),
+                            signature=_encode_sig(
+                                getattr(part, "thought_signature", None)
+                            ),
                             visibility="internal",
                         )
                     )
@@ -958,7 +985,16 @@ class GeminiProvider:
                             )
                 else:
                     # Regular text (including final answer with thought_signature)
-                    content_blocks.append(TextBlock(text=part.text))
+                    # Capture any thought_signature as an extra field (bytes) so the
+                    # outbound path can echo it back to the API.
+                    _text_sig = getattr(part, "thought_signature", None)
+                    _text_kwargs: dict = {"signature": _text_sig} if _text_sig is not None else {}
+                    content_blocks.append(TextBlock(text=part.text, **_text_kwargs))
+                    if _text_sig is not None:
+                        logger.debug(
+                            "[PROVIDER] Gemini: captured thought_signature on text part (%d bytes)",
+                            len(_text_sig),
+                        )
                     text_accumulator.append(part.text)
                     event_blocks.append(TextContent(text=part.text))
             elif hasattr(part, "function_call"):
@@ -966,12 +1002,26 @@ class GeminiProvider:
                 fc = part.function_call
                 tool_call_id = self._generate_tool_call_id()
 
+                # Capture thought_signature if present (Gemini 2.5+ thinking models).
+                # Store as raw bytes in an extra field so the outbound path can echo
+                # it back without an additional encode/decode round-trip.
+                _fc_sig = getattr(part, "thought_signature", None)
+                _fc_kwargs: dict = {"signature": _fc_sig} if _fc_sig is not None else {}
+                if _fc_sig is not None:
+                    logger.debug(
+                        "[PROVIDER] Gemini: captured thought_signature on function_call "
+                        "part '%s' (%d bytes)",
+                        fc.name,
+                        len(_fc_sig),
+                    )
+
                 # Create ToolCallBlock
                 content_blocks.append(
                     ToolCallBlock(
                         id=tool_call_id,
                         name=fc.name,
                         input=dict(fc.args),  # Convert to dict
+                        **_fc_kwargs,
                     )
                 )
 
@@ -979,7 +1029,7 @@ class GeminiProvider:
                 from amplifier_core.message_models import ToolCall as TCModel
 
                 tool_calls.append(
-                    TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args))
+                    TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args), **_fc_kwargs)
                 )
                 event_blocks.append(
                     ToolCallContent(
@@ -1100,13 +1150,30 @@ class GeminiProvider:
                         # Content is a list of blocks - extract text blocks only
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "text":
-                                parts.append({"text": block.get("text", "")})
+                                text_part: dict[str, Any] = {"text": block.get("text", "")}
+                                if _tsig := block.get("signature"):
+                                    text_part["thought_signature"] = _encode_sig(_tsig)
+                                    logger.debug(
+                                        "[PROVIDER] Gemini: echoing thought_signature on text part"
+                                    )
+                                parts.append(text_part)
                             elif (
                                 isinstance(block, dict)
                                 and block.get("type") == "thinking"
                             ):
-                                # Gemini doesn't have thinking in input, skip
-                                pass
+                                # Echo thinking blocks that carry a thought_signature
+                                # (Gemini 2.5+ requires these to maintain reasoning context).
+                                # Thinking blocks WITHOUT a signature are from older models
+                                # that didn't require round-tripping — skip them as before.
+                                if _tsig := block.get("signature"):
+                                    thought_part: dict[str, Any] = {"thought": True}
+                                    if _thinking_text := block.get("thinking"):
+                                        thought_part["text"] = _thinking_text
+                                    thought_part["thought_signature"] = _encode_sig(_tsig)
+                                    logger.debug(
+                                        "[PROVIDER] Gemini: echoing thought_signature on thinking part"
+                                    )
+                                    parts.append(thought_part)
                             elif (
                                 isinstance(block, dict)
                                 and block.get("type") == "tool_call"
@@ -1123,14 +1190,23 @@ class GeminiProvider:
                         # Extract name - handle both old format (tool) and new format (name)
                         tool_name = tc.get("name") or tc.get("tool", "")
 
-                        parts.append(
-                            {
-                                "function_call": {
-                                    "name": tool_name,
-                                    "args": tc.get("arguments", {}),
-                                }
+                        fc_part: dict[str, Any] = {
+                            "function_call": {
+                                "name": tool_name,
+                                "args": tc.get("arguments", {}),
                             }
-                        )
+                        }
+                        # Echo thought_signature if present (Gemini 2.5+ thinking models).
+                        # Omitting it causes HTTP 400 "Function call is missing a
+                        # thought_signature in functionCall parts".
+                        if _tc_sig := tc.get("signature"):
+                            fc_part["thought_signature"] = _encode_sig(_tc_sig)
+                            logger.debug(
+                                "[PROVIDER] Gemini: echoing thought_signature on "
+                                "function_call part '%s'",
+                                tool_name,
+                            )
+                        parts.append(fc_part)
 
                 gemini_contents.append({"role": gemini_role, "parts": parts})
 
