@@ -68,6 +68,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Process-wide concurrency semaphore
+# Shared across ALL GeminiProvider instances in this process (including
+# parent + delegated child sessions). Prevents simultaneous-delegation
+# blast patterns from exhausting Gemini API rate limits.
+# Created lazily on the first API call; keyed by event loop so that tests
+# using asyncio.run() get fresh semaphores rather than inheriting stale state.
+# ---------------------------------------------------------------------------
+
+_process_semaphore: asyncio.Semaphore | None = None
+_process_semaphore_loop: Any = None  # asyncio.AbstractEventLoop
+_process_semaphore_max: int = 0
+_active_requests: int = 0  # currently holding semaphore (executing)
+_waiting_requests: int = 0  # waiting to acquire semaphore
+
+
+async def _get_process_semaphore(max_concurrent: int) -> asyncio.Semaphore | None:
+    """Get or create the process-wide concurrency semaphore.
+
+    Returns ``None`` when ``max_concurrent <= 0`` (semaphore disabled).
+    Recreates the semaphore when called from a different event loop so that
+    unit tests using ``asyncio.run()`` always get a fresh, valid semaphore.
+    """
+    global _process_semaphore, _process_semaphore_loop, _process_semaphore_max
+    if max_concurrent <= 0:
+        return None
+    current_loop = asyncio.get_running_loop()
+    if (
+        _process_semaphore is None
+        or _process_semaphore_loop is not current_loop
+        or _process_semaphore_max != max_concurrent
+    ):
+        _process_semaphore = asyncio.Semaphore(max_concurrent)
+        _process_semaphore_loop = current_loop
+        _process_semaphore_max = max_concurrent
+    return _process_semaphore
+
+
 _CLOUDFLARE_403_WARNING = (
     "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
     "with no details). Treating as transient — will retry."
@@ -118,6 +156,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         lambda: [
             "llm:request",
             "llm:response",
+            "provider:concurrency",
             "provider:tool_sequence_repaired",
             "thinking:final",
         ],
@@ -125,7 +164,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "session.cost",
         "provider-gemini",
-        lambda: {"cost_usd": str(_totals["cost_usd"]) if _totals["cost_usd"] is not None else None} if _totals["has_data"] else None,
+        lambda: {
+            "cost_usd": str(_totals["cost_usd"])
+            if _totals["cost_usd"] is not None
+            else None
+        }
+        if _totals["has_data"]
+        else None,
     )
 
     # Return cleanup function
@@ -134,7 +179,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         pass
 
     return cleanup
-
 
 
 def _encode_sig(sig: bytes | str | None) -> str | None:
@@ -207,6 +251,16 @@ class GeminiProvider:
             initial_delay=float(self.config.get("min_retry_delay", 1.0)),
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
             jitter=bool(self.config.get("retry_jitter", True)),
+        )
+
+        # Process-wide concurrency gate.
+        # Limits how many API calls this process has in-flight simultaneously,
+        # shared across ALL provider instances (parent + delegated child sessions).
+        # This prevents blast patterns (e.g. parallel: true recipes spawning many
+        # concurrent calls) from exhausting Gemini API rate limits.
+        # Set to 0 to disable the semaphore entirely.
+        self._max_concurrent_requests = int(
+            self.config.get("max_concurrent_requests", 5)
         )
 
         # Track repaired tool call IDs to prevent infinite detection loops.
@@ -858,9 +912,63 @@ class GeminiProvider:
                     },
                 )
 
+        async def _do_complete_guarded():
+            """Semaphore-gated wrapper around _do_complete with concurrency logging.
+
+            Acquires the process-wide concurrency semaphore before each API call
+            attempt so that at most ``max_concurrent_requests`` calls are in-flight
+            simultaneously across all provider instances in this process.
+
+            This is the function passed to retry_with_backoff so that:
+            - the semaphore is *released* between retry attempts (during backoff sleep)
+            - each fresh attempt must re-acquire before hitting the network
+            """
+            global _active_requests, _waiting_requests
+            sem = await _get_process_semaphore(self._max_concurrent_requests)
+            if sem is not None:
+                _waiting_requests += 1
+                async with sem:
+                    _waiting_requests -= 1
+                    _active_requests += 1
+                    try:
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                "provider:concurrency",
+                                {
+                                    "provider": "gemini",
+                                    "model": model,
+                                    "active_requests": _active_requests,
+                                    "waiting_requests": _waiting_requests,
+                                    "max_concurrent": self._max_concurrent_requests,
+                                    "process_id": os.getpid(),
+                                },
+                            )
+                        return await _do_complete()
+                    finally:
+                        _active_requests -= 1
+            else:
+                # Semaphore disabled (max_concurrent_requests=0) — still log
+                _active_requests += 1
+                try:
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "provider:concurrency",
+                            {
+                                "provider": "gemini",
+                                "model": model,
+                                "active_requests": _active_requests,
+                                "waiting_requests": _waiting_requests,
+                                "max_concurrent": 0,
+                                "process_id": os.getpid(),
+                            },
+                        )
+                    return await _do_complete()
+                finally:
+                    _active_requests -= 1
+
         try:
             response = await retry_with_backoff(
-                _do_complete,
+                _do_complete_guarded,
                 self._retry_config,
                 on_retry=_on_retry,
             )
@@ -960,7 +1068,9 @@ class GeminiProvider:
                 )
             raise
 
-    def _convert_to_chat_response(self, response, *, model: str = "") -> GeminiChatResponse:
+    def _convert_to_chat_response(
+        self, response, *, model: str = ""
+    ) -> GeminiChatResponse:
         """
         Convert Gemini response to ChatResponse.
 
@@ -1013,7 +1123,9 @@ class GeminiProvider:
                     # Capture any thought_signature as an extra field (bytes) so the
                     # outbound path can echo it back to the API.
                     _text_sig = getattr(part, "thought_signature", None)
-                    _text_kwargs: dict = {"signature": _text_sig} if _text_sig is not None else {}
+                    _text_kwargs: dict = (
+                        {"signature": _text_sig} if _text_sig is not None else {}
+                    )
                     content_blocks.append(TextBlock(text=part.text, **_text_kwargs))
                     if _text_sig is not None:
                         logger.debug(
@@ -1054,7 +1166,12 @@ class GeminiProvider:
                 from amplifier_core.message_models import ToolCall as TCModel
 
                 tool_calls.append(
-                    TCModel(id=tool_call_id, name=fc.name, arguments=dict(fc.args), **_fc_kwargs)
+                    TCModel(
+                        id=tool_call_id,
+                        name=fc.name,
+                        arguments=dict(fc.args),
+                        **_fc_kwargs,
+                    )
                 )
                 event_blocks.append(
                     ToolCallContent(
@@ -1193,7 +1310,9 @@ class GeminiProvider:
                         # Content is a list of blocks - extract text blocks only
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "text":
-                                text_part: dict[str, Any] = {"text": block.get("text", "")}
+                                text_part: dict[str, Any] = {
+                                    "text": block.get("text", "")
+                                }
                                 if _tsig := block.get("signature"):
                                     text_part["thought_signature"] = _encode_sig(_tsig)
                                     logger.debug(
@@ -1212,7 +1331,9 @@ class GeminiProvider:
                                     thought_part: dict[str, Any] = {"thought": True}
                                     if _thinking_text := block.get("thinking"):
                                         thought_part["text"] = _thinking_text
-                                    thought_part["thought_signature"] = _encode_sig(_tsig)
+                                    thought_part["thought_signature"] = _encode_sig(
+                                        _tsig
+                                    )
                                     logger.debug(
                                         "[PROVIDER] Gemini: echoing thought_signature on thinking part"
                                     )
