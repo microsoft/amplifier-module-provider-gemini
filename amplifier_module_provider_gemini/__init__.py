@@ -161,7 +161,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "thinking:final",
             "llm:stream_block_start",
             "llm:stream_block_delta",
-            "llm:stream_thinking_delta",
             "llm:stream_block_end",
             "llm:stream_aborted",
         ],
@@ -986,9 +985,8 @@ class GeminiProvider:
             Iterates generate_content_stream chunks, synthesises block
             start/end boundaries (Gemini has no explicit ones), and emits
             the five contract events per provider-streaming-contract.md:
-              llm:stream_block_start, llm:stream_block_delta,
-              llm:stream_thinking_delta, llm:stream_block_end,
-              llm:stream_aborted.
+              llm:stream_block_start, llm:stream_block_delta (text + thinking),
+              llm:stream_block_end, llm:stream_aborted.
 
             Timeout is enforced per-anext() because asyncio.wait_for
             cannot wrap an async generator directly.
@@ -1151,19 +1149,16 @@ class GeminiProvider:
                             await _close_block()
                             await _open_block(part_type)
 
-                        # Emit delta (contract: guard every delta with )
+                        # Emit delta — ONE event for all block content (contract: guard with if text:)
+                        # block_type sourced from current_block_type (equals part_type after _open_block)
                         if text:
-                            _event = (
-                                "llm:stream_thinking_delta"
-                                if part_type == "thinking"
-                                else "llm:stream_block_delta"
-                            )
                             if hooks_available:
                                 await self.coordinator.hooks.emit(
-                                    _event,
+                                    "llm:stream_block_delta",
                                     {
                                         "request_id": request_id,
                                         "block_index": block_index,
+                                        "block_type": current_block_type,
                                         "sequence": seq[block_index],
                                         "text": text,
                                     },

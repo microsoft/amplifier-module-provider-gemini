@@ -211,7 +211,12 @@ async def test_single_request_id_across_all_stream_events():
 
 @pytest.mark.asyncio
 async def test_thinking_only_produces_correct_events():
-    """Thinking parts -> block_start(thinking,0) + thinking_deltas + block_end(thinking,0)."""
+    """Thinking parts -> block_start(thinking,0) + block_deltas(thinking) + block_end(thinking,0).
+
+    Contract: ONE delta event (llm:stream_block_delta) for ALL block content;
+    block_type on every delta distinguishes thinking from text.
+    llm:stream_thinking_delta is REMOVED.
+    """
     provider, coordinator = _make_provider()
     chunks = [
         _chunk([_part(text="I think...", thought=True)]),
@@ -229,17 +234,18 @@ async def test_thinking_only_produces_correct_events():
 
     names = [n for n, _ in _stream_events(coordinator)]
     assert "llm:stream_block_start" in names
-    assert "llm:stream_thinking_delta" in names
+    assert "llm:stream_block_delta" in names          # single event for ALL block content
     assert "llm:stream_block_end" in names
-    assert "llm:stream_block_delta" not in names
+    assert "llm:stream_thinking_delta" not in names   # removed per contract
 
     starts = _by_name(coordinator, "llm:stream_block_start")
     assert len(starts) == 1
     assert starts[0]["block_index"] == 0
     assert starts[0]["block_type"] == "thinking"
 
-    deltas = _by_name(coordinator, "llm:stream_thinking_delta")
+    deltas = _by_name(coordinator, "llm:stream_block_delta")
     assert len(deltas) == 2
+    assert all(d["block_type"] == "thinking" for d in deltas)  # block_type on every delta
     assert deltas[0]["text"] == "I think..."
     assert deltas[1]["text"] == " therefore I am."
     assert deltas[0]["sequence"] == 0
@@ -288,6 +294,7 @@ async def test_text_only_produces_correct_events():
 
     deltas = _by_name(coordinator, "llm:stream_block_delta")
     assert len(deltas) == 2
+    assert all(d["block_type"] == "text" for d in deltas)  # block_type on every delta
     assert deltas[0]["text"] == "Hello"
     assert deltas[1]["text"] == " world"
     assert deltas[0]["sequence"] == 0
@@ -322,15 +329,19 @@ async def test_thinking_then_text_transition_synthesizes_boundaries():
 
     await provider.complete(ChatRequest(messages=[Message(role="user", content="solve")]))
 
-    stream_names = [n for n, _ in _stream_events(coordinator)]
+    all_stream_events = _stream_events(coordinator)
 
-    # Ordering: block_start(thinking) < thinking_delta < block_end(thinking) < block_delta
-    first_start = stream_names.index("llm:stream_block_start")
-    first_thinking = stream_names.index("llm:stream_thinking_delta")
-    first_end = stream_names.index("llm:stream_block_end")
-    first_delta = stream_names.index("llm:stream_block_delta")
-    assert first_start < first_thinking < first_end < first_delta, (
-        f"Wrong ordering: {stream_names}"
+    # Ordering (by position in event list):
+    #   block_start(thinking) < block_delta(thinking) < block_end(thinking) < block_delta(text)
+    # Both thinking and text fragments use llm:stream_block_delta; block_type distinguishes them.
+    def _pos(name, *, block_type=None):
+        for i, (n, p) in enumerate(all_stream_events):
+            if n == name and (block_type is None or p.get("block_type") == block_type):
+                return i
+        raise ValueError(f"Event {name!r} block_type={block_type!r} not found")
+
+    assert _pos("llm:stream_block_start", block_type="thinking")         < _pos("llm:stream_block_delta", block_type="thinking")         < _pos("llm:stream_block_end", block_type="thinking")         < _pos("llm:stream_block_delta", block_type="text"), (
+        f"Wrong ordering: {[n for n, _ in all_stream_events]}"
     )
 
     starts = _by_name(coordinator, "llm:stream_block_start")
@@ -347,7 +358,8 @@ async def test_thinking_then_text_transition_synthesizes_boundaries():
     assert ends[1]["block_index"] == 1
     assert ends[1]["block_type"] == "text"
 
-    text_deltas = _by_name(coordinator, "llm:stream_block_delta")
+    all_deltas = _by_name(coordinator, "llm:stream_block_delta")
+    text_deltas = [d for d in all_deltas if d["block_type"] == "text"]
     assert len(text_deltas) == 1
     assert text_deltas[0]["block_index"] == 1
     assert text_deltas[0]["sequence"] == 0  # resets per block
@@ -472,12 +484,15 @@ async def test_sequence_counter_is_per_block_and_resets():
 
     await provider.complete(ChatRequest(messages=[Message(role="user", content="go")]))
 
-    thinking_deltas = _by_name(coordinator, "llm:stream_thinking_delta")
+    # Both thinking and text use llm:stream_block_delta; filter by block_type.
+    all_deltas = _by_name(coordinator, "llm:stream_block_delta")
+    thinking_deltas = [d for d in all_deltas if d["block_type"] == "thinking"]
+    text_deltas = [d for d in all_deltas if d["block_type"] == "text"]
+
     assert len(thinking_deltas) == 2
     assert thinking_deltas[0]["sequence"] == 0
     assert thinking_deltas[1]["sequence"] == 1
 
-    text_deltas = _by_name(coordinator, "llm:stream_block_delta")
     assert len(text_deltas) == 2
     assert text_deltas[0]["sequence"] == 0  # reset
     assert text_deltas[1]["sequence"] == 1
@@ -518,8 +533,7 @@ async def test_function_call_emits_tool_use_block_no_deltas():
     assert len(ends) == 1
     assert ends[0]["block_type"] == "tool_use"
 
-    assert not _by_name(coordinator, "llm:stream_block_delta"), "No text deltas for tool_use"
-    assert not _by_name(coordinator, "llm:stream_thinking_delta"), "No thinking deltas for tool_use"
+    assert not _by_name(coordinator, "llm:stream_block_delta"), "No deltas for tool_use (text or thinking)"
 
     assert response.tool_calls, "Tool call must be in ChatResponse"
     assert response.tool_calls[0].name == "get_weather"
