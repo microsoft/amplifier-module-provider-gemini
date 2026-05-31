@@ -47,7 +47,7 @@ class FakeCoordinator:
 
 def _make_provider(**config_overrides) -> GeminiProvider:
     """Create a provider with retry disabled for error translation tests."""
-    config = {"max_retries": 0, **config_overrides}
+    config = {"max_retries": 0, "use_streaming": False, **config_overrides}
     provider = GeminiProvider(api_key="test-key", config=config)
     provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
     return provider

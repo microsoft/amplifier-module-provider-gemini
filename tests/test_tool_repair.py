@@ -45,7 +45,7 @@ def _make_gemini_response():
 
 
 def _make_provider() -> GeminiProvider:
-    provider = GeminiProvider(api_key="test-key", config={"max_retries": 0})
+    provider = GeminiProvider(api_key="test-key", config={"max_retries": 0, "use_streaming": False})
     mock_client = MagicMock()
     mock_client.aio.models.generate_content = AsyncMock(
         return_value=_make_gemini_response()

@@ -76,7 +76,7 @@ def _make_provider(
     model: str = "gemini-2.5-flash",
 ) -> tuple[GeminiProvider, FakeCoordinator]:
     """Create a GeminiProvider wired to a FakeCoordinator, with a mocked client."""
-    cfg = {"max_retries": 0, "default_model": model}
+    cfg = {"max_retries": 0, "default_model": model, "use_streaming": False}
     provider = GeminiProvider(api_key="test-key", config=cfg)
     coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, coordinator)
@@ -239,7 +239,7 @@ def test_usage_model_stores_decimal_internally():
     event, session.cost contributor).  The Usage model itself must keep
     cost_usd as Decimal so downstream callers retain arithmetic precision.
     """
-    provider = GeminiProvider(api_key="test-key", config={})
+    provider = GeminiProvider(api_key="test-key", config={"use_streaming": False})
     mock_response = _make_gemini_response(
         prompt_token_count=1_000, candidates_token_count=200
     )

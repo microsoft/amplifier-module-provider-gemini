@@ -49,7 +49,7 @@ def _make_provider(
     config: dict | None = None,
 ) -> tuple[GeminiProvider, FakeCoordinator]:
     """Create a GeminiProvider with a fake coordinator and mocked client."""
-    cfg = {"max_retries": 0, **(config or {})}
+    cfg = {"max_retries": 0, "use_streaming": False, **(config or {})}
     provider = GeminiProvider(api_key="test-key", config=cfg)
     coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, coordinator)

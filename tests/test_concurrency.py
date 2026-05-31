@@ -100,6 +100,7 @@ def _make_provider(
     config = {
         "max_retries": 0,
         "max_concurrent_requests": max_concurrent,
+        "use_streaming": False,
         **extra_config,
     }
     provider = GeminiProvider(api_key="test-key", config=config)
@@ -136,13 +137,13 @@ class TestSemaphoreConfig:
 
     def test_config_overrides_default(self):
         provider = GeminiProvider(
-            api_key="test-key", config={"max_concurrent_requests": 3}
+            api_key="test-key", config={"max_concurrent_requests": 3, "use_streaming": False}
         )
         assert provider._max_concurrent_requests == 3
 
     def test_zero_disables_semaphore(self):
         provider = GeminiProvider(
-            api_key="test-key", config={"max_concurrent_requests": 0}
+            api_key="test-key", config={"max_concurrent_requests": 0, "use_streaming": False}
         )
         assert provider._max_concurrent_requests == 0
 
@@ -429,6 +430,7 @@ class TestConcurrencyEventEmission:
             config={
                 "max_retries": 0,
                 "max_concurrent_requests": 5,
+                "use_streaming": False,
             },
         )
         provider.coordinator = None

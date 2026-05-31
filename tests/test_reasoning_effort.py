@@ -42,7 +42,7 @@ def _make_gemini_response():
 
 
 def _make_provider() -> GeminiProvider:
-    provider = GeminiProvider(api_key="test-key", config={"max_retries": 0})
+    provider = GeminiProvider(api_key="test-key", config={"max_retries": 0, "use_streaming": False})
     provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
     return provider
 
