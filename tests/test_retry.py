@@ -69,7 +69,7 @@ def test_retries_on_retryable_error_then_succeeds():
     """Retry loop should retry on retryable errors and succeed when API recovers."""
     provider = GeminiProvider(
         api_key="test-key",
-        config={"max_retries": 3, "min_retry_delay": 0.01, "max_retry_delay": 0.1},
+        config={"max_retries": 3, "min_retry_delay": 0.01, "max_retry_delay": 0.1, "use_streaming": False},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -105,7 +105,7 @@ def test_no_retry_on_non_retryable_error():
     """Non-retryable errors (e.g. AuthenticationError) should raise immediately."""
     provider = GeminiProvider(
         api_key="test-key",
-        config={"max_retries": 5, "min_retry_delay": 0.01},
+        config={"max_retries": 5, "min_retry_delay": 0.01, "use_streaming": False},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -135,7 +135,7 @@ def test_retry_after_exceeds_max_delay_raises_immediately():
     """If retry_after > max_retry_delay, fail fast instead of waiting."""
     provider = GeminiProvider(
         api_key="test-key",
-        config={"max_retries": 5, "max_retry_delay": 60.0, "min_retry_delay": 0.01},
+        config={"max_retries": 5, "max_retry_delay": 60.0, "min_retry_delay": 0.01, "use_streaming": False},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -169,7 +169,7 @@ def test_exhausts_all_retries_then_raises():
     """After max_retries attempts, the error should propagate."""
     provider = GeminiProvider(
         api_key="test-key",
-        config={"max_retries": 2, "min_retry_delay": 0.01, "max_retry_delay": 0.05},
+        config={"max_retries": 2, "min_retry_delay": 0.01, "max_retry_delay": 0.05, "use_streaming": False},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -199,7 +199,7 @@ def test_timeout_error_retried():
     """asyncio.TimeoutError should be translated and retried."""
     provider = GeminiProvider(
         api_key="test-key",
-        config={"max_retries": 2, "min_retry_delay": 0.01, "max_retry_delay": 0.05},
+        config={"max_retries": 2, "min_retry_delay": 0.01, "max_retry_delay": 0.05, "use_streaming": False},
     )
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)

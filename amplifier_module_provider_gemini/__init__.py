@@ -159,6 +159,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "provider:concurrency",
             "provider:tool_sequence_repaired",
             "thinking:final",
+            "llm:stream_block_start",
+            "llm:stream_block_delta",
+            "llm:stream_block_end",
+            "llm:stream_aborted",
         ],
     )
     coordinator.register_contributor(
@@ -244,6 +248,7 @@ class GeminiProvider:
         self.timeout = self.config.get("timeout", 600.0)
         self.priority = self.config.get("priority", 100)
         self.raw = self.config.get("raw", False)
+        self.use_streaming = self.config.get("use_streaming", True)
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
@@ -916,7 +921,7 @@ class GeminiProvider:
             """Semaphore-gated wrapper around _do_complete with concurrency logging.
 
             Acquires the process-wide concurrency semaphore before each API call
-            attempt so that at most ``max_concurrent_requests`` calls are in-flight
+            attempt so that at most max_concurrent_requests calls are in-flight
             simultaneously across all provider instances in this process.
 
             This is the function passed to retry_with_backoff so that:
@@ -966,40 +971,315 @@ class GeminiProvider:
                 finally:
                     _active_requests -= 1
 
-        try:
-            response = await retry_with_backoff(
-                _do_complete_guarded,
-                self._retry_config,
-                on_retry=_on_retry,
+        # ----------------------------------------------------------------
+        # Per-request streaming override (contract §Per-request stream override)
+        # ----------------------------------------------------------------
+        _meta = getattr(request, "metadata", None)
+        _use_streaming = self.use_streaming
+        if isinstance(_meta, dict) and _meta.get("stream") is False:
+            _use_streaming = False
+
+        async def _do_complete_streaming():
+            """Streaming API call with contract-compliant event emission.
+
+            Iterates generate_content_stream chunks, synthesises block
+            start/end boundaries (Gemini has no explicit ones), and emits
+            the five contract events per provider-streaming-contract.md:
+              llm:stream_block_start, llm:stream_block_delta (text + thinking),
+              llm:stream_block_end, llm:stream_aborted.
+
+            Timeout is enforced per-anext() because asyncio.wait_for
+            cannot wrap an async generator directly.
+            """
+            from types import SimpleNamespace as _NS
+
+            request_id = str(uuid.uuid4())
+            block_index = -1
+            current_block_type: str | None = None
+            seq: dict[int, int] = {}          # block_index -> next sequence number
+            partial_emitted = False
+            hooks_available = bool(
+                self.coordinator and hasattr(self.coordinator, "hooks")
             )
+
+            # Per-block text accumulator and running thought_signature
+            current_text_buf: list[str] = []
+            current_sig = None
+            # Collected virtual parts for _convert_to_chat_response
+            collected_parts: list = []
+            final_usage_metadata = None
+
+            def _flush_block() -> None:
+                """Merge text fragments into one part and append to collected_parts."""
+                nonlocal current_text_buf, current_sig
+                if current_block_type in ("text", "thinking"):
+                    combined = "".join(current_text_buf)
+                    if combined:
+                        collected_parts.append(
+                            _NS(
+                                text=combined,
+                                thought=(current_block_type == "thinking"),
+                                thought_signature=current_sig,
+                            )
+                        )
+                current_text_buf.clear()
+                current_sig = None
+
+            async def _open_block(btype: str, name: str | None = None) -> None:
+                nonlocal block_index, current_block_type
+                block_index += 1
+                current_block_type = btype
+                seq[block_index] = 0
+                if hooks_available:
+                    payload: dict[str, Any] = {
+                        "request_id": request_id,
+                        "block_index": block_index,
+                        "block_type": btype,
+                    }
+                    if name is not None:
+                        payload["name"] = name
+                    await self.coordinator.hooks.emit(
+                        "llm:stream_block_start", payload
+                    )
+
+            async def _close_block() -> None:
+                nonlocal current_block_type
+                if current_block_type is None:
+                    return
+                if hooks_available:
+                    await self.coordinator.hooks.emit(
+                        "llm:stream_block_end",
+                        {
+                            "request_id": request_id,
+                            "block_index": block_index,
+                            "block_type": current_block_type,
+                        },
+                    )
+                _flush_block()
+                current_block_type = None
+
+            try:
+                # Establish the stream; timeout covers connection setup
+                try:
+                    stream = await asyncio.wait_for(
+                        self.client.aio.models.generate_content_stream(
+                            model=model,
+                            contents=all_messages,
+                            config=config,
+                        ),
+                        timeout=self.timeout,
+                    )
+                except asyncio.TimeoutError as _te:
+                    raise LLMTimeoutError(
+                        f"Stream connection timed out after {self.timeout}s",
+                        provider="gemini",
+                        retryable=True,
+                    ) from _te
+
+                # Iterate chunks; timeout enforced per-anext()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            stream.__anext__(),
+                            timeout=self.timeout,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as _te:
+                        raise LLMTimeoutError(
+                            f"Stream timed out waiting for next chunk after {self.timeout}s",
+                            provider="gemini",
+                            retryable=True,
+                        ) from _te
+
+                    # Capture usage (present only on the final chunk)
+                    _um = getattr(chunk, "usage_metadata", None)
+                    if _um:
+                        final_usage_metadata = _um
+
+                    # Guard against heartbeat chunks
+                    try:
+                        parts = chunk.candidates[0].content.parts
+                    except (AttributeError, IndexError, TypeError):
+                        continue
+                    if not parts:
+                        continue
+
+                    for part in parts:
+                        # Always capture any thought_signature (seal fragments)
+                        _sig = getattr(part, "thought_signature", None)
+                        if _sig is not None:
+                            current_sig = _sig
+
+                        _has_text = hasattr(part, "text") and bool(
+                            getattr(part, "text", None)
+                        )
+                        _has_fc = getattr(part, "function_call", None) is not None
+                        _is_thought = getattr(part, "thought", False) is True
+
+                        # Seal-only part (signature but no text/fc) — already captured
+                        if not _has_text and not _has_fc:
+                            continue
+
+                        # Determine part type
+                        if _is_thought:
+                            part_type = "thinking"
+                        elif _has_fc:
+                            part_type = "tool_use"
+                        else:
+                            part_type = "text"
+
+                        # ---- tool_use: arrives whole; immediate open+close ----
+                        if part_type == "tool_use":
+                            fc = part.function_call
+                            await _close_block()
+                            await _open_block("tool_use", name=fc.name)
+                            # Accumulate for final response assembly
+                            _tc_sig = getattr(part, "thought_signature", None)
+                            collected_parts.append(
+                                _NS(function_call=fc, thought_signature=_tc_sig)
+                            )
+                            await _close_block()
+                            continue
+
+                        # ---- text / thinking: type-transition state machine ----
+                        text = part.text  # already confirmed truthy via _has_text
+
+                        if part_type != current_block_type:
+                            await _close_block()
+                            await _open_block(part_type)
+
+                        # Emit delta — ONE event for all block content (contract: guard with if text:)
+                        # block_type sourced from current_block_type (equals part_type after _open_block)
+                        if text:
+                            if hooks_available:
+                                await self.coordinator.hooks.emit(
+                                    "llm:stream_block_delta",
+                                    {
+                                        "request_id": request_id,
+                                        "block_index": block_index,
+                                        "block_type": current_block_type,
+                                        "sequence": seq[block_index],
+                                        "text": text,
+                                    },
+                                )
+                            seq[block_index] += 1
+                            partial_emitted = True
+                            current_text_buf.append(text)
+
+                # Close the final open block (synthesised boundary at stream end)
+                await _close_block()
+
+                # Assemble ChatResponse by reusing _convert_to_chat_response
+                # with a synthetic response built from collected virtual parts
+                _synth = _NS(
+                    candidates=[_NS(content=_NS(parts=collected_parts))],
+                    usage_metadata=final_usage_metadata,
+                )
+                return self._convert_to_chat_response(_synth, model=model)
+
+            except LLMTimeoutError:
+                raise
+            except LLMError:
+                raise
+            except Exception as _exc:
+                if partial_emitted and hooks_available:
+                    await self.coordinator.hooks.emit(
+                        "llm:stream_aborted",
+                        {
+                            "request_id": request_id,
+                            "error": {
+                                "type": type(_exc).__name__,
+                                "msg": str(_exc),
+                            },
+                        },
+                    )
+                raise
+
+        async def _do_complete_streaming_guarded():
+            """Semaphore-gated streaming wrapper.
+
+            Holds the semaphore for the ENTIRE stream so that concurrency
+            limits apply across the full response, not just the first chunk.
+            """
+            global _active_requests, _waiting_requests
+            sem = await _get_process_semaphore(self._max_concurrent_requests)
+            if sem is not None:
+                _waiting_requests += 1
+                async with sem:
+                    _waiting_requests -= 1
+                    _active_requests += 1
+                    try:
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                "provider:concurrency",
+                                {
+                                    "provider": "gemini",
+                                    "model": model,
+                                    "active_requests": _active_requests,
+                                    "waiting_requests": _waiting_requests,
+                                    "max_concurrent": self._max_concurrent_requests,
+                                    "process_id": os.getpid(),
+                                },
+                            )
+                        return await _do_complete_streaming()
+                    finally:
+                        _active_requests -= 1
+            else:
+                _active_requests += 1
+                try:
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "provider:concurrency",
+                            {
+                                "provider": "gemini",
+                                "model": model,
+                                "active_requests": _active_requests,
+                                "waiting_requests": _waiting_requests,
+                                "max_concurrent": 0,
+                                "process_id": os.getpid(),
+                            },
+                        )
+                    return await _do_complete_streaming()
+                finally:
+                    _active_requests -= 1
+        try:
+            if _use_streaming:
+                chat_response = await _do_complete_streaming_guarded()
+            else:
+                response = await retry_with_backoff(
+                    _do_complete_guarded,
+                    self._retry_config,
+                    on_retry=_on_retry,
+                )
+
+                # Validate response structure
+                if not response.candidates or len(response.candidates) == 0:
+                    raise ValueError("Gemini API returned no candidates in response")
+
+                if (
+                    not hasattr(response.candidates[0], "content")
+                    or not response.candidates[0].content
+                ):
+                    logger.error(f"Response structure: {response}")
+                    logger.error(
+                        f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
+                    )
+                    raise ValueError("Gemini API response candidate has no content")
+
+                if (
+                    not hasattr(response.candidates[0].content, "parts")
+                    or not response.candidates[0].content.parts
+                ):
+                    logger.error(f"Content: {response.candidates[0].content}")
+                    raise ValueError("Gemini API response content has no parts")
+
+                # Convert to ChatResponse first (ordering fix — emit uses converted usage)
+                chat_response = self._convert_to_chat_response(response, model=model)
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-            # Validate response structure
-            if not response.candidates or len(response.candidates) == 0:
-                raise ValueError("Gemini API returned no candidates in response")
-
-            if (
-                not hasattr(response.candidates[0], "content")
-                or not response.candidates[0].content
-            ):
-                logger.error(f"Response structure: {response}")
-                logger.error(
-                    f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
-                )
-                raise ValueError("Gemini API response candidate has no content")
-
-            if (
-                not hasattr(response.candidates[0].content, "parts")
-                or not response.candidates[0].content.parts
-            ):
-                logger.error(f"Content: {response.candidates[0].content}")
-                raise ValueError("Gemini API response content has no parts")
-
-            # Convert to ChatResponse first (ordering fix — emit uses converted usage)
-            chat_response = self._convert_to_chat_response(response, model=model)
-
-            # Emit llm:response event after conversion, using canonical keys
+            # Emit llm:response (common to both streaming and blocking paths)
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 usage_data: dict[str, Any] = {}
                 if chat_response.usage is not None:
@@ -1020,7 +1300,8 @@ class GeminiProvider:
                     "status": "ok",
                     "duration_ms": elapsed_ms,
                 }
-                if self.raw:
+                if self.raw and not _use_streaming:
+                    # raw logging: only available on the blocking path
                     response_payload["raw"] = redact_secrets(
                         {
                             "content_parts": str(response.candidates[0].content.parts),
@@ -1067,7 +1348,6 @@ class GeminiProvider:
                     },
                 )
             raise
-
     def _convert_to_chat_response(
         self, response, *, model: str = ""
     ) -> GeminiChatResponse:
