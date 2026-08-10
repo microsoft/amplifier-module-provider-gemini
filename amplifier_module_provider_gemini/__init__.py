@@ -149,6 +149,55 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     await coordinator.mount("providers", provider, name="gemini")
     logger.info("Mounted GeminiProvider")
 
+    # M2 compaction mitigation: intentionally NOT ported from provider-openai.
+    #
+    # amplifier-module-provider-openai subscribes to "context:compaction" /
+    # "context:pre_compact" / "context:post_compact" and sets a one-shot flag
+    # that drops `previous_response_id` on the next request. That mitigation
+    # exists because the OpenAI Responses API supports server-side response
+    # chaining: the provider persists `previous_response_id` across turns and,
+    # when chaining, sends only a *delta* of new messages plus that ID -- the
+    # server reconstructs the rest of the context from its own stored state.
+    # If compaction shrinks the local message list but the provider keeps
+    # chaining from a pre-compaction response ID, the server-side context
+    # never shrinks: input tokens grow unboundedly until
+    # context_length_exceeded, and cache alignment is irrelevant because the
+    # compacted prefix was never actually sent to the server at all.
+    #
+    # GeminiProvider has no equivalent state to invalidate:
+    #   - It holds no per-turn handle analogous to previous_response_id (no
+    #     `self._last_response_id` / chain / session reference is stored
+    #     across calls -- verified by inspection of GeminiProvider.__init__
+    #     and complete()).
+    #   - Every request rebuilds `contents` from scratch from
+    #     `request.messages` (see the conversion in complete(), around the
+    #     `all_messages = context_user_msgs + conversation_msgs` assembly).
+    #     Whatever the context manager returns -- pre- or post-compaction --
+    #     is exactly what gets sent. There is no delta-plus-serverside-chain
+    #     shortcut for compaction to be defeated by.
+    #   - This provider does not use Gemini's *explicit* caching API
+    #     (`client.caches.create` / `CachedContent` / `cached_content=` on the
+    #     request config -- confirmed absent from this module by grep). It
+    #     relies solely on Gemini's *implicit* caching, which is automatic,
+    #     server-side, and keyed off the request's own content each call --
+    #     there is no client-held cache handle to reset either.
+    #
+    # Net effect: compaction already takes effect on the very next Gemini
+    # request, with no unbounded growth and no stale server-side reference to
+    # break. The only unavoidable consequence of a changed prefix is the
+    # ordinary one-time implicit-cache miss on the first post-compaction
+    # request while the new (shorter) prefix populates the cache again --
+    # that is a property of context-simple's prefix mutation itself, not
+    # something a provider-side compaction hook could fix, and it affects
+    # every provider with prefix-keyed caching equally (Anthropic, Gemini,
+    # and OpenAI's own implicit prompt-cache keying) rather than being
+    # specific to Gemini.
+    #
+    # If Gemini ever gains client-managed state that persists across turns
+    # (e.g. adopting explicit `CachedContent` handles), this reasoning must be
+    # revisited -- see tests/test_no_compaction_state.py for the regression
+    # guard that documents this decision and will need updating alongside it.
+
     # Register observability events via contribution channels
     coordinator.register_contributor(
         "observability.events",
@@ -1486,12 +1535,44 @@ class GeminiProvider:
                 response.usage_metadata, "cached_content_token_count", None
             )
 
+            # cache_write_tokens: deliberately NOT populated. Verified by reading
+            # the installed google-genai SDK's actual response type (not just
+            # docs) — `google.genai.types.GenerateContentResponseUsageMetadata`
+            # (SDK 1.46.0) exposes only: cache_tokens_details,
+            # cached_content_token_count, candidates_token_count,
+            # candidates_tokens_details, prompt_token_count,
+            # prompt_tokens_details, thoughts_token_count,
+            # tool_use_prompt_token_count, tool_use_prompt_tokens_details,
+            # total_token_count, traffic_type. There is no field for tokens
+            # written to cache on this call.
+            #
+            # This is consistent with how Gemini caching works here: this
+            # provider only uses *implicit* caching (no `client.caches.create` /
+            # `CachedContent` / `cached_content=` anywhere in this module —
+            # confirmed by grep). Implicit caching is automatic and
+            # server-managed; Google's docs describe it as billed identically
+            # to a cache hit/miss on ordinary input tokens, with no separate
+            # "cache write" charge or count exposed per generateContent call
+            # (unlike Anthropic's cache_creation_input_tokens, or OpenAI's
+            # GPT-5.6 cache_write_tokens under *explicit* prompt_cache_options).
+            # `google.genai.types.CachedContentUsageMetadata` does report
+            # storage-token counts, but only for the *explicit* CachedContent
+            # object API this provider does not use — it is not part of
+            # `GenerateContentResponseUsageMetadata` and not reachable here.
+            #
+            # Per the no-fabrication rule: a metric the API does not report
+            # must stay None (Usage's default), never synthesized or estimated
+            # from cached_content_token_count or any other field. Leaving
+            # cache_write_tokens unset below is intentional, not an omission —
+            # see tests/test_cache_write_tokens_not_fabricated.py for the
+            # regression guard.
             usage = Usage(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 reasoning_tokens=thoughts_tokens,
                 cache_read_tokens=cached_tokens,
+                # cache_write_tokens intentionally omitted — see comment above.
             )
 
             cost = compute_cost(
