@@ -138,11 +138,24 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         return None
 
-    _totals: dict = {"cost_usd": None, "has_data": False}
+    _totals: dict = {
+        "cost_usd": None,
+        "has_data": False,
+        "unpriced_models": set(),
+    }
 
-    def _add_cost(cost) -> None:
+    def _add_cost(cost, model: str | None = None) -> None:
         if cost is not None:
             _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + cost
+            _totals["has_data"] = True
+        elif model is not None:
+            # A real API call happened but this model has no rate-table entry.
+            # Track it so the session.cost contributor below can surface
+            # "cost incomplete: unpriced model(s)" instead of silently
+            # reporting nothing at all when this is the only kind of call
+            # made in the session (the exact "reports no cost at all for
+            # every turn" defect).
+            _totals["unpriced_models"].add(model)
             _totals["has_data"] = True
 
     provider = GeminiProvider(api_key, config, coordinator, add_cost=_add_cost)
@@ -214,16 +227,30 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "llm:stream_aborted",
         ],
     )
-    coordinator.register_contributor(
-        "session.cost",
-        "provider-gemini",
-        lambda: {
+    def _report_session_cost() -> dict[str, Any] | None:
+        """Report accumulated session cost for the "session.cost" channel.
+
+        Returns None only when no Gemini calls have happened at all (the
+        pre-existing "no data" case). Once ANY call has happened -- priced
+        or not -- this always returns a dict, so a session that only ever
+        called an unpriced model reports "cost_usd: None, unpriced_models:
+        [...]" rather than silently vanishing and reading as "$0, all free".
+        """
+        if not _totals["has_data"]:
+            return None
+        result: dict[str, Any] = {
             "cost_usd": str(_totals["cost_usd"])
             if _totals["cost_usd"] is not None
             else None
         }
-        if _totals["has_data"]
-        else None,
+        if _totals["unpriced_models"]:
+            result["unpriced_models"] = sorted(_totals["unpriced_models"])
+        return result
+
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-gemini",
+        _report_session_cost,
     )
 
     # Return cleanup function
@@ -272,7 +299,7 @@ class GeminiProvider:
         api_key: str | None = None,
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
-        add_cost: Callable[[Decimal | None], None] | None = None,
+        add_cost: Callable[[Decimal | None, str | None], None] | None = None,
     ):
         """
         Initialize Gemini provider.
@@ -284,11 +311,16 @@ class GeminiProvider:
             api_key: Google AI API key (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
-            add_cost: Optional callback to accumulate cost_usd into a session total
+            add_cost: Optional callback to accumulate cost_usd into a session
+                total. Called as ``add_cost(cost, model)`` -- ``model`` lets
+                the callback distinguish "no cost data for this call" (cost is
+                None, model given) from "no calls happened" (never called).
         """
         self._api_key = api_key
         self._client = None  # Lazy init
-        self._add_cost = add_cost if add_cost is not None else lambda cost: None
+        self._add_cost = (
+            add_cost if add_cost is not None else lambda cost, model=None: None
+        )
         self.config = config or {}
         self.coordinator = coordinator
         self.default_model = self.config.get("default_model", "gemini-2.5-flash")
@@ -1336,12 +1368,45 @@ class GeminiProvider:
                         "input_tokens": chat_response.usage.input_tokens,
                         "output_tokens": chat_response.usage.output_tokens,
                     }
+                    # reasoning_tokens MUST be emitted whenever the API
+                    # reported it. output_tokens above is a BLENDED number
+                    # (visible candidates + thinking) because that is what
+                    # Google bills -- without this key, no consumer can
+                    # decompose it, and a 1,360-token answer is
+                    # indistinguishable from a 4-token answer with 1,356
+                    # tokens of deliberation behind it. Those are very
+                    # different things to a user watching cost.
+                    #
+                    # This payload is a hand-built dict, NOT Usage.model_dump()
+                    # -- a field only reaches the event stream if it is
+                    # explicitly added here. `reasoning_tokens` is the
+                    # canonical Usage field name (also the name in the
+                    # protobuf Usage message and in provider-openai's Usage
+                    # construction), so no parallel vocabulary is introduced.
+                    # Presence-gated on `is not None` to match the
+                    # cache_read_tokens convention directly below: 0 is a real
+                    # measurement ("thinking ran, produced nothing") and is
+                    # emitted; None means the API did not report the field at
+                    # all and the key is omitted.
+                    if chat_response.usage.reasoning_tokens is not None:
+                        usage_data["reasoning_tokens"] = (
+                            chat_response.usage.reasoning_tokens
+                        )
                     if chat_response.usage.cache_read_tokens is not None:
                         usage_data["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
                     _cost = getattr(chat_response.usage, "cost_usd", None)
                     usage_data["cost_usd"] = str(_cost) if _cost is not None else None
+                    # Surface WHY cost_usd is None when it's because the model
+                    # has no rate-table entry (vs. simply no usage_metadata at
+                    # all). Only present when applicable -- see
+                    # _convert_to_chat_response's cost_unpriced_model comment.
+                    _unpriced_model = getattr(
+                        chat_response.usage, "cost_unpriced_model", None
+                    )
+                    if _unpriced_model is not None:
+                        usage_data["cost_unpriced_model"] = _unpriced_model
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
                     "model": model,
@@ -1517,7 +1582,7 @@ class GeminiProvider:
             input_tokens = (
                 getattr(response.usage_metadata, "prompt_token_count", 0) or 0
             )
-            output_tokens = (
+            candidate_tokens = (
                 getattr(response.usage_metadata, "candidates_token_count", 0) or 0
             )
             total_tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
@@ -1566,9 +1631,20 @@ class GeminiProvider:
             # cache_write_tokens unset below is intentional, not an omission —
             # see tests/test_cache_write_tokens_not_fabricated.py for the
             # regression guard.
+            #
+            # output_tokens reported here is the BILLED output: visible
+            # (candidate) tokens PLUS thinking tokens. Google bills thinking
+            # tokens at the output rate (every thinking-capable model's
+            # pricing-page entry labels its output price "(including thinking
+            # tokens)") -- reporting only candidate_tokens here would silently
+            # under-report output (and, via compute_cost below, cost) on any
+            # turn that used reasoning. reasoning_tokens stays populated
+            # separately below so the thinking/visible split remains visible
+            # for observability -- this is additive, not a replacement for it.
+            billed_output_tokens = candidate_tokens + (thoughts_tokens or 0)
             usage = Usage(
                 input_tokens=input_tokens,
-                output_tokens=output_tokens,
+                output_tokens=billed_output_tokens,
                 total_tokens=total_tokens,
                 reasoning_tokens=thoughts_tokens,
                 cache_read_tokens=cached_tokens,
@@ -1581,17 +1657,26 @@ class GeminiProvider:
                     response.usage_metadata, "prompt_token_count", 0
                 )
                 or 0,
-                candidates_token_count=getattr(
-                    response.usage_metadata, "candidates_token_count", 0
-                )
-                or 0,
+                candidates_token_count=candidate_tokens,
                 cached_content_token_count=getattr(
                     response.usage_metadata, "cached_content_token_count", None
                 )
                 or 0,
+                thoughts_token_count=thoughts_tokens or 0,
             )
             usage = usage.model_copy(update={"cost_usd": cost})
-            self._add_cost(cost)
+            if cost is None:
+                # Distinguish "no rate data for this model" from "genuinely
+                # free" (Decimal('0')). cost_usd stays None per Usage's own
+                # documented contract ("None = rate data unavailable, not
+                # zero"); this extra field (Usage allows extra="allow")
+                # records WHICH model was unpriced so downstream consumers
+                # (the llm:response event, the session.cost contributor
+                # below) can surface "cost unknown" instead of a call that
+                # silently contributes nothing and reads as free. See
+                # mount()'s _add_cost() for the session-total counterpart.
+                usage = usage.model_copy(update={"cost_unpriced_model": model})
+            self._add_cost(cost, model)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
