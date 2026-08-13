@@ -18,11 +18,26 @@ Integration tests (m–o): _convert_to_chat_response stamps cost_usd on Usage
   (m) Known model + tokens → cost_usd is Decimal > 0
   (n) Fully cached request → cost_usd stamped correctly
   (o) Unknown model → cost_usd is None
+
+Defect B regression tests (p–s): thinking tokens billed at output rate
+  (p) Measured live scenario: gemini-3-flash-preview, 10,101 in / 4 out /
+      228 thoughts → cost matches the corrected ≈$0.0057465 (not the
+      previously-reported $0.0050625, an ~13.5% under-report).
+  (q) thoughts_token_count defaults to 0 → identical to omitting it entirely
+      (backward compatible for non-thinking calls).
+  (r) Thinking tokens billed at the SAME rate as candidates (tiered model).
+  (s) thoughts_token_count=0 explicitly behaves like omission.
+
+Defect D regression tests (t–w): new-model rates + still-missing model
+  (t) gemini-3.5-flash flat rate: $1.50 / $9.00 / $0.15 per 1M
+  (u) gemini-3.6-flash flat rate: $1.50 / $7.50 / $0.15 per 1M
+  (v) gemini-3.1-flash-lite flat rate: $0.25 / $1.50 / $0.025 per 1M
+  (w) gemini-3.1-flash-image-preview remains unpriced (no confirmable
+      official rate) -- returns None, not a guessed number.
 """
 
 from decimal import Decimal
 from unittest.mock import MagicMock
-
 
 from amplifier_module_provider_gemini._cost import compute_cost
 
@@ -141,8 +156,8 @@ def test_fresh_input_subtraction():
         candidates_token_count=0,
         cached_content_token_count=50_000,
     )
-    fresh_cost = Decimal("150000") * Decimal("0.30") / Decimal("1000000")
-    cache_cost = Decimal("50000") * Decimal("0.03") / Decimal("1000000")
+    fresh_cost = Decimal(150000) * Decimal("0.30") / Decimal(1000000)
+    cache_cost = Decimal(50000) * Decimal("0.03") / Decimal(1000000)
     expected = fresh_cost + cache_cost
     assert result == expected, f"Expected {expected!r}, got {result!r}"
 
@@ -180,7 +195,7 @@ def test_unknown_distinct_from_zero():
     """None returned for unknown model must not equal Decimal('0')."""
     result = compute_cost("no-such-model", prompt_token_count=0)
     assert result is None
-    assert result != Decimal("0")
+    assert result != Decimal(0)
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +302,177 @@ def test_convert_leaves_cost_none_for_unknown_model():
         prompt_token_count=1_000,
         candidates_token_count=500,
     )
-    result = provider._convert_to_chat_response(response, model="gemini-unknown-model-9999")
+    result = provider._convert_to_chat_response(
+        response, model="gemini-unknown-model-9999"
+    )
     assert result.usage is not None
     assert result.usage.cost_usd is None, (
         f"cost_usd should be None for unknown model, got {result.usage.cost_usd!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Defect B: thinking tokens billed at output rate
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# (p) Measured live scenario (bat-and-ball prompt, gemini-3-flash-preview):
+#     input_tokens=10101, output_tokens=4, reasoning_tokens=228.
+#     Previously reported cost_usd = "0.0050625" (thinking tokens excluded).
+#     Corrected cost must be ≈$0.0057465 -- an ~13.5% under-report before
+#     this fix (0.0006840 / 0.0050625 == 0.1351...).
+# ---------------------------------------------------------------------------
+def test_measured_defect_b_scenario_bills_thinking_tokens():
+    """Reproduces the exact measured defect-B scenario from the bug report."""
+    old_wrong_cost = compute_cost(
+        "gemini-3-flash-preview",
+        prompt_token_count=10_101,
+        candidates_token_count=4,
+        # thoughts_token_count omitted -> old (buggy) behaviour
+    )
+    assert old_wrong_cost is not None
+    assert old_wrong_cost == Decimal("0.0050625"), (
+        f"Sanity check on old behaviour failed: got {old_wrong_cost!r}"
+    )
+
+    corrected_cost = compute_cost(
+        "gemini-3-flash-preview",
+        prompt_token_count=10_101,
+        candidates_token_count=4,
+        thoughts_token_count=228,
+    )
+    assert corrected_cost is not None
+    assert corrected_cost == Decimal("0.0057465"), (
+        f"Expected Decimal('0.0057465'), got {corrected_cost!r}"
+    )
+
+    # The old value under-reports true cost by ~13.5%.
+    under_report_fraction = (corrected_cost - old_wrong_cost) / old_wrong_cost
+    assert abs(under_report_fraction - Decimal("0.135")) < Decimal("0.001"), (
+        f"Expected ~13.5% under-report, got {under_report_fraction * 100:.2f}%"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (q) thoughts_token_count defaults to 0 -> identical to omitting it
+# ---------------------------------------------------------------------------
+def test_thoughts_token_count_defaults_to_zero():
+    """Omitting thoughts_token_count must be identical to passing 0 explicitly."""
+    omitted = compute_cost(
+        "gemini-2.5-flash", prompt_token_count=1_000, candidates_token_count=200
+    )
+    explicit_zero = compute_cost(
+        "gemini-2.5-flash",
+        prompt_token_count=1_000,
+        candidates_token_count=200,
+        thoughts_token_count=0,
+    )
+    assert omitted == explicit_zero
+
+
+# ---------------------------------------------------------------------------
+# (r) Thinking tokens billed at the SAME rate as candidates (flat-rate model)
+# ---------------------------------------------------------------------------
+def test_thinking_tokens_billed_at_output_rate_flat_model():
+    """1M thinking tokens alone must cost the same as 1M candidate tokens alone."""
+    from_candidates = compute_cost(
+        "gemini-2.5-flash", prompt_token_count=0, candidates_token_count=1_000_000
+    )
+    from_thoughts = compute_cost(
+        "gemini-2.5-flash",
+        prompt_token_count=0,
+        candidates_token_count=0,
+        thoughts_token_count=1_000_000,
+    )
+    assert from_candidates == from_thoughts == Decimal("2.50")
+
+
+# ---------------------------------------------------------------------------
+# (s) thoughts_token_count adds on top of candidates, not replaces them
+# ---------------------------------------------------------------------------
+def test_thinking_and_candidate_tokens_both_billed():
+    """candidates + thoughts must both contribute to the output charge."""
+    result = compute_cost(
+        "gemini-2.5-flash-lite",
+        prompt_token_count=0,
+        candidates_token_count=500_000,
+        thoughts_token_count=500_000,
+    )
+    # 1M combined output tokens x $0.40/M = $0.40
+    assert result == Decimal("0.40"), f"Expected Decimal('0.40'), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Defect D: new-model rates + still-unpriced model
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# (t) gemini-3.5-flash flat rate: $1.50 / $9.00 / $0.15 per 1M
+# ---------------------------------------------------------------------------
+def test_gemini_3_5_flash_rates():
+    input_cost = compute_cost(
+        "gemini-3.5-flash", prompt_token_count=1_000_000, candidates_token_count=0
+    )
+    output_cost = compute_cost(
+        "gemini-3.5-flash", prompt_token_count=0, candidates_token_count=1_000_000
+    )
+    cache_cost = compute_cost(
+        "gemini-3.5-flash",
+        prompt_token_count=1_000_000,
+        candidates_token_count=0,
+        cached_content_token_count=1_000_000,
+    )
+    assert input_cost == Decimal("1.50")
+    assert output_cost == Decimal("9.00")
+    assert cache_cost == Decimal("0.15")  # fresh_input=0 -> only cache_read applies
+
+
+# ---------------------------------------------------------------------------
+# (u) gemini-3.6-flash flat rate: $1.50 / $7.50 / $0.15 per 1M
+# ---------------------------------------------------------------------------
+def test_gemini_3_6_flash_rates():
+    input_cost = compute_cost(
+        "gemini-3.6-flash", prompt_token_count=1_000_000, candidates_token_count=0
+    )
+    output_cost = compute_cost(
+        "gemini-3.6-flash", prompt_token_count=0, candidates_token_count=1_000_000
+    )
+    assert input_cost == Decimal("1.50")
+    assert output_cost == Decimal("7.50")
+
+
+# ---------------------------------------------------------------------------
+# (v) gemini-3.1-flash-lite flat rate: $0.25 / $1.50 / $0.025 per 1M
+# ---------------------------------------------------------------------------
+def test_gemini_3_1_flash_lite_rates():
+    input_cost = compute_cost(
+        "gemini-3.1-flash-lite", prompt_token_count=1_000_000, candidates_token_count=0
+    )
+    output_cost = compute_cost(
+        "gemini-3.1-flash-lite", prompt_token_count=0, candidates_token_count=1_000_000
+    )
+    assert input_cost == Decimal("0.25")
+    assert output_cost == Decimal("1.50")
+
+
+# ---------------------------------------------------------------------------
+# (w) gemini-3.1-flash-image-preview remains unpriced -- no official rate
+#     could be confirmed. This must NOT silently become Decimal('0').
+# ---------------------------------------------------------------------------
+def test_gemini_3_1_flash_image_preview_still_unpriced():
+    """Deliberately excluded: no confirmable official Google rate exists.
+
+    Do not add a rate for this model without a citation to
+    https://ai.google.dev/gemini-api/docs/pricing (or successor) actually
+    listing it -- third-party aggregators disagree with each other and are
+    not an authoritative source.
+    """
+    result = compute_cost(
+        "gemini-3.1-flash-image-preview",
+        prompt_token_count=1_000,
+        candidates_token_count=500,
+    )
+    assert result is None
+    assert result != Decimal(0)
