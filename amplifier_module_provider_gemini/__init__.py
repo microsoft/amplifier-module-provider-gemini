@@ -37,6 +37,7 @@ from amplifier_core.llm_errors import ContextLengthError
 from amplifier_core.llm_errors import InvalidRequestError
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.llm_errors import LLMTimeoutError
+from amplifier_core.llm_errors import NotFoundError
 from amplifier_core.llm_errors import ProviderUnavailableError
 from amplifier_core.llm_errors import RateLimitError
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
@@ -426,17 +427,205 @@ class GeminiProvider:
     async def list_models(self) -> list[ModelInfo]:
         """List available Gemini models via the live API.
 
-        Raises the underlying exception if the API query fails. Callers are
-        expected to handle empty lists and propagated errors — this matches
-        the behaviour of provider-anthropic and provider-openai, which both
-        hard-fail rather than returning a stale hardcoded fallback.
+        The query is retried with the same shared retry_with_backoff()/
+        _retry_config machinery used by complete() on transient failures
+        (5xx, timeouts, Cloudflare/CDN challenges, connection errors).
+        The paginated async iterator is consumed to completion *inside*
+        the retried attempt so that a failure mid-pagination retries the
+        whole listing rather than resuming from a partial result. Raises
+        the translated kernel error once retries are exhausted, or
+        immediately for non-retryable errors (401/403/404) — no fallback;
+        caller handles empty lists.
+
+        This matches the behaviour of provider-anthropic and
+        provider-openai, which both hard-fail (after retrying transient
+        failures) rather than returning a stale hardcoded fallback.
 
         The previous implementation kept a hardcoded 5-model fallback list
         that drifted out of sync with actual Google releases and silently
         masked API outages. Removed 2026-04-22.
         """
+
+        async def _do_list_models() -> list[Any]:
+            """Single API call attempt with SDK -> kernel error translation.
+
+            Mirrors the error-translation branches used by _do_complete()
+            (rate limit, authentication, permission/Cloudflare-403, 5xx via
+            genai_errors, google.api_core fallback, catch-all) so
+            list_models() shares the same retry policy as complete(). The
+            paginated iterator is fully consumed here — inside the
+            try/except and therefore inside each individual retry
+            attempt — so a failure partway through pagination causes the
+            *entire* listing to be retried rather than yielding a partial
+            result.
+            """
+            try:
+                page = await self.client.aio.models.list()
+                return [model async for model in page]
+            except LLMError:
+                raise  # Already translated, don't double-wrap
+            except Exception as e:
+                # --- Primary path: google.genai.errors (always available) ---
+                if genai_errors is not None:
+                    if isinstance(e, genai_errors.ClientError):
+                        code = getattr(e, "code", None)
+                        details = getattr(e, "details", None)
+                        error_msg = (
+                            json.dumps(details) if details is not None else str(e)
+                        )
+                        if code == 429:
+                            # Try to extract Retry-After from httpx response headers.
+                            retry_after_val = self._extract_retry_after(e)
+                            # Fail-fast: if retry_after exceeds max_delay, mark non-retryable
+                            retryable = True
+                            if (
+                                retry_after_val is not None
+                                and retry_after_val > self._retry_config.max_delay
+                            ):
+                                retryable = False
+                            raise RateLimitError(
+                                error_msg,
+                                provider="gemini",
+                                status_code=429,
+                                retryable=retryable,
+                                retry_after=retry_after_val,
+                            ) from e
+                        if code == 401:
+                            raise AuthenticationError(
+                                error_msg, provider="gemini", status_code=401
+                            ) from e
+                        if code == 403:
+                            if self._is_cloudflare_challenge(e):
+                                logger.warning(_CLOUDFLARE_403_WARNING)
+                                raise ProviderUnavailableError(
+                                    "CDN/proxy challenge (transient 403). "
+                                    "This typically resolves on retry.",
+                                    provider="gemini",
+                                    status_code=403,
+                                    retryable=True,
+                                ) from e
+                            raise AccessDeniedError(
+                                error_msg, provider="gemini", status_code=403
+                            ) from e
+                        if code == 404:
+                            raise NotFoundError(
+                                error_msg, provider="gemini", status_code=404
+                            ) from e
+                        raise InvalidRequestError(
+                            error_msg,
+                            provider="gemini",
+                            status_code=code or 400,
+                        ) from e
+                    if isinstance(e, genai_errors.ServerError):
+                        code = getattr(e, "code", None)
+                        details = getattr(e, "details", None)
+                        error_msg = (
+                            json.dumps(details) if details is not None else str(e)
+                        )
+                        retry_after_val = self._extract_retry_after(e)
+                        raise ProviderUnavailableError(
+                            error_msg,
+                            provider="gemini",
+                            status_code=code or 500,
+                            retryable=True,
+                            retry_after=retry_after_val,
+                        ) from e
+
+                # --- Fallback: google.api_core.exceptions (if installed) ---
+                if google_exceptions is not None:
+                    if isinstance(e, google_exceptions.ResourceExhausted):
+                        retry_after_val = self._extract_retry_after(e)
+                        retryable = True
+                        if (
+                            retry_after_val is not None
+                            and retry_after_val > self._retry_config.max_delay
+                        ):
+                            retryable = False
+                        raise RateLimitError(
+                            str(e),
+                            provider="gemini",
+                            status_code=429,
+                            retryable=retryable,
+                            retry_after=retry_after_val,
+                        ) from e
+                    if isinstance(e, google_exceptions.Unauthenticated):
+                        raise AuthenticationError(
+                            str(e), provider="gemini", status_code=401
+                        ) from e
+                    if isinstance(e, google_exceptions.PermissionDenied):
+                        # Falsy check (not just `is None`) is intentional:
+                        # google.api_core exceptions may have empty details
+                        # ([], "", etc.) which also indicate a CDN/proxy 403.
+                        if not getattr(e, "details", None):
+                            logger.warning(_CLOUDFLARE_403_WARNING)
+                            raise ProviderUnavailableError(
+                                "CDN/proxy challenge (transient 403). "
+                                "This typically resolves on retry.",
+                                provider="gemini",
+                                status_code=403,
+                                retryable=True,
+                            ) from e
+                        raise AccessDeniedError(
+                            str(e), provider="gemini", status_code=403
+                        ) from e
+                    if isinstance(e, google_exceptions.NotFound):
+                        raise NotFoundError(
+                            str(e), provider="gemini", status_code=404
+                        ) from e
+                    if isinstance(e, google_exceptions.InvalidArgument):
+                        raise InvalidRequestError(
+                            str(e), provider="gemini", status_code=400
+                        ) from e
+                    if isinstance(e, google_exceptions.ServiceUnavailable):
+                        raise ProviderUnavailableError(
+                            str(e),
+                            provider="gemini",
+                            status_code=503,
+                            retryable=True,
+                        ) from e
+                    if isinstance(e, google_exceptions.DeadlineExceeded):
+                        raise LLMTimeoutError(
+                            str(e),
+                            provider="gemini",
+                            retryable=True,
+                        ) from e
+
+                # Unknown errors default to retryable per design doc
+                details = getattr(e, "details", None)
+                error_msg = (
+                    json.dumps(details)
+                    if details is not None
+                    else (str(e) or f"{type(e).__name__}: (no message)")
+                )
+                raise LLMError(
+                    error_msg,
+                    provider="gemini",
+                    retryable=True,
+                ) from e
+
+        async def _on_retry(attempt: int, delay: float, error: LLMError):
+            """Callback invoked before each retry sleep."""
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    PROVIDER_RETRY,
+                    {
+                        "provider": "gemini",
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
+        raw_models = await retry_with_backoff(
+            _do_list_models,
+            self._retry_config,
+            on_retry=_on_retry,
+        )
+
         models: list[ModelInfo] = []
-        async for model in await self.client.aio.models.list():
+        for model in raw_models:
             model_name = getattr(model, "name", "")
             # Filter to gemini models only (exclude tuned models, etc.)
             if not model_name or "gemini" not in model_name.lower():
