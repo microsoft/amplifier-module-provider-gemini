@@ -410,17 +410,6 @@ class GeminiProvider:
                     prompt="Enter your Google AI API key",
                     env_var="GOOGLE_API_KEY",
                 ),
-                ConfigField(
-                    id="thinking_budget",
-                    display_name="Thinking Budget",
-                    field_type="choice",
-                    prompt="Select thinking budget (-1 = dynamic, 0 = disabled)",
-                    choices=["-1 (dynamic)", "0 (disabled)", "8192", "16384", "32768"],
-                    default="-1 (dynamic)",
-                    required=False,
-                    requires_model=True,
-                    show_when={"default_model": "gemini-2.5-flash"},
-                ),
             ],
         )
 
