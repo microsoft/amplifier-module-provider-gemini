@@ -37,10 +37,13 @@ allow-direct-references = true
 testpaths = ["tests"]
 addopts = "--import-mode=importlib"
 asyncio_mode = "strict"
+markers = [
+    "live: requires real network access / real provider credentials; deselected in CI via `-m \"not live\"`",
+]
 
 [dependency-groups]
 dev = [
-    "amplifier-core>=1.0.10",
+    "amplifier-core>=1.6.0",
     "google-api-core>=2.0.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.2.0",
