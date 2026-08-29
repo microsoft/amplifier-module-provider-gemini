@@ -69,8 +69,14 @@ def _make_response(parts):
 
 
 def test_inbound_function_call_signature_captured():
-    """function_call part with thought_signature -> ToolCallBlock.signature and ToolCall.signature."""
+    """function_call part with thought_signature -> ToolCallBlock.signature and ToolCall.signature.
+
+    Captured as a base64 str, NOT the SDK's raw bytes (see
+    test_inbound_signature_is_json_safe_not_raw_bytes for why: raw bytes
+    break JSON serialization for non-UTF-8 signatures, which is the normal
+    case for an opaque cryptographic signature)."""
     sig_bytes = b"\x01\x02\x03"
+    expected_b64 = base64.b64encode(sig_bytes).decode("ascii")
     fc = SimpleNamespace(name="todo", args={"content": "do something"})
     part = SimpleNamespace(thought=False, function_call=fc, thought_signature=sig_bytes)
     response = _make_response([part])
@@ -81,23 +87,27 @@ def test_inbound_function_call_signature_captured():
     # ToolCallBlock in content
     assert result.content, "Expected content blocks"
     tc_block = result.content[0]
-    assert getattr(tc_block, "signature", None) == sig_bytes, (
-        f"ToolCallBlock.signature should be {sig_bytes!r}, "
+    assert getattr(tc_block, "signature", None) == expected_b64, (
+        f"ToolCallBlock.signature should be base64 {expected_b64!r}, "
         f"got {getattr(tc_block, 'signature', None)!r}"
     )
 
     # ToolCall in tool_calls list
     assert result.tool_calls, "Expected tool_calls"
     tc = result.tool_calls[0]
-    assert getattr(tc, "signature", None) == sig_bytes, (
-        f"ToolCall.signature should be {sig_bytes!r}, "
+    assert getattr(tc, "signature", None) == expected_b64, (
+        f"ToolCall.signature should be base64 {expected_b64!r}, "
         f"got {getattr(tc, 'signature', None)!r}"
     )
 
 
 def test_inbound_text_signature_captured():
-    """Non-thought text part with thought_signature -> TextBlock.signature."""
+    """Non-thought text part with thought_signature -> TextBlock.signature.
+
+    Captured as a base64 str, NOT the SDK's raw bytes -- see
+    test_inbound_signature_is_json_safe_not_raw_bytes."""
     sig_bytes = b"\x04\x05\x06"
+    expected_b64 = base64.b64encode(sig_bytes).decode("ascii")
     part = SimpleNamespace(text="final answer", thought=False, thought_signature=sig_bytes)
     response = _make_response([part])
 
@@ -106,8 +116,8 @@ def test_inbound_text_signature_captured():
 
     assert result.content, "Expected content blocks"
     tb = result.content[0]
-    assert getattr(tb, "signature", None) == sig_bytes, (
-        f"TextBlock.signature should be {sig_bytes!r}, "
+    assert getattr(tb, "signature", None) == expected_b64, (
+        f"TextBlock.signature should be base64 {expected_b64!r}, "
         f"got {getattr(tb, 'signature', None)!r}"
     )
 
@@ -343,9 +353,9 @@ def test_round_trip_multiple_parallel_calls_only_first_has_signature():
     provider = _make_provider()
     chat_response = provider._convert_to_chat_response(response)
 
-    # Verify inbound: only first TC captured a signature
+    # Verify inbound: only first TC captured a signature (as base64 str)
     assert len(chat_response.tool_calls) == 3
-    assert getattr(chat_response.tool_calls[0], "signature", None) == sig_bytes
+    assert getattr(chat_response.tool_calls[0], "signature", None) == expected_b64
     assert getattr(chat_response.tool_calls[1], "signature", None) is None
     assert getattr(chat_response.tool_calls[2], "signature", None) is None
 
@@ -370,3 +380,54 @@ def test_round_trip_multiple_parallel_calls_only_first_has_signature():
     assert "thought_signature" not in parts_out[2], (
         f"Third function_call should NOT have thought_signature, got: {parts_out[2]}"
     )
+
+
+# ============================================================
+# JSON-safety regression (the actual load-bearing bug this audit found)
+# ============================================================
+
+
+def test_inbound_signature_is_json_safe_not_raw_bytes():
+    """Captured signatures must be JSON-safe (base64 str), never raw bytes.
+
+    This module is stateless full-resend: the entire Message list gets
+    rebuilt from the stored conversation history on every turn. That stored
+    history commonly crosses a JSON boundary somewhere in the stack (session
+    persistence, event logging, an orchestrator calling
+    model_dump(mode="json")). A raw-bytes signature containing a byte
+    sequence that isn't valid UTF-8 -- the NORMAL case for an opaque
+    cryptographic signature -- crashes that serialization outright.
+
+    Verified directly against amplifier_core's own models before this fix:
+        ToolCallBlock(signature=bytes([0xff, 0xfe, 0x80])).model_dump(mode="json")
+    raised UnicodeDecodeError. ThinkingBlock was never affected (its
+    signature field is already typed str | None and was already encoded at
+    capture time) -- only TextBlock and ToolCallBlock/ToolCall had the bug.
+    """
+    # A byte sequence that is NOT valid UTF-8 (the realistic case).
+    sig_bytes = bytes([0xFF, 0xFE, 0x80, 0x81, 0x00, 0x9D])
+
+    fc = SimpleNamespace(name="todo", args={"content": "x"})
+    fc_part = SimpleNamespace(thought=False, function_call=fc, thought_signature=sig_bytes)
+    text_part = SimpleNamespace(text="answer", thought=False, thought_signature=sig_bytes)
+    response = _make_response([text_part, fc_part])
+
+    provider = _make_provider()
+    result = provider._convert_to_chat_response(response)
+
+    text_block, tc_block = result.content[0], result.content[1]
+
+    # Both must be plain base64 str, not bytes -- and both round-trip
+    # through the exact JSON serialization path that used to crash.
+    assert isinstance(text_block.signature, str)
+    assert isinstance(tc_block.signature, str)
+    assert isinstance(result.tool_calls[0].signature, str)
+
+    text_block.model_dump(mode="json")
+    tc_block.model_dump(mode="json")
+    result.tool_calls[0].model_dump(mode="json")
+
+    # And the value is recoverable: decoding it gives back the exact
+    # original bytes (nothing lost, nothing mangled).
+    assert base64.b64decode(text_block.signature) == sig_bytes
+    assert base64.b64decode(tc_block.signature) == sig_bytes

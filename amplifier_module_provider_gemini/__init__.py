@@ -10,6 +10,7 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 import base64
+import difflib
 from collections import defaultdict
 from collections.abc import Callable
 from decimal import Decimal
@@ -283,6 +284,399 @@ def _encode_sig(sig: bytes | str | None) -> str | None:
     return sig  # assume already base64-encoded str
 
 
+# ---------------------------------------------------------------------------
+# Thinking level support (google-genai's *current* thinking control)
+# ---------------------------------------------------------------------------
+# Google's `thinking_budget` (an approximate output-token budget spent on
+# internal reasoning) is now the LEGACY thinking control. The current
+# control -- and the *only* one some models accept at all -- is
+# `thinking_level`, an enum (minimal|low|medium|high). Sending both
+# thinking_level and thinking_budget on the same request is rejected by the
+# API with a 400.
+#
+# CRITICAL, verified LIVE against the real Google AI API on 2026-08-29 (not
+# documented by Google as of this writing, and NOT the "smaller subset of
+# levels per older model" story one might assume): thinking_level support is
+# an all-or-nothing split by model generation, not a graduated subset --
+#   * gemini-2.5-flash and gemini-2.5-pro REJECT thinking_level outright:
+#       400 INVALID_ARGUMENT: "Thinking level is not supported for this model."
+#     These models only understand the legacy thinking_budget control, and
+#     think by default via a dynamic budget regardless of any config.
+#   * gemini-3.x models are the opposite: thinking is MANDATORY and
+#     thinking_budget is silently ignored (verified live: thinking_budget=0
+#     on gemini-3.7-flash still produced ~26 thinking tokens) -- there is no
+#     way to disable thinking on a Gemini 3.x model. thinking_level is their
+#     only real, effective control, and even that control cannot express
+#     "disabled" -- there is no "none" level in the enum.
+#
+# _THINKING_LEVEL_TABLE maps a model id to the ThinkingLevel values it is
+# known to accept. `None` means "rejects thinking_level entirely -- always
+# use the legacy thinking_budget path for this model". Google does not
+# publish this table; it is reverse-engineered from live 400 responses.
+# Treat it as best-effort and update it as new models ship or vendor
+# behavior changes.
+_THINKING_LEVEL_TABLE: dict[str, tuple[str, ...] | None] = {
+    # Gemini 2.x -- thinking_level rejected outright (verified live,
+    # 2026-08-29). These models think by default via a dynamic budget;
+    # the legacy thinking_budget path is their only control.
+    "gemini-2.5-pro": None,
+    "gemini-2.5-flash": None,
+    "gemini-2.5-flash-lite": None,
+    "gemini-2.0-flash": None,
+    "gemini-2.0-flash-lite": None,
+    # Gemini 3.7 Flash -- current flagship Flash model. Verified live:
+    # low/medium/high accepted; MINIMAL rejected ("Thinking level MINIMAL is
+    # not supported for this model. Please retry with other thinking
+    # level."). ai.google.dev documents its default (when omitted) as medium.
+    "gemini-3.7-flash": ("low", "medium", "high"),
+    # Gemini 3.5 family -- verified live: minimal accepted.
+    "gemini-3.5-flash": ("minimal", "low", "medium", "high"),
+    "gemini-3.5-flash-lite": ("minimal", "low", "medium", "high"),
+}
+
+# Fallback range for any gemini-3.x model id not listed above -- new preview
+# ids ship often (gemini-3.1-*, gemini-3.6-flash, etc.). Assume the full
+# range until a live 400 proves a narrower one for that specific id.
+_THINKING_LEVEL_DEFAULT_3X: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+# Ordinal order used for clamping (lowest to highest amount of thinking).
+_THINKING_LEVEL_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+# reasoning_effort (Amplifier's portable, cross-provider knob) -> the
+# thinking_level it targets. "xhigh"/"max" collapse to "high" -- Gemini has
+# no level above high.
+_EFFORT_TO_LEVEL: dict[str, str] = {
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def _supported_thinking_levels(model: str) -> tuple[str, ...] | None:
+    """Return the ThinkingLevel values ``model`` is known to accept.
+
+    ``None`` means the model rejects thinking_level entirely (legacy
+    thinking_budget path only). See _THINKING_LEVEL_TABLE for the live
+    evidence behind each entry.
+    """
+    if model in _THINKING_LEVEL_TABLE:
+        return _THINKING_LEVEL_TABLE[model]
+    if model.startswith("gemini-2."):
+        return None
+    if model.startswith("gemini-3."):
+        return _THINKING_LEVEL_DEFAULT_3X
+    # Unknown family (a future gemini-4.x, a tuned model id, etc.) -- assume
+    # support; a live 400 surfaces clearly rather than degrading silently.
+    return _THINKING_LEVEL_DEFAULT_3X
+
+
+def _clamp_thinking_level(model: str, requested: str, supported: tuple[str, ...]) -> str:
+    """Clamp ``requested`` to the nearest level in ``supported`` for ``model``.
+
+    Prefers the next level UP (more thinking) over down: under-thinking
+    silently degrades output quality, while over-thinking only costs a few
+    more tokens. Logs one INFO line whenever the clamp actually changes the
+    requested value -- clamping is never silent.
+    """
+    if requested in supported:
+        return requested
+    req_idx = _THINKING_LEVEL_ORDER.index(requested)
+    for idx in range(req_idx + 1, len(_THINKING_LEVEL_ORDER)):
+        if _THINKING_LEVEL_ORDER[idx] in supported:
+            clamped = _THINKING_LEVEL_ORDER[idx]
+            logger.info(
+                "[PROVIDER] Gemini: thinking_level '%s' not supported by '%s' "
+                "(supports: %s) -- clamped up to '%s'",
+                requested,
+                model,
+                supported,
+                clamped,
+            )
+            return clamped
+    for idx in range(req_idx - 1, -1, -1):
+        if _THINKING_LEVEL_ORDER[idx] in supported:
+            clamped = _THINKING_LEVEL_ORDER[idx]
+            logger.info(
+                "[PROVIDER] Gemini: thinking_level '%s' not supported by '%s' "
+                "(supports: %s) -- clamped down to '%s'",
+                requested,
+                model,
+                supported,
+                clamped,
+            )
+            return clamped
+    return supported[0]  # pragma: no cover -- defensive; supported is never empty
+
+
+# ---------------------------------------------------------------------------
+# Config hygiene: bool/numeric coercion, unknown-key sweep, inert-key notes
+# ---------------------------------------------------------------------------
+# Config commonly arrives as strings: the app-cli wizard writes
+# `field_type="boolean"` values as the literal strings "true"/"false" (not
+# Python bools), and hand-edited YAML often quotes both booleans and
+# numbers. Naive `bool(raw)` or bare `int(raw)`/`float(raw)` are both wrong
+# for that -- `bool("false")` is True (any non-empty string is truthy),
+# silently inverting the operator's intent, and a bad numeric string
+# currently either raises at mount time (max_retries etc., which call
+# int()/float() directly) or survives uncoerced all the way to
+# asyncio.wait_for(timeout=...), which fails on the FIRST real API call
+# with a confusing low-level TypeError instead of a clear config error.
+
+_CONFIG_BOOL_TRUE_STRINGS: frozenset[str] = frozenset({"true", "1", "yes"})
+_CONFIG_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no"})
+
+
+def _parse_config_bool(key: str, raw: Any, default: bool) -> bool:
+    """Parse a boolean-ish provider-config value, tolerating string bools.
+
+    Accepts:
+      - key absent / value None / value "" -> `default`
+      - real bool -> itself, unchanged
+      - str in {"true", "1", "yes"} (case-insensitive, stripped) -> True
+      - str in {"false", "0", "no"} (case-insensitive, stripped) -> False
+
+    Anything else logs a warning and falls back to `default` -- config
+    hygiene here is warn-and-default, not raise, so one typo'd flag doesn't
+    take down the whole provider mount.
+    """
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in _CONFIG_BOOL_TRUE_STRINGS:
+            return True
+        if normalized in _CONFIG_BOOL_FALSE_STRINGS:
+            return False
+    logger.warning(
+        "[PROVIDER] Gemini: invalid config %r=%r (expected true/false, "
+        "also 1/0, yes/no; case-insensitive) -- using default %r",
+        key,
+        raw,
+        default,
+    )
+    return default
+
+
+def _parse_config_number(key: str, raw: Any, default: Any, cast) -> Any:
+    """Parse a numeric provider-config value, tolerating string numbers.
+
+    Accepts real int/float values and numeric strings (whitespace-stripped),
+    coercing via `cast` (int or float). Anything unparseable -- including
+    key absent / None / "" -- logs a warning and falls back to `default`.
+    Never raises: a bad numeric config value degrades to a safe default
+    instead of crashing the provider at mount time or, worse, surviving
+    uncoerced as a string into a low-level call (e.g.
+    asyncio.wait_for(timeout="600")) that fails confusingly on the first
+    real request instead of at mount.
+    """
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        pass  # bool is a subclass of int -- never accept it as numeric config
+    elif isinstance(raw, (int, float)):
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(raw, str):
+        try:
+            return cast(raw.strip())
+        except (TypeError, ValueError):
+            pass
+    logger.warning(
+        "[PROVIDER] Gemini: invalid config %r=%r (expected a %s) -- using "
+        "default %r",
+        key,
+        raw,
+        cast.__name__,
+        default,
+    )
+    return default
+
+
+def _read_renamed_config(config: dict[str, Any], new: str, old: str) -> Any:
+    """Read `new`, falling back to the deprecated `old` with one warning.
+
+    The new key always wins when present (even when both are set) -- a
+    config that has already been migrated to the new name is never
+    silently overridden by a stale leftover of the old one. The warning
+    fires only when `old` is the value actually used, so a fully migrated
+    config stays silent and a config carrying both is told plainly which
+    one won.
+
+    Returns None (not a sentinel) when neither key is present, so callers
+    can pass the result straight into _parse_config_bool/_parse_config_number,
+    which already treat None as "use my own default".
+    """
+    new_val = config.get(new)
+    old_val = config.get(old)
+    if new_val not in (None, ""):
+        if old_val not in (None, ""):
+            logger.warning(
+                "[PROVIDER] Gemini: config keys '%s' (deprecated) and '%s' "
+                "are BOTH set; '%s' wins. Remove '%s'.",
+                old,
+                new,
+                new,
+                old,
+            )
+        return new_val
+    if old_val not in (None, ""):
+        logger.warning(
+            "[PROVIDER] Gemini: config key '%s' is deprecated -- use '%s' "
+            "instead (this is Google's own API parameter name). Falling "
+            "back to '%s'=%r for this session.",
+            old,
+            new,
+            old,
+            old_val,
+        )
+        return old_val
+    return None
+
+
+# Config keys this provider actually reads (self.config.get(...) call
+# sites). `priority` is included even though this module only stores it
+# on self.priority for the orchestrator's provider-selection logic to read
+# -- it is a real, consumed key, never a typo to flag. `max_tokens` is kept
+# as the deprecated back-compat alias for `max_output_tokens` (Google's own
+# API parameter name) -- see _read_renamed_config. `extra_request_params`
+# is a settings-only escape hatch (never a ConfigField / interactive
+# wizard prompt) -- see _apply_extra_request_params.
+_CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "default_model",
+        "max_output_tokens",
+        "max_tokens",  # deprecated alias for max_output_tokens
+        "temperature",
+        "timeout",
+        "priority",
+        "raw",
+        "use_streaming",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "max_concurrent_requests",
+        "extra_request_params",
+    }
+)
+
+
+def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) -> None:
+    """Merge extra_request_params into a GenerateContentConfig, in place.
+
+    `extra_request_params` is a settings-only escape hatch (bundle/settings
+    YAML only -- never an interactive ConfigField) for reaching
+    GenerateContentConfig fields this provider doesn't otherwise expose:
+    safety_settings, top_p, top_k, seed, stop_sequences,
+    presence_penalty/frequency_penalty, response_mime_type, labels, and any
+    other field google-genai's GenerateContentConfig defines. It is merged
+    LAST, after this provider's own computed values (temperature,
+    max_output_tokens, thinking_config, tools, ...) -- the caller's extra
+    config always wins, and wins LOUDLY: overriding a value this provider
+    itself had already set logs a warning naming the field, the old value,
+    and the new one, so a confusing production override is never silent.
+
+    An extra_request_params key that isn't a real GenerateContentConfig
+    field logs a warning and is skipped -- never raises, since a typo in
+    settings.yaml shouldn't crash the whole provider mount.
+    """
+    if not extra_request_params:
+        return
+    valid_fields = type(config).model_fields
+    for key, value in extra_request_params.items():
+        if key not in valid_fields:
+            logger.warning(
+                "[PROVIDER] Gemini: extra_request_params key %r is not a "
+                "recognized GenerateContentConfig field -- ignored. See "
+                "google.genai.types.GenerateContentConfig for valid fields.",
+                key,
+            )
+            continue
+        existing = getattr(config, key, None)
+        if existing is not None:
+            logger.warning(
+                "[PROVIDER] Gemini: extra_request_params overrides '%s' "
+                "(provider computed %r, extra_request_params sets %r) -- "
+                "extra_request_params always wins.",
+                key,
+                existing,
+                value,
+            )
+        setattr(config, key, value)
+
+# Keys that appeared in past README revisions describing features that were
+# never actually implemented in this module (verified by grep: no
+# `self.config.get(...)` call site reads any of them). These are not typos
+# -- they're documentation ghosts a user may reasonably still have in their
+# config from an older guide -- so they get a specific, helpful message
+# instead of a generic "did you mean" guess.
+_KNOWN_INERT_CONFIG_KEYS: dict[str, str] = {
+    "debug": (
+        "documented in older README revisions but never implemented -- no "
+        "llm:request:debug/llm:response:debug events exist in this "
+        "provider. Setting it has no effect."
+    ),
+    "raw_debug": (
+        "documented in older README revisions but never implemented -- no "
+        "llm:request:raw/llm:response:raw events exist in this provider. "
+        "Setting it has no effect. (This provider's actual raw-I/O capture "
+        "is the differently-named 'raw' config key, which IS implemented.)"
+    ),
+    "debug_truncate_length": (
+        "documented in older README revisions but never implemented -- "
+        "this provider has no debug-log truncation path. Setting it has "
+        "no effect."
+    ),
+}
+
+
+def _sweep_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never raise) about config keys this provider doesn't consume.
+
+    Three distinct messages, in priority order:
+      1. A known documentation ghost (_KNOWN_INERT_CONFIG_KEYS) -- specific,
+         helpful explanation of why it does nothing.
+      2. A likely typo of a real key (difflib match) -- "did you mean X?".
+      3. Anything else -- generic "unrecognized, ignored" with the full
+         list of keys this provider actually reads.
+    """
+    for key in config:
+        if key in _CONSUMED_CONFIG_KEYS:
+            continue
+        if key in _KNOWN_INERT_CONFIG_KEYS:
+            logger.warning(
+                "[PROVIDER] Gemini: config key %r is inert -- %s",
+                key,
+                _KNOWN_INERT_CONFIG_KEYS[key],
+            )
+            continue
+        suggestions = difflib.get_close_matches(
+            key, _CONSUMED_CONFIG_KEYS, n=1
+        )
+        if suggestions:
+            logger.warning(
+                "[PROVIDER] Gemini: unknown config key %r -- did you mean "
+                "%r? (unrecognized keys are ignored)",
+                key,
+                suggestions[0],
+            )
+        else:
+            logger.warning(
+                "[PROVIDER] Gemini: unknown config key %r -- ignored. "
+                "Recognized keys: %s",
+                key,
+                sorted(_CONSUMED_CONFIG_KEYS),
+            )
+
+
 class GeminiChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
 
@@ -324,20 +718,53 @@ class GeminiProvider:
         )
         self.config = config or {}
         self.coordinator = coordinator
-        self.default_model = self.config.get("default_model", "gemini-2.5-flash")
-        self.max_tokens = self.config.get("max_tokens", 8192)
-        self.temperature = self.config.get("temperature", 0.7)
-        self.timeout = self.config.get("timeout", 600.0)
-        self.priority = self.config.get("priority", 100)
-        self.raw = self.config.get("raw", False)
-        self.use_streaming = self.config.get("use_streaming", True)
+        # gemini-3.7-flash is the current flagship Flash model (verified
+        # live against this account's key on 2026-08-29: present in
+        # list_models(), 40 gemini-* models served). gemini-2.5-flash is two
+        # generations back; gemini-3.5-flash is documented as legacy.
+        _sweep_unknown_config_keys(self.config)
+
+        self.default_model = self.config.get("default_model", "gemini-3.7-flash")
+        self.max_tokens = _parse_config_number(
+            "max_output_tokens",
+            _read_renamed_config(self.config, "max_output_tokens", "max_tokens"),
+            8192,
+            int,
+        )
+        self.temperature = _parse_config_number(
+            "temperature", self.config.get("temperature"), 0.7, float
+        )
+        self.timeout = _parse_config_number(
+            "timeout", self.config.get("timeout"), 600.0, float
+        )
+        self.priority = _parse_config_number(
+            "priority", self.config.get("priority"), 100, int
+        )
+        self.raw = _parse_config_bool("raw", self.config.get("raw"), False)
+        self.use_streaming = _parse_config_bool(
+            "use_streaming", self.config.get("use_streaming"), True
+        )
+        # Settings-only escape hatch -- deliberately NOT a ConfigField (no
+        # interactive wizard prompt). Arbitrary GenerateContentConfig
+        # fields (safety_settings, top_p, top_k, seed, stop_sequences,
+        # etc.) merged in last, after this provider's own computed values.
+        # See _apply_extra_request_params for the merge contract.
+        self.extra_request_params = self.config.get("extra_request_params") or {}
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
-            max_retries=int(self.config.get("max_retries", 5)),
-            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
-            max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            max_retries=_parse_config_number(
+                "max_retries", self.config.get("max_retries"), 5, int
+            ),
+            initial_delay=_parse_config_number(
+                "min_retry_delay", self.config.get("min_retry_delay"), 1.0, float
+            ),
+            max_delay=_parse_config_number(
+                "max_retry_delay", self.config.get("max_retry_delay"), 60.0, float
+            ),
+            jitter=_parse_config_bool(
+                "retry_jitter", self.config.get("retry_jitter"), True
+            ),
         )
 
         # Process-wide concurrency gate.
@@ -397,7 +824,7 @@ class GeminiProvider:
             credential_env_vars=["GOOGLE_API_KEY", "GEMINI_API_KEY"],
             capabilities=["streaming", "tools", "thinking", "json_mode", "batch"],
             defaults={
-                "model": "gemini-2.5-flash",
+                "model": "gemini-3.7-flash",
                 "max_tokens": 8192,
                 "temperature": 0.7,
                 "timeout": 600.0,
@@ -831,6 +1258,122 @@ class GeminiProvider:
 
         return await self._complete_chat_request(request, **kwargs)
 
+    def _resolve_thinking_config(
+        self, model: str, request: ChatRequest, kwargs: dict[str, Any]
+    ):
+        """Resolve the ThinkingConfig to send for this request.
+
+        Precedence (highest first):
+
+        1. Explicit ``thinking_budget`` via kwargs or ``request.metadata`` --
+           the legacy override. Honored ALONE: never combined with
+           thinking_level (Google 400s if both are set on one request).
+        2. ``request.reasoning_effort`` -- mapped to a thinking_level target
+           (see _EFFORT_TO_LEVEL), clamped per-model (see
+           _supported_thinking_levels / _clamp_thinking_level). Models that
+           reject thinking_level entirely fall back to the legacy numeric
+           mapping instead (the only control they have):
+           none=0, minimal/low=4096, medium/high/xhigh/max=-1 (dynamic).
+        3. No directive at all -- omit both thinking_budget and
+           thinking_level, keeping only include_thoughts. Gemini models
+           think by default (dynamically) even with a config that sets
+           neither field; forcing an explicit dynamic budget of -1 is
+           functionally equivalent but needlessly forecloses "let the model
+           use its own built-in default" for level-only models. Verified
+           live: ThinkingConfig(include_thoughts=True) with no budget/level
+           still returns thought summaries at the model's own default
+           thinking amount, on both gemini-2.5-flash and gemini-3.7-flash.
+
+        A note on disabling thinking: explicitly sending thinking_budget=0
+        DOES disable thinking on Gemini 2.x models (verified live:
+        thoughts_token_count becomes None) -- but *omitting* the config
+        entirely does NOT (verified live: thoughts_token_count is still
+        populated with no thinking_config sent at all). These are not
+        equivalent, so the explicit-zero case below always sends the
+        field rather than omitting it -- omitting it here was the
+        pre-existing implementation's bug (thinking_budget=0 never actually
+        reached the API), fixed as part of this same change since it's the
+        exact code path being redesigned.
+
+        Gemini 3.x cannot disable thinking at all regardless of what is
+        sent (verified live: thinking_budget=0 on gemini-3.7-flash still
+        produced ~26 thinking tokens; there is no "off" thinking_level).
+        That is a vendor limitation, not something this method can work
+        around.
+        """
+        from google import genai
+
+        include_thoughts = True
+        if request.metadata and "include_thoughts" in request.metadata:
+            include_thoughts = request.metadata["include_thoughts"]
+        if "include_thoughts" in kwargs:
+            include_thoughts = kwargs["include_thoughts"]
+
+        # --- 1. Explicit thinking_budget (legacy override) -----------------
+        explicit_budget = None
+        if request.metadata and "thinking_budget" in request.metadata:
+            explicit_budget = request.metadata["thinking_budget"]
+        if "thinking_budget" in kwargs:
+            explicit_budget = kwargs["thinking_budget"]
+
+        if explicit_budget is not None:
+            return genai.types.ThinkingConfig(
+                thinking_budget=explicit_budget, include_thoughts=include_thoughts
+            )
+
+        # --- 2. reasoning_effort -> thinking_level (clamped per-model) ------
+        if request.reasoning_effort:
+            effort = request.reasoning_effort.lower()
+            supported = _supported_thinking_levels(model)
+
+            if supported is None:
+                # This model has no thinking_level control at all -- the
+                # legacy numeric mapping is the only lever available.
+                if effort == "none":
+                    budget = 0
+                elif effort in ("minimal", "low"):
+                    budget = 4096
+                else:
+                    budget = -1  # medium/high/xhigh/max -> dynamic
+                return genai.types.ThinkingConfig(
+                    thinking_budget=budget, include_thoughts=include_thoughts
+                )
+
+            if effort == "none":
+                if "minimal" in supported:
+                    return genai.types.ThinkingConfig(
+                        thinking_level=genai.types.ThinkingLevel.MINIMAL,
+                        include_thoughts=include_thoughts,
+                    )
+                # This model can't go any lower than its own default, and
+                # (for Gemini 3.x) may not be able to disable thinking at
+                # all -- fall through to the model's own default amount.
+                logger.info(
+                    "[PROVIDER] Gemini: reasoning_effort='none' requested but "
+                    "'%s' has no thinking_level below its own default -- "
+                    "using the model's default thinking amount instead",
+                    model,
+                )
+                return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
+
+            target = _EFFORT_TO_LEVEL.get(effort)
+            if target is None:
+                logger.warning(
+                    "[PROVIDER] Gemini: unknown reasoning_effort '%s' -- "
+                    "ignoring, using model default thinking",
+                    request.reasoning_effort,
+                )
+                return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
+
+            level = _clamp_thinking_level(model, target, supported)
+            return genai.types.ThinkingConfig(
+                thinking_level=genai.types.ThinkingLevel(level.upper()),
+                include_thoughts=include_thoughts,
+            )
+
+        # --- 3. No directive at all -----------------------------------------
+        return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -891,41 +1434,16 @@ class GeminiProvider:
             "max_tokens", self.max_tokens
         )
 
-        # Extract thinking parameters from request metadata or kwargs
-        # Default: Enable dynamic thinking with text summaries for 2.5+ models
-        thinking_budget = -1  # -1 = dynamic (model decides), 0 = disabled
-        include_thoughts = True  # Get text summaries of thoughts
-
-        if request.metadata:
-            if "thinking_budget" in request.metadata:
-                thinking_budget = request.metadata.get("thinking_budget")
-            include_thoughts = request.metadata.get("include_thoughts", True)
-
-        # reasoning_effort support (portable interface, checked after metadata but before kwargs)
-        # Maps reasoning_effort to thinking_budget values per design doc.
-        if request.reasoning_effort and "thinking_budget" not in kwargs:
-            effort = request.reasoning_effort.lower()
-            if effort == "low":
-                thinking_budget = 4096
-            elif effort in ("medium", "high"):
-                thinking_budget = -1  # dynamic
-
-        # Allow kwargs to override (backward compat — takes absolute precedence)
-        if "thinking_budget" in kwargs:
-            thinking_budget = kwargs["thinking_budget"]
-        if "include_thoughts" in kwargs:
-            include_thoughts = kwargs["include_thoughts"]
+        # Resolve thinking configuration -- see _resolve_thinking_config for
+        # the full precedence (explicit thinking_budget > reasoning_effort ->
+        # thinking_level, clamped per-model > model default).
+        thinking_config = self._resolve_thinking_config(model, request, kwargs)
 
         # Build Gemini config with thinking support
         config = genai.types.GenerateContentConfig(
             temperature=temperature, max_output_tokens=max_tokens
         )
-
-        # Add thinking configuration (enabled by default for 2.5+ models)
-        if thinking_budget != 0:  # 0 explicitly disables thinking
-            config.thinking_config = genai.types.ThinkingConfig(
-                thinking_budget=thinking_budget, include_thoughts=include_thoughts
-            )
+        config.thinking_config = thinking_config
 
         if system_instruction:
             config.system_instruction = system_instruction
@@ -943,6 +1461,12 @@ class GeminiProvider:
             config.automatic_function_calling = (
                 genai.types.AutomaticFunctionCallingConfig(disable=True)
             )
+
+        # extra_request_params merged LAST -- see _apply_extra_request_params
+        # for the full contract (owner-beware override, warns loudly).
+        # Single site: both the streaming and non-streaming call paths below
+        # reuse this same `config` object.
+        _apply_extra_request_params(config, self.extra_request_params)
 
         logger.info(f"Gemini API call - model: {model}, messages: {len(all_messages)}")
 
@@ -1692,16 +2216,32 @@ class GeminiProvider:
                             )
                 else:
                     # Regular text (including final answer with thought_signature)
-                    # Capture any thought_signature as an extra field (bytes) so the
-                    # outbound path can echo it back to the API.
-                    _text_sig = getattr(part, "thought_signature", None)
+                    # Capture any thought_signature as an extra field so the
+                    # outbound path can echo it back to the API. Encode to
+                    # base64 str at capture time (matching ThinkingBlock's
+                    # existing behavior below) rather than storing raw SDK
+                    # bytes: this module is stateless full-resend, so the
+                    # captured Message list is exactly what later gets
+                    # replayed -- and, in practice, also exactly what gets
+                    # JSON-serialized by session persistence, event logging,
+                    # or any orchestrator that calls model_dump(mode="json").
+                    # Raw bytes containing non-UTF-8 sequences (the normal
+                    # case for an opaque cryptographic signature) make that
+                    # serialization crash outright -- verified directly
+                    # against amplifier_core's own TextBlock/ToolCallBlock:
+                    # model_dump(mode="json") raises UnicodeDecodeError for
+                    # a signature like bytes([0xff, 0xfe, ...]). Encoding to
+                    # base64 ASCII here makes the value JSON-safe everywhere
+                    # it travels, matching ThinkingBlock's contract (its
+                    # signature field is typed str | None for this reason).
+                    _text_sig = _encode_sig(getattr(part, "thought_signature", None))
                     _text_kwargs: dict = (
                         {"signature": _text_sig} if _text_sig is not None else {}
                     )
                     content_blocks.append(TextBlock(text=part.text, **_text_kwargs))
                     if _text_sig is not None:
                         logger.debug(
-                            "[PROVIDER] Gemini: captured thought_signature on text part (%d bytes)",
+                            "[PROVIDER] Gemini: captured thought_signature on text part (%d chars, base64)",
                             len(_text_sig),
                         )
                     text_accumulator.append(part.text)
@@ -1711,15 +2251,18 @@ class GeminiProvider:
                 fc = part.function_call
                 tool_call_id = self._generate_tool_call_id()
 
-                # Capture thought_signature if present (Gemini 2.5+ thinking models).
-                # Store as raw bytes in an extra field so the outbound path can echo
-                # it back without an additional encode/decode round-trip.
-                _fc_sig = getattr(part, "thought_signature", None)
+                # Capture thought_signature if present (Gemini 2.5+ thinking
+                # models). Encoded to base64 str at capture time for the same
+                # JSON-safety reason as the text-part signature above --
+                # verified directly that a raw-bytes ToolCallBlock/ToolCall
+                # signature fails model_dump(mode="json") for non-UTF-8 byte
+                # sequences (the normal case for an opaque signature).
+                _fc_sig = _encode_sig(getattr(part, "thought_signature", None))
                 _fc_kwargs: dict = {"signature": _fc_sig} if _fc_sig is not None else {}
                 if _fc_sig is not None:
                     logger.debug(
                         "[PROVIDER] Gemini: captured thought_signature on function_call "
-                        "part '%s' (%d bytes)",
+                        "part '%s' (%d chars, base64)",
                         fc.name,
                         len(_fc_sig),
                     )
