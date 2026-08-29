@@ -10,6 +10,7 @@ __amplifier_module_type__ = "provider"
 
 import asyncio
 import base64
+import difflib
 from collections import defaultdict
 from collections.abc import Callable
 from decimal import Decimal
@@ -410,6 +411,181 @@ def _clamp_thinking_level(model: str, requested: str, supported: tuple[str, ...]
     return supported[0]  # pragma: no cover -- defensive; supported is never empty
 
 
+# ---------------------------------------------------------------------------
+# Config hygiene: bool/numeric coercion, unknown-key sweep, inert-key notes
+# ---------------------------------------------------------------------------
+# Config commonly arrives as strings: the app-cli wizard writes
+# `field_type="boolean"` values as the literal strings "true"/"false" (not
+# Python bools), and hand-edited YAML often quotes both booleans and
+# numbers. Naive `bool(raw)` or bare `int(raw)`/`float(raw)` are both wrong
+# for that -- `bool("false")` is True (any non-empty string is truthy),
+# silently inverting the operator's intent, and a bad numeric string
+# currently either raises at mount time (max_retries etc., which call
+# int()/float() directly) or survives uncoerced all the way to
+# asyncio.wait_for(timeout=...), which fails on the FIRST real API call
+# with a confusing low-level TypeError instead of a clear config error.
+
+_CONFIG_BOOL_TRUE_STRINGS: frozenset[str] = frozenset({"true", "1", "yes"})
+_CONFIG_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no"})
+
+
+def _parse_config_bool(key: str, raw: Any, default: bool) -> bool:
+    """Parse a boolean-ish provider-config value, tolerating string bools.
+
+    Accepts:
+      - key absent / value None / value "" -> `default`
+      - real bool -> itself, unchanged
+      - str in {"true", "1", "yes"} (case-insensitive, stripped) -> True
+      - str in {"false", "0", "no"} (case-insensitive, stripped) -> False
+
+    Anything else logs a warning and falls back to `default` -- config
+    hygiene here is warn-and-default, not raise, so one typo'd flag doesn't
+    take down the whole provider mount.
+    """
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in _CONFIG_BOOL_TRUE_STRINGS:
+            return True
+        if normalized in _CONFIG_BOOL_FALSE_STRINGS:
+            return False
+    logger.warning(
+        "[PROVIDER] Gemini: invalid config %r=%r (expected true/false, "
+        "also 1/0, yes/no; case-insensitive) -- using default %r",
+        key,
+        raw,
+        default,
+    )
+    return default
+
+
+def _parse_config_number(key: str, raw: Any, default: Any, cast) -> Any:
+    """Parse a numeric provider-config value, tolerating string numbers.
+
+    Accepts real int/float values and numeric strings (whitespace-stripped),
+    coercing via `cast` (int or float). Anything unparseable -- including
+    key absent / None / "" -- logs a warning and falls back to `default`.
+    Never raises: a bad numeric config value degrades to a safe default
+    instead of crashing the provider at mount time or, worse, surviving
+    uncoerced as a string into a low-level call (e.g.
+    asyncio.wait_for(timeout="600")) that fails confusingly on the first
+    real request instead of at mount.
+    """
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        pass  # bool is a subclass of int -- never accept it as numeric config
+    elif isinstance(raw, (int, float)):
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(raw, str):
+        try:
+            return cast(raw.strip())
+        except (TypeError, ValueError):
+            pass
+    logger.warning(
+        "[PROVIDER] Gemini: invalid config %r=%r (expected a %s) -- using "
+        "default %r",
+        key,
+        raw,
+        cast.__name__,
+        default,
+    )
+    return default
+
+
+# Config keys this provider actually reads (self.config.get(...) call
+# sites). `priority` is included even though this module only stores it
+# on self.priority for the orchestrator's provider-selection logic to read
+# -- it is a real, consumed key, never a typo to flag.
+_CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "default_model",
+        "max_tokens",
+        "temperature",
+        "timeout",
+        "priority",
+        "raw",
+        "use_streaming",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "max_concurrent_requests",
+    }
+)
+
+# Keys that appeared in past README revisions describing features that were
+# never actually implemented in this module (verified by grep: no
+# `self.config.get(...)` call site reads any of them). These are not typos
+# -- they're documentation ghosts a user may reasonably still have in their
+# config from an older guide -- so they get a specific, helpful message
+# instead of a generic "did you mean" guess.
+_KNOWN_INERT_CONFIG_KEYS: dict[str, str] = {
+    "debug": (
+        "documented in older README revisions but never implemented -- no "
+        "llm:request:debug/llm:response:debug events exist in this "
+        "provider. Setting it has no effect."
+    ),
+    "raw_debug": (
+        "documented in older README revisions but never implemented -- no "
+        "llm:request:raw/llm:response:raw events exist in this provider. "
+        "Setting it has no effect. (This provider's actual raw-I/O capture "
+        "is the differently-named 'raw' config key, which IS implemented.)"
+    ),
+    "debug_truncate_length": (
+        "documented in older README revisions but never implemented -- "
+        "this provider has no debug-log truncation path. Setting it has "
+        "no effect."
+    ),
+}
+
+
+def _sweep_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never raise) about config keys this provider doesn't consume.
+
+    Three distinct messages, in priority order:
+      1. A known documentation ghost (_KNOWN_INERT_CONFIG_KEYS) -- specific,
+         helpful explanation of why it does nothing.
+      2. A likely typo of a real key (difflib match) -- "did you mean X?".
+      3. Anything else -- generic "unrecognized, ignored" with the full
+         list of keys this provider actually reads.
+    """
+    for key in config:
+        if key in _CONSUMED_CONFIG_KEYS:
+            continue
+        if key in _KNOWN_INERT_CONFIG_KEYS:
+            logger.warning(
+                "[PROVIDER] Gemini: config key %r is inert -- %s",
+                key,
+                _KNOWN_INERT_CONFIG_KEYS[key],
+            )
+            continue
+        suggestions = difflib.get_close_matches(
+            key, _CONSUMED_CONFIG_KEYS, n=1
+        )
+        if suggestions:
+            logger.warning(
+                "[PROVIDER] Gemini: unknown config key %r -- did you mean "
+                "%r? (unrecognized keys are ignored)",
+                key,
+                suggestions[0],
+            )
+        else:
+            logger.warning(
+                "[PROVIDER] Gemini: unknown config key %r -- ignored. "
+                "Recognized keys: %s",
+                key,
+                sorted(_CONSUMED_CONFIG_KEYS),
+            )
+
+
 class GeminiChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
 
@@ -455,20 +631,40 @@ class GeminiProvider:
         # live against this account's key on 2026-08-29: present in
         # list_models(), 40 gemini-* models served). gemini-2.5-flash is two
         # generations back; gemini-3.5-flash is documented as legacy.
+        _sweep_unknown_config_keys(self.config)
+
         self.default_model = self.config.get("default_model", "gemini-3.7-flash")
-        self.max_tokens = self.config.get("max_tokens", 8192)
-        self.temperature = self.config.get("temperature", 0.7)
-        self.timeout = self.config.get("timeout", 600.0)
-        self.priority = self.config.get("priority", 100)
-        self.raw = self.config.get("raw", False)
-        self.use_streaming = self.config.get("use_streaming", True)
+        self.max_tokens = _parse_config_number(
+            "max_tokens", self.config.get("max_tokens"), 8192, int
+        )
+        self.temperature = _parse_config_number(
+            "temperature", self.config.get("temperature"), 0.7, float
+        )
+        self.timeout = _parse_config_number(
+            "timeout", self.config.get("timeout"), 600.0, float
+        )
+        self.priority = _parse_config_number(
+            "priority", self.config.get("priority"), 100, int
+        )
+        self.raw = _parse_config_bool("raw", self.config.get("raw"), False)
+        self.use_streaming = _parse_config_bool(
+            "use_streaming", self.config.get("use_streaming"), True
+        )
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
-            max_retries=int(self.config.get("max_retries", 5)),
-            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
-            max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            max_retries=_parse_config_number(
+                "max_retries", self.config.get("max_retries"), 5, int
+            ),
+            initial_delay=_parse_config_number(
+                "min_retry_delay", self.config.get("min_retry_delay"), 1.0, float
+            ),
+            max_delay=_parse_config_number(
+                "max_retry_delay", self.config.get("max_retry_delay"), 60.0, float
+            ),
+            jitter=_parse_config_bool(
+                "retry_jitter", self.config.get("retry_jitter"), True
+            ),
         )
 
         # Process-wide concurrency gate.
