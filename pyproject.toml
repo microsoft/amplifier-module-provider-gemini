@@ -9,7 +9,16 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
-    "google-genai>=1.40.0",
+    # 1.56.0 is the floor because that is the first google-genai release
+    # whose ThinkingConfig exposes the full thinking_level enum this module
+    # needs (minimal/low/medium/high). Verified by probing the SDK's own
+    # installed types directly (not just changelog text) on 2026-08-29:
+    #   - 1.46.0: no thinking_level field on ThinkingConfig at all.
+    #   - 1.51.0: thinking_level added, but only LOW/HIGH values exist.
+    #   - 1.56.0: adds MINIMAL and MEDIUM -- the full four-level enum.
+    # See amplifier_module_provider_gemini/__init__.py's
+    # _THINKING_LEVEL_TABLE comment for the per-model support matrix.
+    "google-genai>=1.56.0",
 ]
 
 [project.entry-points."amplifier.modules"]

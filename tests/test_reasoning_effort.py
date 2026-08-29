@@ -107,7 +107,16 @@ def test_reasoning_effort_high_sets_dynamic():
 
 
 def test_reasoning_effort_none_preserves_default():
-    """reasoning_effort=None -> existing behavior (default dynamic thinking)."""
+    """reasoning_effort=None -> no explicit budget/level; model default thinking.
+
+    Historically this asserted thinking_budget == -1 ("explicit dynamic").
+    Post-retarget, no directive at all means neither thinking_budget nor
+    thinking_level is sent -- verified live that Gemini still thinks by
+    default (and, with include_thoughts=True, still returns thought
+    summaries) with a bare ThinkingConfig(include_thoughts=True). Sending
+    -1 explicitly was functionally equivalent but foreclosed the
+    thinking_level path for models that only accept levels.
+    """
     provider = _make_provider()
     mock_client = _capture_config(provider)
 
@@ -119,8 +128,9 @@ def test_reasoning_effort_none_preserves_default():
 
     call_kwargs = mock_client.aio.models.generate_content.await_args
     config = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
-    # Default is -1 (dynamic)
-    assert config.thinking_config.thinking_budget == -1
+    assert config.thinking_config.thinking_budget is None
+    assert config.thinking_config.thinking_level is None
+    assert config.thinking_config.include_thoughts is True
 
 
 def test_kwargs_thinking_budget_overrides_reasoning_effort():
@@ -157,7 +167,18 @@ def test_metadata_thinking_budget_with_no_reasoning_effort():
 
 
 def test_thinking_disabled_with_budget_zero():
-    """thinking_budget=0 in kwargs should disable thinking entirely."""
+    """thinking_budget=0 in kwargs should disable thinking entirely.
+
+    Bug fix: the pre-retarget implementation OMITTED thinking_config
+    entirely when thinking_budget resolved to 0, and this test asserted
+    exactly that ("thinking_config is None"). Verified live against the
+    real API that omitting the field is NOT the same as sending an explicit
+    zero: gemini-2.5-flash with no thinking_config at all still reports a
+    populated thoughts_token_count (still thinking, budget=0 never actually
+    reached the API), while an EXPLICIT thinking_budget=0 correctly reports
+    thoughts_token_count=None (thinking genuinely disabled). The fix always
+    sends the explicit value through instead of omitting it.
+    """
     provider = _make_provider()
     mock_client = _capture_config(provider)
 
@@ -169,5 +190,6 @@ def test_thinking_disabled_with_budget_zero():
 
     call_kwargs = mock_client.aio.models.generate_content.await_args
     config = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
-    # thinking_budget=0 disables thinking, so thinking_config should not be set
-    assert config.thinking_config is None
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget == 0
+    assert config.thinking_config.thinking_level is None

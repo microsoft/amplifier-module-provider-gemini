@@ -283,6 +283,133 @@ def _encode_sig(sig: bytes | str | None) -> str | None:
     return sig  # assume already base64-encoded str
 
 
+# ---------------------------------------------------------------------------
+# Thinking level support (google-genai's *current* thinking control)
+# ---------------------------------------------------------------------------
+# Google's `thinking_budget` (an approximate output-token budget spent on
+# internal reasoning) is now the LEGACY thinking control. The current
+# control -- and the *only* one some models accept at all -- is
+# `thinking_level`, an enum (minimal|low|medium|high). Sending both
+# thinking_level and thinking_budget on the same request is rejected by the
+# API with a 400.
+#
+# CRITICAL, verified LIVE against the real Google AI API on 2026-08-29 (not
+# documented by Google as of this writing, and NOT the "smaller subset of
+# levels per older model" story one might assume): thinking_level support is
+# an all-or-nothing split by model generation, not a graduated subset --
+#   * gemini-2.5-flash and gemini-2.5-pro REJECT thinking_level outright:
+#       400 INVALID_ARGUMENT: "Thinking level is not supported for this model."
+#     These models only understand the legacy thinking_budget control, and
+#     think by default via a dynamic budget regardless of any config.
+#   * gemini-3.x models are the opposite: thinking is MANDATORY and
+#     thinking_budget is silently ignored (verified live: thinking_budget=0
+#     on gemini-3.7-flash still produced ~26 thinking tokens) -- there is no
+#     way to disable thinking on a Gemini 3.x model. thinking_level is their
+#     only real, effective control, and even that control cannot express
+#     "disabled" -- there is no "none" level in the enum.
+#
+# _THINKING_LEVEL_TABLE maps a model id to the ThinkingLevel values it is
+# known to accept. `None` means "rejects thinking_level entirely -- always
+# use the legacy thinking_budget path for this model". Google does not
+# publish this table; it is reverse-engineered from live 400 responses.
+# Treat it as best-effort and update it as new models ship or vendor
+# behavior changes.
+_THINKING_LEVEL_TABLE: dict[str, tuple[str, ...] | None] = {
+    # Gemini 2.x -- thinking_level rejected outright (verified live,
+    # 2026-08-29). These models think by default via a dynamic budget;
+    # the legacy thinking_budget path is their only control.
+    "gemini-2.5-pro": None,
+    "gemini-2.5-flash": None,
+    "gemini-2.5-flash-lite": None,
+    "gemini-2.0-flash": None,
+    "gemini-2.0-flash-lite": None,
+    # Gemini 3.7 Flash -- current flagship Flash model. Verified live:
+    # low/medium/high accepted; MINIMAL rejected ("Thinking level MINIMAL is
+    # not supported for this model. Please retry with other thinking
+    # level."). ai.google.dev documents its default (when omitted) as medium.
+    "gemini-3.7-flash": ("low", "medium", "high"),
+    # Gemini 3.5 family -- verified live: minimal accepted.
+    "gemini-3.5-flash": ("minimal", "low", "medium", "high"),
+    "gemini-3.5-flash-lite": ("minimal", "low", "medium", "high"),
+}
+
+# Fallback range for any gemini-3.x model id not listed above -- new preview
+# ids ship often (gemini-3.1-*, gemini-3.6-flash, etc.). Assume the full
+# range until a live 400 proves a narrower one for that specific id.
+_THINKING_LEVEL_DEFAULT_3X: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+# Ordinal order used for clamping (lowest to highest amount of thinking).
+_THINKING_LEVEL_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+# reasoning_effort (Amplifier's portable, cross-provider knob) -> the
+# thinking_level it targets. "xhigh"/"max" collapse to "high" -- Gemini has
+# no level above high.
+_EFFORT_TO_LEVEL: dict[str, str] = {
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def _supported_thinking_levels(model: str) -> tuple[str, ...] | None:
+    """Return the ThinkingLevel values ``model`` is known to accept.
+
+    ``None`` means the model rejects thinking_level entirely (legacy
+    thinking_budget path only). See _THINKING_LEVEL_TABLE for the live
+    evidence behind each entry.
+    """
+    if model in _THINKING_LEVEL_TABLE:
+        return _THINKING_LEVEL_TABLE[model]
+    if model.startswith("gemini-2."):
+        return None
+    if model.startswith("gemini-3."):
+        return _THINKING_LEVEL_DEFAULT_3X
+    # Unknown family (a future gemini-4.x, a tuned model id, etc.) -- assume
+    # support; a live 400 surfaces clearly rather than degrading silently.
+    return _THINKING_LEVEL_DEFAULT_3X
+
+
+def _clamp_thinking_level(model: str, requested: str, supported: tuple[str, ...]) -> str:
+    """Clamp ``requested`` to the nearest level in ``supported`` for ``model``.
+
+    Prefers the next level UP (more thinking) over down: under-thinking
+    silently degrades output quality, while over-thinking only costs a few
+    more tokens. Logs one INFO line whenever the clamp actually changes the
+    requested value -- clamping is never silent.
+    """
+    if requested in supported:
+        return requested
+    req_idx = _THINKING_LEVEL_ORDER.index(requested)
+    for idx in range(req_idx + 1, len(_THINKING_LEVEL_ORDER)):
+        if _THINKING_LEVEL_ORDER[idx] in supported:
+            clamped = _THINKING_LEVEL_ORDER[idx]
+            logger.info(
+                "[PROVIDER] Gemini: thinking_level '%s' not supported by '%s' "
+                "(supports: %s) -- clamped up to '%s'",
+                requested,
+                model,
+                supported,
+                clamped,
+            )
+            return clamped
+    for idx in range(req_idx - 1, -1, -1):
+        if _THINKING_LEVEL_ORDER[idx] in supported:
+            clamped = _THINKING_LEVEL_ORDER[idx]
+            logger.info(
+                "[PROVIDER] Gemini: thinking_level '%s' not supported by '%s' "
+                "(supports: %s) -- clamped down to '%s'",
+                requested,
+                model,
+                supported,
+                clamped,
+            )
+            return clamped
+    return supported[0]  # pragma: no cover -- defensive; supported is never empty
+
+
 class GeminiChatResponse(ChatResponse):
     """ChatResponse with additional fields for streaming UI compatibility."""
 
@@ -831,6 +958,122 @@ class GeminiProvider:
 
         return await self._complete_chat_request(request, **kwargs)
 
+    def _resolve_thinking_config(
+        self, model: str, request: ChatRequest, kwargs: dict[str, Any]
+    ):
+        """Resolve the ThinkingConfig to send for this request.
+
+        Precedence (highest first):
+
+        1. Explicit ``thinking_budget`` via kwargs or ``request.metadata`` --
+           the legacy override. Honored ALONE: never combined with
+           thinking_level (Google 400s if both are set on one request).
+        2. ``request.reasoning_effort`` -- mapped to a thinking_level target
+           (see _EFFORT_TO_LEVEL), clamped per-model (see
+           _supported_thinking_levels / _clamp_thinking_level). Models that
+           reject thinking_level entirely fall back to the legacy numeric
+           mapping instead (the only control they have):
+           none=0, minimal/low=4096, medium/high/xhigh/max=-1 (dynamic).
+        3. No directive at all -- omit both thinking_budget and
+           thinking_level, keeping only include_thoughts. Gemini models
+           think by default (dynamically) even with a config that sets
+           neither field; forcing an explicit dynamic budget of -1 is
+           functionally equivalent but needlessly forecloses "let the model
+           use its own built-in default" for level-only models. Verified
+           live: ThinkingConfig(include_thoughts=True) with no budget/level
+           still returns thought summaries at the model's own default
+           thinking amount, on both gemini-2.5-flash and gemini-3.7-flash.
+
+        A note on disabling thinking: explicitly sending thinking_budget=0
+        DOES disable thinking on Gemini 2.x models (verified live:
+        thoughts_token_count becomes None) -- but *omitting* the config
+        entirely does NOT (verified live: thoughts_token_count is still
+        populated with no thinking_config sent at all). These are not
+        equivalent, so the explicit-zero case below always sends the
+        field rather than omitting it -- omitting it here was the
+        pre-existing implementation's bug (thinking_budget=0 never actually
+        reached the API), fixed as part of this same change since it's the
+        exact code path being redesigned.
+
+        Gemini 3.x cannot disable thinking at all regardless of what is
+        sent (verified live: thinking_budget=0 on gemini-3.7-flash still
+        produced ~26 thinking tokens; there is no "off" thinking_level).
+        That is a vendor limitation, not something this method can work
+        around.
+        """
+        from google import genai
+
+        include_thoughts = True
+        if request.metadata and "include_thoughts" in request.metadata:
+            include_thoughts = request.metadata["include_thoughts"]
+        if "include_thoughts" in kwargs:
+            include_thoughts = kwargs["include_thoughts"]
+
+        # --- 1. Explicit thinking_budget (legacy override) -----------------
+        explicit_budget = None
+        if request.metadata and "thinking_budget" in request.metadata:
+            explicit_budget = request.metadata["thinking_budget"]
+        if "thinking_budget" in kwargs:
+            explicit_budget = kwargs["thinking_budget"]
+
+        if explicit_budget is not None:
+            return genai.types.ThinkingConfig(
+                thinking_budget=explicit_budget, include_thoughts=include_thoughts
+            )
+
+        # --- 2. reasoning_effort -> thinking_level (clamped per-model) ------
+        if request.reasoning_effort:
+            effort = request.reasoning_effort.lower()
+            supported = _supported_thinking_levels(model)
+
+            if supported is None:
+                # This model has no thinking_level control at all -- the
+                # legacy numeric mapping is the only lever available.
+                if effort == "none":
+                    budget = 0
+                elif effort in ("minimal", "low"):
+                    budget = 4096
+                else:
+                    budget = -1  # medium/high/xhigh/max -> dynamic
+                return genai.types.ThinkingConfig(
+                    thinking_budget=budget, include_thoughts=include_thoughts
+                )
+
+            if effort == "none":
+                if "minimal" in supported:
+                    return genai.types.ThinkingConfig(
+                        thinking_level=genai.types.ThinkingLevel.MINIMAL,
+                        include_thoughts=include_thoughts,
+                    )
+                # This model can't go any lower than its own default, and
+                # (for Gemini 3.x) may not be able to disable thinking at
+                # all -- fall through to the model's own default amount.
+                logger.info(
+                    "[PROVIDER] Gemini: reasoning_effort='none' requested but "
+                    "'%s' has no thinking_level below its own default -- "
+                    "using the model's default thinking amount instead",
+                    model,
+                )
+                return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
+
+            target = _EFFORT_TO_LEVEL.get(effort)
+            if target is None:
+                logger.warning(
+                    "[PROVIDER] Gemini: unknown reasoning_effort '%s' -- "
+                    "ignoring, using model default thinking",
+                    request.reasoning_effort,
+                )
+                return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
+
+            level = _clamp_thinking_level(model, target, supported)
+            return genai.types.ThinkingConfig(
+                thinking_level=genai.types.ThinkingLevel(level.upper()),
+                include_thoughts=include_thoughts,
+            )
+
+        # --- 3. No directive at all -----------------------------------------
+        return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -891,41 +1134,16 @@ class GeminiProvider:
             "max_tokens", self.max_tokens
         )
 
-        # Extract thinking parameters from request metadata or kwargs
-        # Default: Enable dynamic thinking with text summaries for 2.5+ models
-        thinking_budget = -1  # -1 = dynamic (model decides), 0 = disabled
-        include_thoughts = True  # Get text summaries of thoughts
-
-        if request.metadata:
-            if "thinking_budget" in request.metadata:
-                thinking_budget = request.metadata.get("thinking_budget")
-            include_thoughts = request.metadata.get("include_thoughts", True)
-
-        # reasoning_effort support (portable interface, checked after metadata but before kwargs)
-        # Maps reasoning_effort to thinking_budget values per design doc.
-        if request.reasoning_effort and "thinking_budget" not in kwargs:
-            effort = request.reasoning_effort.lower()
-            if effort == "low":
-                thinking_budget = 4096
-            elif effort in ("medium", "high"):
-                thinking_budget = -1  # dynamic
-
-        # Allow kwargs to override (backward compat — takes absolute precedence)
-        if "thinking_budget" in kwargs:
-            thinking_budget = kwargs["thinking_budget"]
-        if "include_thoughts" in kwargs:
-            include_thoughts = kwargs["include_thoughts"]
+        # Resolve thinking configuration -- see _resolve_thinking_config for
+        # the full precedence (explicit thinking_budget > reasoning_effort ->
+        # thinking_level, clamped per-model > model default).
+        thinking_config = self._resolve_thinking_config(model, request, kwargs)
 
         # Build Gemini config with thinking support
         config = genai.types.GenerateContentConfig(
             temperature=temperature, max_output_tokens=max_tokens
         )
-
-        # Add thinking configuration (enabled by default for 2.5+ models)
-        if thinking_budget != 0:  # 0 explicitly disables thinking
-            config.thinking_config = genai.types.ThinkingConfig(
-                thinking_budget=thinking_budget, include_thoughts=include_thoughts
-            )
+        config.thinking_config = thinking_config
 
         if system_instruction:
             config.system_instruction = system_instruction
