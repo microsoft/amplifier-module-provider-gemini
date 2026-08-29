@@ -499,15 +499,59 @@ def _parse_config_number(key: str, raw: Any, default: Any, cast) -> Any:
     return default
 
 
+def _read_renamed_config(config: dict[str, Any], new: str, old: str) -> Any:
+    """Read `new`, falling back to the deprecated `old` with one warning.
+
+    The new key always wins when present (even when both are set) -- a
+    config that has already been migrated to the new name is never
+    silently overridden by a stale leftover of the old one. The warning
+    fires only when `old` is the value actually used, so a fully migrated
+    config stays silent and a config carrying both is told plainly which
+    one won.
+
+    Returns None (not a sentinel) when neither key is present, so callers
+    can pass the result straight into _parse_config_bool/_parse_config_number,
+    which already treat None as "use my own default".
+    """
+    new_val = config.get(new)
+    old_val = config.get(old)
+    if new_val not in (None, ""):
+        if old_val not in (None, ""):
+            logger.warning(
+                "[PROVIDER] Gemini: config keys '%s' (deprecated) and '%s' "
+                "are BOTH set; '%s' wins. Remove '%s'.",
+                old,
+                new,
+                new,
+                old,
+            )
+        return new_val
+    if old_val not in (None, ""):
+        logger.warning(
+            "[PROVIDER] Gemini: config key '%s' is deprecated -- use '%s' "
+            "instead (this is Google's own API parameter name). Falling "
+            "back to '%s'=%r for this session.",
+            old,
+            new,
+            old,
+            old_val,
+        )
+        return old_val
+    return None
+
+
 # Config keys this provider actually reads (self.config.get(...) call
 # sites). `priority` is included even though this module only stores it
 # on self.priority for the orchestrator's provider-selection logic to read
-# -- it is a real, consumed key, never a typo to flag.
+# -- it is a real, consumed key, never a typo to flag. `max_tokens` is kept
+# as the deprecated back-compat alias for `max_output_tokens` (Google's own
+# API parameter name) -- see _read_renamed_config.
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "api_key",
         "default_model",
-        "max_tokens",
+        "max_output_tokens",
+        "max_tokens",  # deprecated alias for max_output_tokens
         "temperature",
         "timeout",
         "priority",
@@ -635,7 +679,10 @@ class GeminiProvider:
 
         self.default_model = self.config.get("default_model", "gemini-3.7-flash")
         self.max_tokens = _parse_config_number(
-            "max_tokens", self.config.get("max_tokens"), 8192, int
+            "max_output_tokens",
+            _read_renamed_config(self.config, "max_output_tokens", "max_tokens"),
+            8192,
+            int,
         )
         self.temperature = _parse_config_number(
             "temperature", self.config.get("temperature"), 0.7, float

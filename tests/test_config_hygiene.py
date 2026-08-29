@@ -194,7 +194,7 @@ def test_recognized_keys_produce_no_warnings(caplog):
             api_key="test-key",
             config={
                 "default_model": "gemini-3.7-flash",
-                "max_tokens": 8192,
+                "max_output_tokens": 8192,
                 "temperature": 0.7,
                 "timeout": 600.0,
                 "priority": 50,
@@ -208,3 +208,47 @@ def test_recognized_keys_produce_no_warnings(caplog):
             },
         )
     assert caplog.records == []
+
+
+# ============================================================
+# max_tokens -> max_output_tokens rename (back-compat alias)
+# ============================================================
+
+
+def test_max_output_tokens_is_the_canonical_key():
+    provider = GeminiProvider(api_key="test-key", config={"max_output_tokens": 4096})
+    assert provider.max_tokens == 4096
+
+
+def test_max_tokens_still_works_as_deprecated_alias(caplog):
+    with caplog.at_level("WARNING"):
+        provider = GeminiProvider(api_key="test-key", config={"max_tokens": 2048})
+    assert provider.max_tokens == 2048
+    assert any(
+        "'max_tokens' is deprecated" in rec.message
+        and "'max_output_tokens'" in rec.message
+        for rec in caplog.records
+    ), f"got: {[r.message for r in caplog.records]}"
+
+
+def test_max_output_tokens_wins_when_both_set(caplog):
+    with caplog.at_level("WARNING"):
+        provider = GeminiProvider(
+            api_key="test-key",
+            config={"max_output_tokens": 4096, "max_tokens": 2048},
+        )
+    assert provider.max_tokens == 4096
+    assert any(
+        "are BOTH set" in rec.message and "'max_output_tokens' wins" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_max_tokens_string_value_still_coerced_through_alias():
+    provider = GeminiProvider(api_key="test-key", config={"max_tokens": "3000"})
+    assert provider.max_tokens == 3000
+
+
+def test_neither_key_set_uses_default():
+    provider = GeminiProvider(api_key="test-key", config={})
+    assert provider.max_tokens == 8192
