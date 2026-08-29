@@ -545,7 +545,9 @@ def _read_renamed_config(config: dict[str, Any], new: str, old: str) -> Any:
 # on self.priority for the orchestrator's provider-selection logic to read
 # -- it is a real, consumed key, never a typo to flag. `max_tokens` is kept
 # as the deprecated back-compat alias for `max_output_tokens` (Google's own
-# API parameter name) -- see _read_renamed_config.
+# API parameter name) -- see _read_renamed_config. `extra_request_params`
+# is a settings-only escape hatch (never a ConfigField / interactive
+# wizard prompt) -- see _apply_extra_request_params.
 _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "api_key",
@@ -562,8 +564,53 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_retry_delay",
         "retry_jitter",
         "max_concurrent_requests",
+        "extra_request_params",
     }
 )
+
+
+def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) -> None:
+    """Merge extra_request_params into a GenerateContentConfig, in place.
+
+    `extra_request_params` is a settings-only escape hatch (bundle/settings
+    YAML only -- never an interactive ConfigField) for reaching
+    GenerateContentConfig fields this provider doesn't otherwise expose:
+    safety_settings, top_p, top_k, seed, stop_sequences,
+    presence_penalty/frequency_penalty, response_mime_type, labels, and any
+    other field google-genai's GenerateContentConfig defines. It is merged
+    LAST, after this provider's own computed values (temperature,
+    max_output_tokens, thinking_config, tools, ...) -- the caller's extra
+    config always wins, and wins LOUDLY: overriding a value this provider
+    itself had already set logs a warning naming the field, the old value,
+    and the new one, so a confusing production override is never silent.
+
+    An extra_request_params key that isn't a real GenerateContentConfig
+    field logs a warning and is skipped -- never raises, since a typo in
+    settings.yaml shouldn't crash the whole provider mount.
+    """
+    if not extra_request_params:
+        return
+    valid_fields = type(config).model_fields
+    for key, value in extra_request_params.items():
+        if key not in valid_fields:
+            logger.warning(
+                "[PROVIDER] Gemini: extra_request_params key %r is not a "
+                "recognized GenerateContentConfig field -- ignored. See "
+                "google.genai.types.GenerateContentConfig for valid fields.",
+                key,
+            )
+            continue
+        existing = getattr(config, key, None)
+        if existing is not None:
+            logger.warning(
+                "[PROVIDER] Gemini: extra_request_params overrides '%s' "
+                "(provider computed %r, extra_request_params sets %r) -- "
+                "extra_request_params always wins.",
+                key,
+                existing,
+                value,
+            )
+        setattr(config, key, value)
 
 # Keys that appeared in past README revisions describing features that were
 # never actually implemented in this module (verified by grep: no
@@ -697,6 +744,12 @@ class GeminiProvider:
         self.use_streaming = _parse_config_bool(
             "use_streaming", self.config.get("use_streaming"), True
         )
+        # Settings-only escape hatch -- deliberately NOT a ConfigField (no
+        # interactive wizard prompt). Arbitrary GenerateContentConfig
+        # fields (safety_settings, top_p, top_k, seed, stop_sequences,
+        # etc.) merged in last, after this provider's own computed values.
+        # See _apply_extra_request_params for the merge contract.
+        self.extra_request_params = self.config.get("extra_request_params") or {}
 
         # Retry configuration — delegates to shared retry_with_backoff() from amplifier-core.
         self._retry_config = RetryConfig(
@@ -1408,6 +1461,12 @@ class GeminiProvider:
             config.automatic_function_calling = (
                 genai.types.AutomaticFunctionCallingConfig(disable=True)
             )
+
+        # extra_request_params merged LAST -- see _apply_extra_request_params
+        # for the full contract (owner-beware override, warns loudly).
+        # Single site: both the streaming and non-streaming call paths below
+        # reuse this same `config` object.
+        _apply_extra_request_params(config, self.extra_request_params)
 
         logger.info(f"Gemini API call - model: {model}, messages: {len(all_messages)}")
 
