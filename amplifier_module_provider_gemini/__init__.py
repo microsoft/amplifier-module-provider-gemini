@@ -451,7 +451,11 @@ class GeminiProvider:
         )
         self.config = config or {}
         self.coordinator = coordinator
-        self.default_model = self.config.get("default_model", "gemini-2.5-flash")
+        # gemini-3.7-flash is the current flagship Flash model (verified
+        # live against this account's key on 2026-08-29: present in
+        # list_models(), 40 gemini-* models served). gemini-2.5-flash is two
+        # generations back; gemini-3.5-flash is documented as legacy.
+        self.default_model = self.config.get("default_model", "gemini-3.7-flash")
         self.max_tokens = self.config.get("max_tokens", 8192)
         self.temperature = self.config.get("temperature", 0.7)
         self.timeout = self.config.get("timeout", 600.0)
@@ -524,7 +528,7 @@ class GeminiProvider:
             credential_env_vars=["GOOGLE_API_KEY", "GEMINI_API_KEY"],
             capabilities=["streaming", "tools", "thinking", "json_mode", "batch"],
             defaults={
-                "model": "gemini-2.5-flash",
+                "model": "gemini-3.7-flash",
                 "max_tokens": 8192,
                 "temperature": 0.7,
                 "timeout": 600.0,

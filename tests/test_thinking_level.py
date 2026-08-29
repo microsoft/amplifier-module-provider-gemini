@@ -268,9 +268,8 @@ def test_reasoning_effort_legacy_mapping_on_25_flash(effort, expected_budget):
     request = ChatRequest(
         messages=[Message(role="user", content="Hello")],
         reasoning_effort=effort,
-        model="gemini-2.5-flash",
     )
-    config = _run_complete(provider, request)
+    config = _run_complete(provider, request, model="gemini-2.5-flash")
     assert config.thinking_config.thinking_budget == expected_budget
     assert config.thinking_config.thinking_level is None
 

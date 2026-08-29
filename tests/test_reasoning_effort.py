@@ -2,6 +2,14 @@
 
 Verifies that request.reasoning_effort maps to thinking_budget values,
 and that kwargs["thinking_budget"] overrides reasoning_effort.
+
+These tests deliberately pin default_model to gemini-2.5-flash, a model
+verified live to reject thinking_level entirely (see
+_THINKING_LEVEL_TABLE) -- this file exercises the legacy numeric budget
+mapping specifically. The provider's actual default model is
+gemini-3.7-flash (a level-supporting model); see tests/test_thinking_level.py
+for the full reasoning_effort -> thinking_level matrix and the per-model
+clamping/legacy-fallback behavior.
 """
 
 import asyncio
@@ -42,7 +50,14 @@ def _make_gemini_response():
 
 
 def _make_provider() -> GeminiProvider:
-    provider = GeminiProvider(api_key="test-key", config={"max_retries": 0, "use_streaming": False})
+    provider = GeminiProvider(
+        api_key="test-key",
+        config={
+            "max_retries": 0,
+            "use_streaming": False,
+            "default_model": "gemini-2.5-flash",
+        },
+    )
     provider.coordinator = cast(ModuleCoordinator, FakeCoordinator())
     return provider
 
