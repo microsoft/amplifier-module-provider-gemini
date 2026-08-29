@@ -1910,16 +1910,32 @@ class GeminiProvider:
                             )
                 else:
                     # Regular text (including final answer with thought_signature)
-                    # Capture any thought_signature as an extra field (bytes) so the
-                    # outbound path can echo it back to the API.
-                    _text_sig = getattr(part, "thought_signature", None)
+                    # Capture any thought_signature as an extra field so the
+                    # outbound path can echo it back to the API. Encode to
+                    # base64 str at capture time (matching ThinkingBlock's
+                    # existing behavior below) rather than storing raw SDK
+                    # bytes: this module is stateless full-resend, so the
+                    # captured Message list is exactly what later gets
+                    # replayed -- and, in practice, also exactly what gets
+                    # JSON-serialized by session persistence, event logging,
+                    # or any orchestrator that calls model_dump(mode="json").
+                    # Raw bytes containing non-UTF-8 sequences (the normal
+                    # case for an opaque cryptographic signature) make that
+                    # serialization crash outright -- verified directly
+                    # against amplifier_core's own TextBlock/ToolCallBlock:
+                    # model_dump(mode="json") raises UnicodeDecodeError for
+                    # a signature like bytes([0xff, 0xfe, ...]). Encoding to
+                    # base64 ASCII here makes the value JSON-safe everywhere
+                    # it travels, matching ThinkingBlock's contract (its
+                    # signature field is typed str | None for this reason).
+                    _text_sig = _encode_sig(getattr(part, "thought_signature", None))
                     _text_kwargs: dict = (
                         {"signature": _text_sig} if _text_sig is not None else {}
                     )
                     content_blocks.append(TextBlock(text=part.text, **_text_kwargs))
                     if _text_sig is not None:
                         logger.debug(
-                            "[PROVIDER] Gemini: captured thought_signature on text part (%d bytes)",
+                            "[PROVIDER] Gemini: captured thought_signature on text part (%d chars, base64)",
                             len(_text_sig),
                         )
                     text_accumulator.append(part.text)
@@ -1929,15 +1945,18 @@ class GeminiProvider:
                 fc = part.function_call
                 tool_call_id = self._generate_tool_call_id()
 
-                # Capture thought_signature if present (Gemini 2.5+ thinking models).
-                # Store as raw bytes in an extra field so the outbound path can echo
-                # it back without an additional encode/decode round-trip.
-                _fc_sig = getattr(part, "thought_signature", None)
+                # Capture thought_signature if present (Gemini 2.5+ thinking
+                # models). Encoded to base64 str at capture time for the same
+                # JSON-safety reason as the text-part signature above --
+                # verified directly that a raw-bytes ToolCallBlock/ToolCall
+                # signature fails model_dump(mode="json") for non-UTF-8 byte
+                # sequences (the normal case for an opaque signature).
+                _fc_sig = _encode_sig(getattr(part, "thought_signature", None))
                 _fc_kwargs: dict = {"signature": _fc_sig} if _fc_sig is not None else {}
                 if _fc_sig is not None:
                     logger.debug(
                         "[PROVIDER] Gemini: captured thought_signature on function_call "
-                        "part '%s' (%d bytes)",
+                        "part '%s' (%d chars, base64)",
                         fc.name,
                         len(_fc_sig),
                     )
