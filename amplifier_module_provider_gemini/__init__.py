@@ -71,6 +71,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Teardown hard bound (see GeminiProvider.close)
+# ---------------------------------------------------------------------------
+# `google.genai.Client` holds TWO independent httpx transports, both built
+# eagerly in `Client(...)` (verified against google-genai 1.56.0 -- this
+# module's dependency floor -- and 2.22.0):
+#
+#   - a SYNC one, closed by the SYNCHRONOUS `Client.close()`
+#     (`self._api_client.close()` -> `httpx.Client.close()`), and
+#   - an ASYNC one, closed by `await Client.aio.aclose()`
+#     (`self._api_client.aclose()` -> `httpx.AsyncClient.aclose()` plus any
+#     aiohttp sessions).
+#
+# Neither has a deadline of its own, and `httpx.AsyncClient.aclose()` on a
+# half-closed (CLOSE-WAIT) connection can block indefinitely. Session cleanup
+# runs BEFORE a CLI command returns its result, so an unbounded close turns a
+# finished run into a silent hang -- the failure mode measured on the sibling
+# providers (recipes-8sr: 28 minutes). Overridable per instance via the
+# `close_timeout` config key, matching anthropic/openai/vllm/azure-openai/
+# chat-completions/github-copilot.
+_DEFAULT_CLOSE_TIMEOUT: float = 5.0
+
+
+def _retrieve_task_exception(task: "asyncio.Future[Any]") -> None:
+    """Consume an abandoned close task's exception.
+
+    Without this, a close task we stopped awaiting that later fails makes
+    asyncio log "Task exception was never retrieved" at GC time -- noise
+    that reads like a new defect. Cancelled tasks have nothing to retrieve.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
+# ---------------------------------------------------------------------------
 # Process-wide concurrency semaphore
 # Shared across ALL GeminiProvider instances in this process (including
 # parent + delegated child sessions). Prevents simultaneous-delegation
@@ -255,10 +289,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         _report_session_cost,
     )
 
-    # Return cleanup function
+    # Return cleanup function that delegates to provider.close().
+    # close() handles the lazy-client guard, the shield, CancelledError, and
+    # the hard `close_timeout` bound -- this cleanup runs inside the finally
+    # that precedes a CLI command's return, so it must never block forever.
     async def cleanup():
-        # genai.Client doesn't require explicit cleanup
-        pass
+        await provider.close()
 
     return cleanup
 
@@ -556,6 +592,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_tokens",  # deprecated alias for max_output_tokens
         "temperature",
         "timeout",
+        "close_timeout",
         "priority",
         "raw",
         "use_streaming",
@@ -736,6 +773,13 @@ class GeminiProvider:
         )
         self.timeout = _parse_config_number(
             "timeout", self.config.get("timeout"), 600.0, float
+        )
+        # Hard bound on session-teardown client close -- see close().
+        self._close_timeout = _parse_config_number(
+            "close_timeout",
+            self.config.get("close_timeout"),
+            _DEFAULT_CLOSE_TIMEOUT,
+            float,
         )
         self.priority = _parse_config_number(
             "priority", self.config.get("priority"), 100, int
@@ -2703,6 +2747,137 @@ class GeminiProvider:
 
         return gemini_tools
 
+    async def _close_client(self, client: Any) -> None:
+        """Close both of a genai client's transports, off the event loop.
+
+        `google.genai.Client` builds TWO httpx transports eagerly in its
+        constructor and exposes a separate close for each:
+
+          - ``await client.aio.aclose()`` -- the ASYNC transport. This is the
+            one that actually carries this provider's traffic: every API call
+            here goes through ``self.client.aio.*`` (generate_content,
+            generate_content_stream, models.list). Closing only the sync
+            surface would leave the real sockets to the garbage collector.
+          - ``client.close()`` -- the SYNC transport (plus any authorized
+            session). Synchronous, so it is offloaded with
+            ``asyncio.to_thread``: calling it inline would block the event
+            loop for the duration of the transport shutdown, trading a leak
+            for a stall. It is still worth closing -- the sync httpx client
+            is constructed eagerly whether or not this provider ever uses it.
+
+        The two run CONCURRENTLY so a wedged async transport cannot starve
+        the sync close (and vice versa) inside the single shared bound the
+        caller applies. Exceptions are collected rather than raised: a close
+        that fails is logged, never propagated into session teardown.
+
+        Both closes are feature-detected. Every supported google-genai
+        release (>=1.56.0, this module's floor) has both, but an SDK that
+        dropped or renamed one must degrade to "close what exists" rather
+        than raise AttributeError out of cleanup.
+        """
+        coros = []
+        labels = []
+
+        aio = getattr(client, "aio", None)
+        aclose = getattr(aio, "aclose", None)
+        if callable(aclose):
+            coros.append(aclose())
+            labels.append("async transport (client.aio.aclose)")
+
+        sync_close = getattr(client, "close", None)
+        if callable(sync_close):
+            coros.append(asyncio.to_thread(sync_close))
+            labels.append("sync transport (client.close)")
+
+        if not coros:
+            logger.warning(
+                "[PROVIDER] Gemini: client object %s exposes neither "
+                "aio.aclose() nor close() -- nothing to close, its transport "
+                "is left to garbage collection.",
+                type(client).__name__,
+            )
+            return
+
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for label, result in zip(labels, results):
+            if isinstance(result, asyncio.CancelledError):
+                # Abandonment path (timeout) or caller cancellation -- the
+                # caller already logs it; don't double-report.
+                continue
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "[PROVIDER] Gemini: closing the %s raised %s: %s -- "
+                    "continuing teardown.",
+                    label,
+                    type(result).__name__,
+                    result,
+                )
+
     async def close(self) -> None:
-        """Release the genai client reference."""
+        """Close the underlying genai client to prevent resource leaks.
+
+        Before this, close() only did ``self._client = None``: the client's
+        httpx transports were never closed, merely dereferenced, and their
+        sockets waited on garbage collection.
+
+        Resets ``self._client`` to ``None`` so the ``client`` property's
+        lazy-init contract still holds after close(): that property only
+        constructs a client when ``self._client is None``, so leaving a
+        closed client in place would make every subsequent call reuse a
+        closed transport and fail permanently. Clearing it lets the next use
+        lazily rebuild a fresh client, and makes close() idempotent. The slot
+        is cleared BEFORE anything is awaited, so a wedged client is never
+        handed back out even on the timeout path where we never learn whether
+        the close finished.
+
+        The close is HARD BOUNDED at ``close_timeout`` seconds (config key;
+        default 5.0). Neither `httpx.AsyncClient.aclose()` nor
+        `httpx.Client.close()` has a deadline of its own: on a half-closed
+        (CLOSE-WAIT) connection either can block indefinitely. Session
+        cleanup runs inside the ``finally`` that PRECEDES a CLI command's
+        return, so an unbounded close here does not merely leak a socket --
+        it swallows the result of a completed run (recipes-8sr on the sibling
+        anthropic provider: 28 minutes, process asleep in the await). On
+        timeout the transports are abandoned with a WARNING naming the
+        instance; the sockets are reclaimed at process exit.
+
+        Never raises, and never blocks the event loop: the SDK's synchronous
+        `Client.close()` runs in a worker thread (`asyncio.to_thread`).
+        """
+        client = self._client
+        if client is None:
+            # Client was never built (lazy init) -- nothing to close.
+            return
+        # Hand off and clear the slot FIRST: the lazy-init contract and
+        # idempotency must hold even on the timeout path.
         self._client = None
+        close_task = asyncio.ensure_future(self._close_client(client))
+        close_task.add_done_callback(_retrieve_task_exception)
+        try:
+            # shield: cancelling our CALLER does not cancel a close already
+            # in flight. wait_for: bounds it. Shield's outer future is a
+            # plain Future, so cancelling it completes immediately -- this
+            # returns within the timeout even though a wedged transport
+            # ignores deadlines and cancellation alike.
+            await asyncio.wait_for(
+                asyncio.shield(close_task), timeout=self._close_timeout
+            )
+        except asyncio.CancelledError:
+            # Caller cancelled: leave the shielded close running.
+            pass
+        except TimeoutError:
+            # Request cancellation and walk away. Deliberately NOT awaited:
+            # awaiting a close that ignores cancellation (a to_thread worker
+            # cannot be interrupted at all) would reintroduce the unbounded
+            # wait this bound exists to prevent.
+            close_task.cancel()
+            logger.warning(
+                "[PROVIDER] Gemini client close exceeded %.1fs "
+                "(half-closed/CLOSE-WAIT connection?) -- abandoning the genai "
+                "client for provider instance %s id=0x%x. The sockets are "
+                "reclaimed at process exit. Raise the `close_timeout` config "
+                "key if this is a false alarm.",
+                self._close_timeout,
+                self.name,
+                id(self),
+            )
