@@ -12,6 +12,8 @@ Verifies that:
 """
 
 import base64
+import copy
+import json
 from types import SimpleNamespace
 from typing import cast
 
@@ -61,6 +63,37 @@ def _make_response(parts):
     content = SimpleNamespace(parts=parts)
     candidate = SimpleNamespace(content=content)
     return SimpleNamespace(candidates=[candidate], usage_metadata=_make_usage())
+
+
+def _legacy_loop_message(provider: GeminiProvider, parts: list) -> dict:
+    """Capture a response through the legacy loop's lossy tool-call shape."""
+    chat_response = provider._convert_to_chat_response(_make_response(parts))
+    assistant_message = {
+        "role": "assistant",
+        "content": [
+            block.model_dump() if hasattr(block, "model_dump") else block
+            for block in chat_response.content
+        ],
+        "tool_calls": [
+            {
+                "id": tool_call.id,
+                "tool": tool_call.name,
+                "arguments": tool_call.arguments,
+            }
+            for tool_call in chat_response.tool_calls
+        ],
+    }
+    return json.loads(json.dumps(assistant_message))
+
+
+def _function_call_parts(gemini_contents: list[dict]) -> list[dict]:
+    """Return all emitted Gemini function-call parts in message order."""
+    return [
+        part
+        for content in gemini_contents
+        for part in content["parts"]
+        if "function_call" in part
+    ]
 
 
 # ============================================================
@@ -380,6 +413,251 @@ def test_round_trip_multiple_parallel_calls_only_first_has_signature():
     assert "thought_signature" not in parts_out[2], (
         f"Third function_call should NOT have thought_signature, got: {parts_out[2]}"
     )
+
+
+def test_legacy_loop_json_history_recovers_tool_call_signature_once():
+    """A legacy loop's unsigned tool_calls recover matching block signatures."""
+    raw_signature = bytes([0xFF, 0xFE, 0x80, 0x81, 0x00, 0x9D])
+    expected_signature = base64.b64encode(raw_signature).decode("ascii")
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=raw_signature,
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    original_message = copy.deepcopy(legacy_message)
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert legacy_message == original_message
+    assert len(function_parts) == 1
+    assert function_parts[0]["thought_signature"] == expected_signature
+    assert base64.b64decode(function_parts[0]["thought_signature"]) == raw_signature
+
+
+def test_legacy_signature_recovery_accepts_explicit_none():
+    """An explicitly None legacy signature has the same recovery path as absent."""
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["tool_calls"][0]["signature"] = None
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 1
+    assert function_parts[0]["thought_signature"] == base64.b64encode(b"signed").decode(
+        "ascii"
+    )
+
+
+def test_legacy_signature_recovery_does_not_change_empty_signatures():
+    """An explicit empty signature remains unsigned instead of being recovered."""
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["tool_calls"][0]["signature"] = ""
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 1
+    assert "thought_signature" not in function_parts[0]
+
+
+def test_legacy_signature_recovery_preserves_canonical_tool_call_signature():
+    """An existing tool_calls signature wins over the matching content block."""
+    content_signature = b"content-signature"
+    canonical_signature = b"canonical-signature"
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=content_signature,
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["tool_calls"][0]["signature"] = base64.b64encode(
+        canonical_signature
+    ).decode("ascii")
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 1
+    assert function_parts[0]["thought_signature"] == base64.b64encode(
+        canonical_signature
+    ).decode("ascii")
+
+
+def test_legacy_signature_recovery_requires_nonempty_matching_call_id():
+    """A content block cannot recover a signature for an empty legacy ID."""
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["tool_calls"][0]["id"] = ""
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 1
+    assert "thought_signature" not in function_parts[0]
+
+
+def test_legacy_signature_recovery_requires_a_matching_content_block():
+    """A non-matching ID cannot borrow a signature from another block."""
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["tool_calls"][0]["id"] = "unmatched-call-id"
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 1
+    assert "thought_signature" not in function_parts[0]
+
+
+def test_legacy_signature_recovery_rejects_mismatched_duplicate_call():
+    """A duplicate ID with different call data cannot steal another signature."""
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["tool_calls"].append(
+        {
+            "id": legacy_message["tool_calls"][0]["id"],
+            "tool": "grep",
+            "arguments": {"pattern": "persist"},
+        }
+    )
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 2
+    assert "thought_signature" in function_parts[0]
+    assert "thought_signature" not in function_parts[1]
+
+
+def test_legacy_signature_recovery_rejects_ambiguous_content_blocks():
+    """Duplicate matching content blocks cannot establish one original signature."""
+    part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [part])
+    legacy_message["content"].append(dict(legacy_message["content"][0]))
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 1
+    assert "thought_signature" not in function_parts[0]
+
+
+def test_legacy_parallel_calls_recover_only_the_signed_sibling():
+    """Unsigned parallel siblings do not receive the first call's signature."""
+    signed_part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+    unsigned_part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="grep", args={"pattern": "persist"}),
+    )
+
+    provider = _make_provider()
+    legacy_message = _legacy_loop_message(provider, [signed_part, unsigned_part])
+
+    _, gemini_contents = provider._convert_messages([legacy_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 2
+    assert "thought_signature" in function_parts[0]
+    assert "thought_signature" not in function_parts[1]
+
+
+def test_legacy_sequential_calls_do_not_recover_across_assistant_messages():
+    """A same-ID unsigned later call cannot recover an earlier message's signature."""
+    signed_part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+        thought_signature=b"signed",
+    )
+    unsigned_part = SimpleNamespace(
+        thought=False,
+        function_call=SimpleNamespace(name="todo", args={"content": "persist"}),
+    )
+
+    provider = _make_provider()
+    first_message = _legacy_loop_message(provider, [signed_part])
+    second_message = _legacy_loop_message(provider, [unsigned_part])
+    for message in (first_message, second_message):
+        message["content"][0]["id"] = "same-call-id"
+        message["tool_calls"][0]["id"] = "same-call-id"
+
+    _, gemini_contents = provider._convert_messages([first_message, second_message])
+
+    function_parts = _function_call_parts(gemini_contents)
+    assert len(function_parts) == 2
+    assert "thought_signature" in function_parts[0]
+    assert "thought_signature" not in function_parts[1]
+
+
+def test_tool_call_content_alone_does_not_reconstruct_a_function_call():
+    """Content remains provenance-only; tool_calls still control emitted calls."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_call",
+                    "id": "call-1",
+                    "name": "todo",
+                    "input": {"content": "persist"},
+                    "signature": base64.b64encode(b"signed").decode("ascii"),
+                }
+            ],
+            "tool_calls": [],
+        }
+    ]
+
+    provider = _make_provider()
+    _, gemini_contents = provider._convert_messages(messages)
+
+    assert _function_call_parts(gemini_contents) == []
 
 
 # ============================================================

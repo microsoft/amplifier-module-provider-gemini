@@ -2514,6 +2514,7 @@ class GeminiProvider:
             if role == "assistant":
                 gemini_role = "model"
                 parts = []
+                content_tool_call_blocks: list[dict[str, Any]] = []
 
                 # Add text content if present
                 if content:
@@ -2553,8 +2554,9 @@ class GeminiProvider:
                                 isinstance(block, dict)
                                 and block.get("type") == "tool_call"
                             ):
-                                # Tool calls handled separately below
-                                pass
+                                # Older histories retained signatures here while
+                                # tool_calls kept only id, tool, and arguments.
+                                content_tool_call_blocks.append(block)
                     else:
                         # Content is a simple string
                         parts.append({"text": content})
@@ -2571,10 +2573,26 @@ class GeminiProvider:
                                 "args": tc.get("arguments", {}),
                             }
                         }
+                        _tc_sig = tc.get("signature")
+                        if _tc_sig is None:
+                            tool_call_id = tc.get("id")
+                            if tool_call_id:
+                                matching_content_calls = [
+                                    block
+                                    for block in content_tool_call_blocks
+                                    if (
+                                        block.get("id") == tool_call_id
+                                        and block.get("name") == tool_name
+                                        and block.get("input")
+                                        == tc.get("arguments", {})
+                                    )
+                                ]
+                                if len(matching_content_calls) == 1:
+                                    _tc_sig = matching_content_calls[0].get("signature")
                         # Echo thought_signature if present (Gemini 2.5+ thinking models).
                         # Omitting it causes HTTP 400 "Function call is missing a
                         # thought_signature in functionCall parts".
-                        if _tc_sig := tc.get("signature"):
+                        if _tc_sig:
                             fc_part["thought_signature"] = _encode_sig(_tc_sig)
                             logger.debug(
                                 "[PROVIDER] Gemini: echoing thought_signature on "
