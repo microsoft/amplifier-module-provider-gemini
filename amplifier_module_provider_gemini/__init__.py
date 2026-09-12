@@ -606,6 +606,70 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _merge_thinking_config(existing: Any, override: Any):
+    """Compose an explicitly configured ThinkingConfig onto an existing one.
+
+    Pydantic assignment validation is disabled on GenerateContentConfig, so a
+    direct assignment of a mapping leaves a raw dict in ``thinking_config``.
+    Normalize both values and rebuild the SDK type instead. Only fields the
+    caller supplied participate in the merge: an empty mapping or
+    ThinkingConfig does not replace computed defaults.
+    """
+    from google import genai
+
+    thinking_config_type = genai.types.ThinkingConfig
+    if isinstance(override, thinking_config_type):
+        supplied = override
+    elif isinstance(override, dict):
+        supplied = thinking_config_type(**override)
+    else:
+        raise ValueError(
+            "extra_request_params.thinking_config must be a mapping, "
+            "ThinkingConfig, or null"
+        )
+
+    supplied_values = supplied.model_dump(exclude_unset=True)
+    has_budget = supplied_values.get("thinking_budget") is not None
+    has_level = supplied_values.get("thinking_level") is not None
+    if has_budget and has_level:
+        raise ValueError(
+            "extra_request_params.thinking_config cannot set both "
+            "thinking_budget and thinking_level"
+        )
+
+    if existing is None:
+        base = thinking_config_type()
+    elif isinstance(existing, thinking_config_type):
+        base = existing
+    elif isinstance(existing, dict):
+        base = thinking_config_type(**existing)
+    else:
+        base = thinking_config_type.model_validate(existing)
+
+    existing_values = base.model_dump(exclude_unset=True)
+    merged_values = existing_values.copy()
+    merged_values.update(supplied_values)
+    if has_budget and "thinking_level" in merged_values:
+        merged_values["thinking_level"] = None
+    elif has_level and "thinking_budget" in merged_values:
+        merged_values["thinking_budget"] = None
+
+    overwritten = [
+        field
+        for field, value in merged_values.items()
+        if existing_values.get(field) is not None and existing_values[field] != value
+    ]
+    if overwritten:
+        logger.warning(
+            "[PROVIDER] Gemini: extra_request_params overrides thinking_config "
+            "field%s %s -- extra_request_params always wins.",
+            "s" if len(overwritten) > 1 else "",
+            ", ".join(overwritten),
+        )
+
+    return thinking_config_type(**merged_values)
+
+
 def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) -> None:
     """Merge extra_request_params into a GenerateContentConfig, in place.
 
@@ -620,6 +684,12 @@ def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) ->
     config always wins, and wins LOUDLY: overriding a value this provider
     itself had already set logs a warning naming the field, the old value,
     and the new one, so a confusing production override is never silent.
+
+    ``thinking_config`` is the one field-level exception. Mappings and SDK
+    ThinkingConfig instances compose only their explicitly supplied fields
+    onto the provider's computed typed config. This keeps independent defaults
+    (such as include_thoughts) and ensures the SDK serializes a typed nested
+    value rather than a raw mapping.
 
     An extra_request_params key that isn't a real GenerateContentConfig
     field logs a warning and is skipped -- never raises, since a typo in
@@ -637,6 +707,13 @@ def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) ->
                 key,
             )
             continue
+        if key == "thinking_config" and value is not None:
+            # Validate and compose before changing config so a conflicting
+            # budget/level pair cannot leave a partially changed request.
+            config.thinking_config = _merge_thinking_config(
+                getattr(config, key, None), value
+            )
+            continue
         existing = getattr(config, key, None)
         if existing is not None:
             logger.warning(
@@ -648,6 +725,7 @@ def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) ->
                 value,
             )
         setattr(config, key, value)
+
 
 # Keys that appeared in past README revisions describing features that were
 # never actually implemented in this module (verified by grep: no
