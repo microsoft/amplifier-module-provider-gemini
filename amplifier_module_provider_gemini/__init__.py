@@ -654,6 +654,7 @@ def _merge_thinking_config(existing: Any, override: Any):
     elif has_level and "thinking_budget" in merged_values:
         merged_values["thinking_budget"] = None
 
+    merged = thinking_config_type(**merged_values)
     overwritten = [
         field
         for field, value in merged_values.items()
@@ -667,7 +668,7 @@ def _merge_thinking_config(existing: Any, override: Any):
             ", ".join(overwritten),
         )
 
-    return thinking_config_type(**merged_values)
+    return merged
 
 
 def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) -> None:
@@ -698,6 +699,17 @@ def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) ->
     if not extra_request_params:
         return
     valid_fields = type(config).model_fields
+    # Reject an invalid nested override before applying any of the other
+    # extras, regardless of their insertion order.
+    merged_thinking_config = None
+    if (
+        "thinking_config" in valid_fields
+        and extra_request_params.get("thinking_config") is not None
+    ):
+        merged_thinking_config = _merge_thinking_config(
+            getattr(config, "thinking_config", None),
+            extra_request_params["thinking_config"],
+        )
     for key, value in extra_request_params.items():
         if key not in valid_fields:
             logger.warning(
@@ -708,11 +720,7 @@ def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) ->
             )
             continue
         if key == "thinking_config" and value is not None:
-            # Validate and compose before changing config so a conflicting
-            # budget/level pair cannot leave a partially changed request.
-            config.thinking_config = _merge_thinking_config(
-                getattr(config, key, None), value
-            )
+            config.thinking_config = merged_thinking_config
             continue
         existing = getattr(config, key, None)
         if existing is not None:
