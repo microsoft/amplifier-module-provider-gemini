@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -30,6 +31,7 @@ def _descriptor(
     *,
     key: str,
     binding: str = "live",
+    authority: str | None = "authoritative",
 ) -> dict[str, Any]:
     descriptor: dict[str, Any] = {
         "version": 1,
@@ -38,6 +40,8 @@ def _descriptor(
         "binding": binding,
         "placement": placement,
     }
+    if authority is not None:
+        descriptor["authority"] = authority
     if binding == "fixed":
         if placement == "head":
             target = {"kind": "conversation_head", "session_id": "session"}
@@ -67,12 +71,15 @@ def _instruction(
     *,
     key: str,
     binding: str = "live",
+    authority: str | None = "authoritative",
 ) -> Message:
     return Message(
         role="system",
         content=content,
         metadata={
-            "amplifier:instruction": _descriptor(placement, key=key, binding=binding)
+            "amplifier:instruction": _descriptor(
+                placement, key=key, binding=binding, authority=authority
+            )
         },
     )
 
@@ -86,6 +93,7 @@ def _carrier(content: str, placement: str, binding: str) -> str:
 
 def test_layout_version_requires_a_gemini_selected_model() -> None:
     assert _provider().instruction_layout_version == 1
+    assert _provider().instruction_layout_authority_v1 is True
     assert _provider("other-provider-model").instruction_layout_version is None
     assert _provider("gemini-").instruction_layout_version is None
     assert (
@@ -108,6 +116,88 @@ def test_legacy_unmarked_system_messages_keep_existing_hoisting() -> None:
     assert contents == [{"role": "user", "parts": [{"text": "human"}]}]
 
 
+def test_authorityless_nonhead_descriptor_defaults_to_global_system_instruction() -> None:
+    provider = _provider()
+    system, contents = provider._convert_messages(
+        [
+            _instruction("head", "head", key="head").model_dump(),
+            _instruction(
+                "historical authoritative tail",
+                "tail",
+                key="historical-tail",
+                authority=None,
+            ).model_dump(),
+            _instruction(
+                "advisory tail", "tail", key="advisory-tail", authority="advisory"
+            ).model_dump(),
+            Message(role="user", content="human").model_dump(),
+        ]
+    )
+
+    assert system == "head\n\nhistorical authoritative tail"
+    assert contents == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": _carrier("advisory tail", "tail", "live")},
+                {"text": "human"},
+            ],
+        }
+    ]
+
+
+def test_authoritative_nonhead_records_never_use_user_carriers_and_warn_once_per_source(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _provider()
+    response = _sdk_response([SimpleNamespace(text="ok", thought=False)])
+    provider._client = MagicMock()
+    provider._client.aio.models.generate_content = AsyncMock(return_value=response)
+    first = _instruction("first authoritative", "before_human", key="first")
+    second = _instruction("second authoritative", "tail", key="second")
+    second.metadata["amplifier:instruction"]["source"] = "other-source"
+    duplicate_source = _instruction(
+        "same-source authoritative", "tail", key="third"
+    )
+    advisory = _instruction(
+        "advisory positioned", "before_human", key="advisory", authority="advisory"
+    )
+    request = ChatRequest(
+        messages=[
+            first,
+            Message(role="user", content="human one"),
+            second,
+            duplicate_source,
+            advisory,
+            Message(role="user", content="human two"),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="amplifier_module_provider_gemini"):
+        asyncio.run(provider.complete(request))
+
+    params = provider._client.aio.models.generate_content.call_args.kwargs
+    assert params["config"].system_instruction == (
+        "first authoritative\n\nsecond authoritative\n\nsame-source authoritative"
+    )
+    user_text = [
+        part["text"]
+        for content in params["contents"]
+        if content["role"] == "user"
+        for part in content["parts"]
+        if "text" in part
+    ]
+    assert all("authoritative" not in text for text in user_text)
+    assert _carrier("advisory positioned", "before_human", "live") in user_text
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "authority wins" in record.message
+    ]
+    assert len(warnings) == 2
+    assert all("implicit-cache placement tradeoff" in warning for warning in warnings)
+
+
 def test_v1_head_and_positioned_records_preserve_resolved_order() -> None:
     provider = _provider()
     canonical = [
@@ -115,7 +205,11 @@ def test_v1_head_and_positioned_records_preserve_resolved_order() -> None:
         _instruction("stable head", "head", key="stable"),
         _instruction("fixed head", "head", key="fixed-head", binding="fixed"),
         _instruction(
-            "fixed beside H1", "before_human", key="fixed-H1", binding="fixed"
+            "fixed beside H1",
+            "before_human",
+            key="fixed-H1",
+            binding="fixed",
+            authority="advisory",
         ),
         Message(role="user", content="H1"),
         Message(
@@ -138,8 +232,12 @@ def test_v1_head_and_positioned_records_preserve_resolved_order() -> None:
             tool_call_id="call-2",
             name="second",
         ),
-        _instruction("after tool batch", "tail", key="tail", binding="fixed"),
-        _instruction("live beside H2", "before_human", key="live-H2"),
+        _instruction(
+            "after tool batch", "tail", key="tail", binding="fixed", authority="advisory"
+        ),
+        _instruction(
+            "live beside H2", "before_human", key="live-H2", authority="advisory"
+        ),
         Message(role="user", content="H2"),
     ]
     original = copy.deepcopy([message.model_dump() for message in canonical])
@@ -173,12 +271,12 @@ def test_stable_head_is_not_duplicated_when_inline_content_changes() -> None:
     first = [
         _instruction("stable head", "head", key="head"),
         Message(role="user", content="human"),
-        _instruction("volatile one", "tail", key="tail"),
+        _instruction("volatile one", "tail", key="tail", authority="advisory"),
     ]
     second = [
         _instruction("stable head", "head", key="head"),
         Message(role="user", content="human"),
-        _instruction("volatile two", "tail", key="tail"),
+        _instruction("volatile two", "tail", key="tail", authority="advisory"),
     ]
 
     first_system, first_contents = provider._convert_messages(
@@ -233,6 +331,23 @@ def test_invalid_marked_metadata_fails_before_sdk_dispatch(
     original = request.model_dump()
 
     with pytest.raises(error_type, match="instruction"):
+        asyncio.run(provider.complete(request))
+
+    provider._client.aio.models.generate_content.assert_not_awaited()
+    assert request.model_dump() == original
+
+
+@pytest.mark.parametrize("authority", [True, "", "untrusted"])
+def test_invalid_instruction_authority_fails_before_sdk_dispatch(authority: Any) -> None:
+    provider = _provider()
+    provider._client = MagicMock()
+    provider._client.aio.models.generate_content = AsyncMock()
+    request = ChatRequest(
+        messages=[_instruction("cannot lower", "head", key="bad", authority=authority)]
+    )
+    original = request.model_dump()
+
+    with pytest.raises(ValueError, match="invalid v1 fields"):
         asyncio.run(provider.complete(request))
 
     provider._client.aio.models.generate_content.assert_not_awaited()
@@ -318,6 +433,90 @@ def test_v1_tool_validation_recognizes_calls_in_content_blocks() -> None:
                 }
             ],
         },
+    ]
+
+
+@pytest.mark.parametrize(
+    "assistant",
+    [
+        Message(
+            role="assistant",
+            content=[ToolCallBlock(id="from-block", name="block-tool", input={})],
+        ),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {"id": "from-top-level", "tool": "top-level-tool", "arguments": {}}
+            ],
+        ),
+    ],
+)
+def test_v1_unnamed_tool_result_uses_its_preceding_call_id(
+    assistant: Message,
+) -> None:
+    provider = _provider()
+    call_id = (
+        "from-block"
+        if isinstance(assistant.content, list)
+        else "from-top-level"
+    )
+    expected_name = (
+        "block-tool"
+        if isinstance(assistant.content, list)
+        else "top-level-tool"
+    )
+    messages = [
+        _instruction("head", "head", key="head"),
+        assistant,
+        Message(role="tool", content="result", tool_call_id=call_id),
+    ]
+
+    provider._validate_v1_tool_sequence(messages)
+    _, contents = provider._convert_messages(
+        [message.model_dump() for message in messages]
+    )
+
+    assert contents[-1]["parts"] == [
+        {
+            "function_response": {
+                "name": expected_name,
+                "response": {"result": "result"},
+            }
+        }
+    ]
+
+
+def test_v1_parallel_unnamed_results_resolve_by_id_in_reversed_order() -> None:
+    provider = _provider()
+    messages = [
+        _instruction("head", "head", key="head"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {"id": "first", "name": "first-tool", "arguments": {}},
+                {"id": "second", "tool": "second-tool", "arguments": {}},
+            ],
+        ),
+        Message(role="tool", content="second result", tool_call_id="second"),
+        Message(role="tool", content="first result", tool_call_id="first"),
+    ]
+
+    provider._validate_v1_tool_sequence(messages)
+    _, contents = provider._convert_messages(
+        [message.model_dump() for message in messages]
+    )
+
+    responses = [
+        part["function_response"]
+        for content in contents
+        for part in content["parts"]
+        if "function_response" in part
+    ]
+    assert responses == [
+        {"name": "second-tool", "response": {"result": "second result"}},
+        {"name": "first-tool", "response": {"result": "first result"}},
     ]
 
 
@@ -470,6 +669,7 @@ async def test_v1_hybrid_response_replays_once_with_signature_and_fixed_instruct
                 "tail",
                 key="fixed",
                 binding="fixed",
+                authority="advisory",
             ),
             Message(role="user", content="next"),
         ]
@@ -586,7 +786,7 @@ def test_mocked_sdk_receives_head_as_system_and_inline_as_contents() -> None:
     request = ChatRequest(
         messages=[
             _instruction("head", "head", key="head"),
-            _instruction("inline", "before_human", key="inline"),
+            _instruction("inline", "before_human", key="inline", authority="advisory"),
             Message(role="user", content="human"),
         ]
     )
@@ -628,7 +828,7 @@ async def test_streaming_v1_dispatch_does_not_mutate_canonical_messages() -> Non
     request = ChatRequest(
         messages=[
             _instruction("head", "head", key="head"),
-            _instruction("inline", "before_human", key="inline"),
+            _instruction("inline", "before_human", key="inline", authority="advisory"),
             Message(role="user", content="human"),
         ]
     )

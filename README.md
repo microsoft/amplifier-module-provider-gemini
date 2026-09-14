@@ -112,6 +112,15 @@ Response metadata is JSON-safe for host checkpoint persistence on both streaming
 and non-streaming paths. `metadata.raw_response` is a detached mapping, not an
 SDK response object; binary thought signatures are encoded as base64.
 
+### Instruction-layout authority
+
+The provider advertises instruction-layout v1 with authority support. Resolved
+records default to `authoritative` when historical metadata omits `authority`.
+Gemini has no positioned native system surface, so authoritative non-head
+records move to global `system_instruction` and warn once per source/request:
+authority deliberately wins temporal and implicit-cache placement. Advisory
+positioned records remain attributed user carriers.
+
 ## Supported Models
 
 **Current support**: Text generation, tool calling, and thinking. Multimodal capabilities (images, video, audio) are not yet implemented.

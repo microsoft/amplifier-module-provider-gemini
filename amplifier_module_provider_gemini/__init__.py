@@ -824,6 +824,7 @@ class GeminiProvider:
     """Google Gemini API integration."""
 
     name = "gemini"
+    instruction_layout_authority_v1 = True
 
     @property
     def instruction_layout_version(self) -> int | None:
@@ -860,6 +861,7 @@ class GeminiProvider:
         base_fields = {"version", "source", "key", "binding", "placement"}
         binding = descriptor.get("binding")
         placement = descriptor.get("placement")
+        authority = descriptor.get("authority", "authoritative")
         if (
             type(descriptor.get("version")) is not int
             or descriptor["version"] != 1
@@ -869,11 +871,16 @@ class GeminiProvider:
             or not descriptor["key"]
             or binding not in {"live", "fixed"}
             or placement not in {"head", "before_human", "tail"}
+            or authority not in {"authoritative", "advisory"}
         ):
             raise ValueError("amplifier:instruction descriptor has invalid v1 fields")
 
         if binding == "live":
-            allowed = base_fields | ({"target"} if "target" in descriptor else set())
+            allowed = (
+                base_fields
+                | ({"authority"} if "authority" in descriptor else set())
+                | ({"target"} if "target" in descriptor else set())
+            )
             if set(descriptor) != allowed:
                 raise ValueError(
                     "live amplifier:instruction descriptor has an unknown field"
@@ -893,6 +900,8 @@ class GeminiProvider:
             "order",
             "disposition",
         }
+        if "authority" in descriptor:
+            expected.add("authority")
         if descriptor.get("deferred_origin") is True:
             expected.add("deferred_origin")
         if descriptor.get("disposition") == "retired":
@@ -958,6 +967,33 @@ class GeminiProvider:
                 "fixed amplifier:instruction target does not match its placement"
             )
         return descriptor
+
+    @staticmethod
+    def _instruction_authority(descriptor: dict[str, Any]) -> str:
+        """Return a descriptor's explicit authority or its historical default."""
+        return descriptor.get("authority", "authoritative")
+
+    def _warn_authoritative_instruction_fallbacks(
+        self, descriptors: list[dict[str, Any] | None]
+    ) -> None:
+        """Warn once per source when Gemini must trade placement for authority."""
+        warned_sources: set[str] = set()
+        for descriptor in descriptors:
+            if (
+                descriptor is None
+                or descriptor["placement"] == "head"
+                or self._instruction_authority(descriptor) != "authoritative"
+                or descriptor["source"] in warned_sources
+            ):
+                continue
+            warned_sources.add(descriptor["source"])
+            logger.warning(
+                "[PROVIDER] Gemini: authoritative instruction from source %r at %s "
+                "is lowered to global system_instruction; authority wins its "
+                "positioned placement and implicit-cache placement tradeoff.",
+                descriptor["source"],
+                descriptor["placement"],
+            )
 
     @staticmethod
     def _is_head_instruction_target(target: Any, session_id: str) -> bool:
@@ -1138,7 +1174,10 @@ class GeminiProvider:
                     raise ValueError(
                         "v1 instruction layout has an orphaned tool result"
                     )
-                if message.name != pending[message.tool_call_id]:
+                if (
+                    message.name is not None
+                    and message.name != pending[message.tool_call_id]
+                ):
                     raise ValueError(
                         "v1 instruction layout tool result does not match its call"
                     )
@@ -1915,9 +1954,10 @@ class GeminiProvider:
 
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
 
-        # A marked record was placed by context-simple already. Only the resolved
-        # head region can become Gemini's global system instruction; all other
-        # placements remain in chronological conversation order as native carriers.
+        # Gemini has no positioned native system carrier. Authoritative records
+        # therefore use its global system instruction even when that sacrifices
+        # their resolved temporal/cache placement; advisory positioned records
+        # retain the attributed user carrier below.
         instruction_descriptors = {
             id(message): self._validated_instruction_descriptor(message.model_dump())
             for message in request.messages
@@ -1925,13 +1965,19 @@ class GeminiProvider:
         has_instruction_layout = any(
             descriptor is not None for descriptor in instruction_descriptors.values()
         )
+        self._warn_authoritative_instruction_fallbacks(
+            list(instruction_descriptors.values())
+        )
         system_msgs: list[Message] = []
         developer_msgs: list[Message] = []
         conversation: list[dict[str, Any]] = []
         for message in request.messages:
             descriptor = instruction_descriptors[id(message)]
             if descriptor is not None:
-                if descriptor["placement"] == "head":
+                if (
+                    descriptor["placement"] == "head"
+                    or self._instruction_authority(descriptor) == "authoritative"
+                ):
                     system_msgs.append(message)
                 else:
                     conversation.append(message.model_dump())
@@ -3016,6 +3062,7 @@ class GeminiProvider:
         )
         system_messages = []
         gemini_contents = []
+        tool_names_by_id: dict[str, str] = {}
 
         for msg in messages:
             role = msg.get("role")
@@ -3023,7 +3070,11 @@ class GeminiProvider:
             descriptor = instruction_descriptors[id(msg)]
 
             if role == "system":
-                if descriptor is None or descriptor["placement"] == "head":
+                if (
+                    descriptor is None
+                    or descriptor["placement"] == "head"
+                    or self._instruction_authority(descriptor) == "authoritative"
+                ):
                     system_messages.append(content)
                 else:
                     gemini_contents.append(
@@ -3135,6 +3186,9 @@ class GeminiProvider:
                                 tool_name,
                             )
                         parts.append(fc_part)
+                        tool_call_id = tc.get("id")
+                        if tool_call_id:
+                            tool_names_by_id[tool_call_id] = tool_name
 
                 gemini_contents.append({"role": gemini_role, "parts": parts})
 
@@ -3154,22 +3208,9 @@ class GeminiProvider:
 
                 if not tool_name:
                     logger.debug(
-                        "Tool result missing name field, recovering from function_call history"
+                        "Tool result missing name field, recovering from its call ID"
                     )
-                    # Try to find the tool name from earlier function_call in conversation
-                    # Scan backwards to find matching function_call
-                    for prev_msg in reversed(gemini_contents):
-                        if prev_msg.get("role") == "model" and prev_msg.get("parts"):
-                            for part in prev_msg["parts"]:
-                                if "function_call" in part:
-                                    # Found the function call - use its name
-                                    tool_name = part["function_call"]["name"]
-                                    logger.info(
-                                        f"Recovered tool name '{tool_name}' from function_call history"
-                                    )
-                                    break
-                        if tool_name:
-                            break
+                    tool_name = tool_names_by_id.get(tool_call_id)
 
                     if not tool_name:
                         logger.error(
