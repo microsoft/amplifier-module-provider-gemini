@@ -108,6 +108,10 @@ Provides access to Google's Gemini models as an LLM provider for Amplifier with 
 **Mount Point:** `providers`
 **Entry Point:** `amplifier_module_provider_gemini:mount`
 
+Response metadata is JSON-safe for host checkpoint persistence on both streaming
+and non-streaming paths. `metadata.raw_response` is a detached mapping, not an
+SDK response object; binary thought signatures are encoded as base64.
+
 ## Supported Models
 
 **Current support**: Text generation, tool calling, and thinking. Multimodal capabilities (images, video, audio) are not yet implemented.

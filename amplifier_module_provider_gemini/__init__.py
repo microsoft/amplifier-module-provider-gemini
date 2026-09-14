@@ -20,8 +20,11 @@ import os
 import time
 import uuid
 from contextlib import suppress
+from types import SimpleNamespace
 from typing import Any
 from typing import TYPE_CHECKING
+
+from pydantic_core import to_jsonable_python
 
 from amplifier_core import ConfigField
 from amplifier_core import ModelInfo
@@ -69,6 +72,16 @@ if TYPE_CHECKING:
     from google import genai  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+_INSTRUCTION_METADATA = "amplifier:instruction"
+
+
+def _stream_response_fields(value: Any) -> dict[str, Any]:
+    """Serialize the namespace nodes used to aggregate streamed SDK parts."""
+    if isinstance(value, SimpleNamespace):
+        return vars(value)
+    raise TypeError(f"Unsupported response metadata type: {type(value).__name__}")
+
 
 # ---------------------------------------------------------------------------
 # Teardown hard bound (see GeminiProvider.close)
@@ -812,6 +825,364 @@ class GeminiProvider:
 
     name = "gemini"
 
+    @property
+    def instruction_layout_version(self) -> int | None:
+        """Advertise v1 lowering only for Gemini's native request path."""
+        return self._instruction_layout_version_for_model(self.default_model)
+
+    @staticmethod
+    def _instruction_layout_version_for_model(model: Any) -> int | None:
+        """Return the optional layout version supported by a selected model."""
+        if not isinstance(model, str):
+            return None
+        model_id = model.removeprefix("models/").lower()
+        # The route decision happens before a live model-list request. This is
+        # therefore a native-path eligibility gate, not an existence claim.
+        return 1 if model_id.startswith("gemini-") and model_id != "gemini-" else None
+
+    @classmethod
+    def _validated_instruction_descriptor(
+        cls, message: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Validate one resolved v1 instruction without changing its placement."""
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict) or _INSTRUCTION_METADATA not in metadata:
+            return None
+
+        descriptor = metadata[_INSTRUCTION_METADATA]
+        if not isinstance(descriptor, dict):
+            raise TypeError("amplifier:instruction descriptor must be a mapping")
+        if message.get("role") != "system" or not isinstance(
+            message.get("content"), str
+        ):
+            raise ValueError("v1 instruction must be a canonical system text message")
+
+        base_fields = {"version", "source", "key", "binding", "placement"}
+        binding = descriptor.get("binding")
+        placement = descriptor.get("placement")
+        if (
+            type(descriptor.get("version")) is not int
+            or descriptor["version"] != 1
+            or not isinstance(descriptor.get("source"), str)
+            or not descriptor["source"]
+            or not isinstance(descriptor.get("key"), str)
+            or not descriptor["key"]
+            or binding not in {"live", "fixed"}
+            or placement not in {"head", "before_human", "tail"}
+        ):
+            raise ValueError("amplifier:instruction descriptor has invalid v1 fields")
+
+        if binding == "live":
+            allowed = base_fields | ({"target"} if "target" in descriptor else set())
+            if set(descriptor) != allowed:
+                raise ValueError(
+                    "live amplifier:instruction descriptor has an unknown field"
+                )
+            target = descriptor.get("target")
+            if target is not None and (
+                placement != "tail" or not cls._is_tail_instruction_target(target)
+            ):
+                raise ValueError("live amplifier:instruction tail target is invalid")
+            return descriptor
+
+        expected = base_fields | {
+            "entry_id",
+            "event_key",
+            "session_id",
+            "target",
+            "order",
+            "disposition",
+        }
+        if descriptor.get("deferred_origin") is True:
+            expected.add("deferred_origin")
+        if descriptor.get("disposition") == "retired":
+            expected.add("retire_reason")
+        if set(descriptor) != expected:
+            raise ValueError(
+                "fixed amplifier:instruction descriptor has an unknown field"
+            )
+        if not all(
+            isinstance(descriptor.get(key), str) and descriptor[key]
+            for key in ("entry_id", "event_key", "session_id")
+        ):
+            raise ValueError(
+                "fixed amplifier:instruction descriptor has invalid identity"
+            )
+        if (
+            descriptor["event_key"] != descriptor["key"]
+            or descriptor["entry_id"]
+            != f"{descriptor['session_id']}:{descriptor['source']}:{descriptor['key']}"
+        ):
+            raise ValueError(
+                "fixed amplifier:instruction descriptor identity is invalid"
+            )
+        if type(descriptor.get("order")) is not int or descriptor["order"] <= 0:
+            raise ValueError(
+                "fixed amplifier:instruction descriptor requires positive order"
+            )
+        if descriptor.get("disposition") not in {
+            "pending",
+            "delivered",
+            "retired",
+            "anchor_pruned",
+        }:
+            raise ValueError(
+                "fixed amplifier:instruction descriptor has invalid disposition"
+            )
+        if descriptor["disposition"] in {"retired", "anchor_pruned"}:
+            raise ValueError("terminal fixed amplifier:instruction cannot be lowered")
+        if "deferred_origin" in descriptor and (
+            descriptor["deferred_origin"] is not True
+            or placement not in {"head", "before_human"}
+        ):
+            raise ValueError("fixed amplifier:instruction deferred origin is invalid")
+        if descriptor.get("disposition") == "retired" and (
+            not isinstance(descriptor.get("retire_reason"), str)
+            or not descriptor["retire_reason"]
+        ):
+            raise ValueError(
+                "retired fixed amplifier:instruction requires a non-empty reason"
+            )
+
+        target = descriptor["target"]
+        target_matches_placement = (
+            placement == "head"
+            and cls._is_head_instruction_target(target, descriptor["session_id"])
+            or placement == "before_human"
+            and cls._is_before_human_instruction_target(target)
+            or placement == "tail"
+            and cls._is_tail_instruction_target(target)
+        )
+        if not target_matches_placement:
+            raise ValueError(
+                "fixed amplifier:instruction target does not match its placement"
+            )
+        return descriptor
+
+    @staticmethod
+    def _is_head_instruction_target(target: Any, session_id: str) -> bool:
+        return (
+            isinstance(target, dict)
+            and set(target) == {"kind", "session_id"}
+            and target.get("kind") == "conversation_head"
+            and target.get("session_id") == session_id
+        )
+
+    @staticmethod
+    def _is_before_human_instruction_target(target: Any) -> bool:
+        if not isinstance(target, dict):
+            return False
+        expected = {"input_id", "message_id", "origin"}
+        if set(target) == expected | {"version"}:
+            if type(target.get("version")) is not int or target["version"] != 1:
+                return False
+            target = {key: target[key] for key in expected}
+        return (
+            set(target) == expected
+            and all(
+                isinstance(target.get(key), str) and target[key] for key in expected
+            )
+            and target["origin"] in {"human", "delegation"}
+        )
+
+    @staticmethod
+    def _is_tail_instruction_target(target: Any) -> bool:
+        return (
+            isinstance(target, dict)
+            and set(target) == {"after_message_id"}
+            and isinstance(target["after_message_id"], str)
+            and bool(target["after_message_id"])
+        )
+
+    @classmethod
+    def _has_instruction_layout(cls, messages: list[Message]) -> bool:
+        """Validate claimed records and report whether this is a v1 request."""
+        return any(
+            cls._validated_instruction_descriptor(message.model_dump()) is not None
+            for message in messages
+        )
+
+    @staticmethod
+    def _v1_tool_call_representation(
+        calls: Any, *, representation: str
+    ) -> list[dict[str, Any]]:
+        """Validate one canonical tool-call representation without changing it."""
+        if calls is None:
+            return []
+        if not isinstance(calls, list):
+            raise ValueError(
+                f"v1 instruction layout has malformed {representation} tool calls"
+            )
+
+        validated: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for call in calls:
+            if hasattr(call, "model_dump"):
+                call = call.model_dump()
+            if not isinstance(call, dict):
+                raise ValueError(
+                    f"v1 instruction layout has malformed {representation} tool call"
+                )
+            call_id = call.get("id")
+            name = call.get("name") or call.get("tool")
+            if "arguments" in call:
+                arguments = call["arguments"]
+            elif "input" in call:
+                arguments = call["input"]
+            else:
+                raise ValueError(
+                    "v1 instruction layout has a tool call without arguments"
+                )
+            if not isinstance(call_id, str) or not call_id:
+                raise ValueError("v1 instruction layout has a tool call without an ID")
+            if not isinstance(name, str) or not name:
+                raise ValueError("v1 instruction layout has a tool call without a name")
+            if not isinstance(arguments, dict):
+                raise ValueError(
+                    "v1 instruction layout has a tool call with malformed arguments"
+                )
+            if call_id in seen_ids:
+                raise ValueError("v1 instruction layout has duplicate tool-call IDs")
+            seen_ids.add(call_id)
+            validated.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "signature": call.get("signature"),
+                }
+            )
+        return validated
+
+    @classmethod
+    def _reconciled_v1_assistant_tool_calls(
+        cls, message: Message | dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Reconcile the matching canonical top-level and content call shapes.
+
+        Gemini response conversion intentionally produces both shapes: content
+        preserves native replay metadata such as thought signatures, while
+        ``tool_calls`` is the loop's canonical dispatch surface.  They represent
+        one call when their ID, name, and arguments agree.  Each source is
+        nevertheless validated independently, so duplicate IDs inside either
+        source and conflicting cross-source calls fail instead of being repaired.
+        """
+        if isinstance(message, dict):
+            top_level_calls = message.get("tool_calls")
+            content = message.get("content")
+        else:
+            top_level_calls = getattr(message, "tool_calls", None)
+            content = message.content
+
+        content_calls = (
+            [
+                block.model_dump() if hasattr(block, "model_dump") else block
+                for block in content
+                if (
+                    getattr(block, "type", None) == "tool_call"
+                    or isinstance(block, dict)
+                    and block.get("type") == "tool_call"
+                )
+            ]
+            if isinstance(content, list)
+            else []
+        )
+        top_level = cls._v1_tool_call_representation(
+            top_level_calls, representation="top-level"
+        )
+        blocks = cls._v1_tool_call_representation(
+            content_calls, representation="content"
+        )
+        blocks_by_id = {call["id"]: call for call in blocks}
+        reconciled = []
+        for call in top_level:
+            block = blocks_by_id.pop(call["id"], None)
+            if block is not None:
+                if (
+                    block["name"] != call["name"]
+                    or block["arguments"] != call["arguments"]
+                ):
+                    raise ValueError(
+                        "v1 instruction layout has conflicting tool-call representations"
+                    )
+                if call["signature"] is None:
+                    call = {**call, "signature": block["signature"]}
+            reconciled.append(call)
+        reconciled.extend(blocks_by_id.values())
+        return reconciled
+
+    @classmethod
+    def _v1_assistant_tool_calls(cls, message: Message) -> dict[str, str]:
+        """Return reconciled tool call ID/name pairs without repairing history."""
+        return {
+            call["id"]: call["name"]
+            for call in cls._reconciled_v1_assistant_tool_calls(message)
+        }
+
+    @classmethod
+    def _validate_v1_tool_sequence(cls, messages: list[Message]) -> None:
+        """Require a complete tool batch rather than mutating v1 history."""
+        pending: dict[str, str] = {}
+        for message in messages:
+            if message.role == "assistant":
+                if pending:
+                    raise ValueError(
+                        "v1 instruction layout has an incomplete tool-result batch"
+                    )
+                pending = cls._v1_assistant_tool_calls(message)
+            elif message.role == "tool":
+                if (
+                    not isinstance(message.tool_call_id, str)
+                    or message.tool_call_id not in pending
+                ):
+                    raise ValueError(
+                        "v1 instruction layout has an orphaned tool result"
+                    )
+                if message.name != pending[message.tool_call_id]:
+                    raise ValueError(
+                        "v1 instruction layout tool result does not match its call"
+                    )
+                pending.pop(message.tool_call_id)
+            elif pending:
+                raise ValueError(
+                    "v1 instruction layout splits a tool-call/tool-result batch"
+                )
+        if pending:
+            raise ValueError("v1 instruction layout has missing tool results")
+
+    @staticmethod
+    def _instruction_carrier(content: str, descriptor: dict[str, Any]) -> str:
+        """Render a positioned record as an attributed Gemini user carrier."""
+        attribution = json.dumps(
+            {
+                "source": descriptor["source"],
+                "placement": descriptor["placement"],
+                "binding": descriptor["binding"],
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return f"[Amplifier system instruction {attribution}]\n{content}"
+
+    @staticmethod
+    def _merge_adjacent_v1_user_contents(
+        contents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge neighboring user carriers without crossing a model boundary."""
+        merged: list[dict[str, Any]] = []
+        for content in contents:
+            if (
+                content.get("role") == "user"
+                and merged
+                and merged[-1].get("role") == "user"
+            ):
+                merged[-1]["parts"] = list(merged[-1].get("parts", [])) + list(
+                    content.get("parts", [])
+                )
+            else:
+                merged.append(content)
+        return merged
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -1318,6 +1689,26 @@ class GeminiProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
+        # Validate marked messages before the legacy repair path touches canonical
+        # history. V1 owns resolved placement and must never be repaired, compacted,
+        # or otherwise rewritten by a provider.
+        has_instruction_layout = self._has_instruction_layout(request.messages)
+        if has_instruction_layout:
+            model = (
+                kwargs["model"]
+                if "model" in kwargs
+                else request.model
+                if request.model is not None
+                else self.default_model
+            )
+            if self._instruction_layout_version_for_model(model) != 1:
+                raise ValueError(
+                    "Gemini model does not support amplifier instruction layout version 1"
+                )
+            self._validate_v1_tool_sequence(request.messages)
+            dispatch_kwargs = {**kwargs, "model": model}
+            return await self._complete_chat_request(request, **dispatch_kwargs)
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._find_missing_tool_results(request.messages)
 
@@ -1524,12 +1915,32 @@ class GeminiProvider:
 
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
 
-        # Separate messages by role
-        system_msgs = [m for m in request.messages if m.role == "system"]
-        developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [
-            m for m in request.messages if m.role in ("user", "assistant", "tool")
-        ]
+        # A marked record was placed by context-simple already. Only the resolved
+        # head region can become Gemini's global system instruction; all other
+        # placements remain in chronological conversation order as native carriers.
+        instruction_descriptors = {
+            id(message): self._validated_instruction_descriptor(message.model_dump())
+            for message in request.messages
+        }
+        has_instruction_layout = any(
+            descriptor is not None for descriptor in instruction_descriptors.values()
+        )
+        system_msgs: list[Message] = []
+        developer_msgs: list[Message] = []
+        conversation: list[dict[str, Any]] = []
+        for message in request.messages:
+            descriptor = instruction_descriptors[id(message)]
+            if descriptor is not None:
+                if descriptor["placement"] == "head":
+                    system_msgs.append(message)
+                else:
+                    conversation.append(message.model_dump())
+            elif message.role == "system":
+                system_msgs.append(message)
+            elif message.role == "developer":
+                developer_msgs.append(message)
+            elif message.role in ("user", "assistant", "tool"):
+                conversation.append(message.model_dump())
 
         # Combine system messages
         system_instruction = (
@@ -1550,12 +1961,12 @@ class GeminiProvider:
         # Convert conversation messages
         conversation_msgs = []
         if conversation:
-            _, conversation_msgs = self._convert_messages(
-                [m.model_dump() for m in conversation]
-            )
+            _, conversation_msgs = self._convert_messages(conversation)
 
         # Combine: context THEN conversation
         all_messages = context_user_msgs + conversation_msgs
+        if has_instruction_layout:
+            all_messages = self._merge_adjacent_v1_user_contents(all_messages)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
@@ -2425,7 +2836,17 @@ class GeminiProvider:
                 )
 
         # Build metadata with usage including thought tokens
-        metadata = {"raw_response": response}
+        # Metadata travels into host-owned JSON checkpoints, not just diagnostics.
+        # Normalize native SDK models and our streamed namespace aggregate here;
+        # opaque thought-signature bytes must remain losslessly base64 encoded.
+        metadata = {
+            "raw_response": to_jsonable_python(
+                response,
+                by_alias=False,
+                bytes_mode="base64",
+                fallback=_stream_response_fields,
+            )
+        }
         usage = None
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             # Gemini includes thoughtsTokenCount in usage metadata when thinking is used
@@ -2584,16 +3005,35 @@ class GeminiProvider:
                 ]
               }
         """
+        # Validate every marked descriptor before lowering anything: silently
+        # treating a malformed positioned record as legacy would hoist it.
+        instruction_descriptors = {
+            id(message): self._validated_instruction_descriptor(message)
+            for message in messages
+        }
+        has_instruction_layout = any(
+            descriptor is not None for descriptor in instruction_descriptors.values()
+        )
         system_messages = []
         gemini_contents = []
 
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content", "")
+            descriptor = instruction_descriptors[id(msg)]
 
-            # Extract system messages
             if role == "system":
-                system_messages.append(content)
+                if descriptor is None or descriptor["placement"] == "head":
+                    system_messages.append(content)
+                else:
+                    gemini_contents.append(
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"text": self._instruction_carrier(content, descriptor)}
+                            ],
+                        }
+                    )
                 continue
 
             # Convert assistant → model role with potential tool calls
@@ -2647,9 +3087,18 @@ class GeminiProvider:
                         # Content is a simple string
                         parts.append({"text": content})
 
-                # Handle tool calls
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    for tc in msg["tool_calls"]:
+                # Handle tool calls. Modern canonical messages carry these in
+                # `tool_calls`; accepted provider responses may preserve them as
+                # ToolCallBlock content instead. The latter must not disappear
+                # merely because this adapter is replaying positioned v1 records.
+                declared_tool_calls = msg.get("tool_calls")
+                tool_calls = (
+                    self._reconciled_v1_assistant_tool_calls(msg)
+                    if has_instruction_layout
+                    else declared_tool_calls or []
+                )
+                if tool_calls:
+                    for tc in tool_calls:
                         # Extract name - handle both old format (tool) and new format (name)
                         tool_name = tc.get("name") or tc.get("tool", "")
 
@@ -2781,7 +3230,8 @@ class GeminiProvider:
 
         # Combine system messages
         system_instruction = "\n\n".join(system_messages) if system_messages else None
-
+        if has_instruction_layout:
+            gemini_contents = self._merge_adjacent_v1_user_contents(gemini_contents)
         return system_instruction, gemini_contents
 
     def _generate_tool_call_id(self) -> str:
