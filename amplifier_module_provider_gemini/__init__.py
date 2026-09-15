@@ -44,6 +44,8 @@ from amplifier_core.llm_errors import RateLimitError
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
 from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
+from ._capabilities import DEFAULT_LIMITS
+from ._capabilities import get_limits
 from ._cost import compute_cost
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
@@ -851,7 +853,7 @@ class GeminiProvider:
         self.max_tokens = _parse_config_number(
             "max_output_tokens",
             _read_renamed_config(self.config, "max_output_tokens", "max_tokens"),
-            8192,
+            get_limits(self.default_model).max_output_tokens,
             int,
         )
         self.temperature = _parse_config_number(
@@ -947,15 +949,28 @@ class GeminiProvider:
         return self._client
 
     def get_info(self) -> ProviderInfo:
-        """Get provider metadata."""
+        """Get provider metadata.
+
+        `context_window` and `max_output_tokens` are REQUIRED here, not
+        decorative: `context-simple._calculate_budget` reads this exact pair to
+        size the session budget, and falls back to a conservative guess when a
+        provider omits either. Omitting them is what kept Gemini sessions
+        running on a ~200K budget against a 1,048,576-token window.
+
+        The model reported is `self.default_model` -- what this instance was
+        actually configured with -- not a hardcoded id.
+        """
+        limits = get_limits(self.default_model)
         return ProviderInfo(
             id="gemini",
             display_name="Google Gemini",
             credential_env_vars=["GOOGLE_API_KEY", "GEMINI_API_KEY"],
             capabilities=["streaming", "tools", "thinking", "json_mode", "batch"],
             defaults={
-                "model": "gemini-3.7-flash",
-                "max_tokens": 8192,
+                "model": self.default_model,
+                "max_tokens": limits.max_output_tokens,
+                "context_window": limits.context_window,
+                "max_output_tokens": limits.max_output_tokens,
                 "temperature": 0.7,
                 "timeout": 600.0,
             },
@@ -1185,8 +1200,12 @@ class GeminiProvider:
                 continue
 
             display_name = getattr(model, "display_name", model_id)
-            input_limit = getattr(model, "input_token_limit", 1048576)
-            output_limit = getattr(model, "output_token_limit", 8192)
+            input_limit = getattr(
+                model, "input_token_limit", DEFAULT_LIMITS.context_window
+            )
+            output_limit = getattr(
+                model, "output_token_limit", DEFAULT_LIMITS.max_output_tokens
+            )
             supports_thinking = getattr(model, "thinking", False)
 
             # Determine capabilities based on model
@@ -1211,7 +1230,7 @@ class GeminiProvider:
                     capabilities=capabilities,
                     defaults={
                         "temperature": 0.7,
-                        "max_tokens": min(8192, output_limit),
+                        "max_tokens": output_limit,
                     },
                 )
             )

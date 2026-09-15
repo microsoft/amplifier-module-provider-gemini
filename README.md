@@ -142,7 +142,7 @@ module = "provider-gemini"
 name = "gemini"
 config = {
     default_model = "gemini-3.7-flash",
-    max_output_tokens = 8192,
+    max_output_tokens = 65536,
     temperature = 0.7,
 }
 ```
@@ -155,7 +155,7 @@ Every key below corresponds either to a real parameter in Google's `google.genai
 |-----------|------|---------|---------------------|-------------|
 | `api_key` | string | env: `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Amplifier-only | Google AI API key. Env vars match the official SDK's own resolution (`GOOGLE_API_KEY` wins if both are set). |
 | `default_model` | string | `gemini-3.7-flash` | Amplifier-only | Default model to use when a request doesn't override it. |
-| `max_output_tokens` | int | 8192 | API: `max_output_tokens` | Maximum output tokens. **Renamed from `max_tokens`** to match Google's own parameter name -- `max_tokens` still works as a deprecated alias (one-shot warning; `max_output_tokens` always wins if both are set). |
+| `max_output_tokens` | int | model default (65,536 for every current model) | API: `max_output_tokens` | Maximum output tokens. **Renamed from `max_tokens`** to match Google's own parameter name -- `max_tokens` still works as a deprecated alias (one-shot warning; `max_output_tokens` always wins if both are set). |
 | `max_tokens` | int | -- | *(deprecated alias)* | Old name for `max_output_tokens`. Prefer the new name in new configs. |
 | `temperature` | float | 0.7 | API: `temperature` | Sampling temperature (0.0-2.0 per Google's docs; this provider does not clamp the range itself). |
 | `timeout` | float | 600.0 | Amplifier-only | API call timeout in seconds, enforced client-side via `asyncio.wait_for`. |
