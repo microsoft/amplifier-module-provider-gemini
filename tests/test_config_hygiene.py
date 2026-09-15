@@ -250,5 +250,10 @@ def test_max_tokens_string_value_still_coerced_through_alias():
 
 
 def test_neither_key_set_uses_default():
+    """The default output cap comes from the model, not a stale constant.
+
+    It was hardcoded 8192 -- three generations out of date. Every current
+    Gemini model accepts 65,536 output tokens.
+    """
     provider = GeminiProvider(api_key="test-key", config={})
-    assert provider.max_tokens == 8192
+    assert provider.max_tokens == 65_536

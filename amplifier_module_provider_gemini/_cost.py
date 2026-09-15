@@ -1,8 +1,21 @@
 """Gemini pricing rates and cost computation.
 
-Verification date: 2026-08-12 (thinking-token billing + new-model rates added;
-original rates verified 2026-05-06 remain unchanged)
+Verification date: 2026-09-15 (every rate below re-read off the live pricing
+page, which was last updated 2026-09-11; gemini-3.7/3.8-flash and
+gemini-3.5-flash-lite added, gemini-3-pro-preview removed as shut down)
 Source: https://ai.google.dev/gemini-api/docs/pricing
+
+Promotional rates expire -- and a static table would not notice
+----------------------------------------------------------------
+Gemini 3.6/3.7/3.8 Flash are on promotional pricing "through December 31,
+2026", after which input and output both DOUBLE (0.75 -> 1.50 and 3.75 ->
+7.50 per 1M). A table that hardcodes the promo rate silently under-reports
+cost by 2x from 2027-01-01 onward -- the failure is invisible, because a cost
+number that is merely wrong looks exactly like one that is right.
+
+So an affected model carries `promo_until` plus a `post_promo` rate block, and
+`compute_cost` selects between them by date. The date is injectable (`today=`)
+so both sides of the boundary are testable without freezing the clock.
 
 Usage
 -----
@@ -37,6 +50,7 @@ reporting them as a separate field, not in how they're billed.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
 # ---------------------------------------------------------------------------
@@ -44,6 +58,9 @@ from decimal import Decimal
 # ---------------------------------------------------------------------------
 
 _PER_M = Decimal(1_000_000)
+
+#: Gemini 3.6/3.7/3.8 Flash promotional pricing runs through this date.
+_FLASH_PROMO_END = date(2026, 12, 31)
 
 # _RATES maps model-id → {
 #   "input_per_m":             Decimal,   # fresh input tokens, per 1M
@@ -55,9 +72,33 @@ _PER_M = Decimal(1_000_000)
 #   "high_input_per_m":        Decimal,   # input rate above threshold
 #   "high_output_per_m":       Decimal,   # output rate above threshold
 #   "high_cache_read_per_m":   Decimal,   # cache-read rate above threshold
+#
+#   For models on promotional pricing only:
+#   "promo_until":             date,      # last day the rates above apply
+#   "post_promo":              dict,      # same rate keys, effective the day after
 # }
 #
 # Rates are in USD.
+
+def _flash_promo_rates() -> dict:
+    """Rates for the 3.6/3.7/3.8 Flash tier, promo and post-promo.
+
+    All three share one published price, so they share one constructor rather
+    than three hand-copied blocks that could drift apart.
+    """
+    return {
+        "input_per_m": Decimal("0.75"),
+        "output_per_m": Decimal("3.75"),
+        "cache_read_per_m": Decimal("0.075"),
+        "promo_until": _FLASH_PROMO_END,
+        "post_promo": {
+            "input_per_m": Decimal("1.50"),
+            "output_per_m": Decimal("7.50"),
+            "cache_read_per_m": Decimal("0.15"),
+        },
+    }
+
+
 _RATES: dict[str, dict] = {
     # ------------------------------------------------------------------
     # gemini-2.5-flash  (flat rate: $0.30 / $2.50 / $0.03 per 1M)
@@ -115,15 +156,12 @@ _RATES: dict[str, dict] = {
     #   ≤200K: $2.00 / $12.00 / $0.20 per 1M
     #   >200K: $4.00 / $18.00 / $0.40 per 1M
     # ------------------------------------------------------------------
-    "gemini-3-pro-preview": {
-        "input_per_m": Decimal("2.00"),
-        "output_per_m": Decimal("12.00"),
-        "cache_read_per_m": Decimal("0.20"),
-        "tier_threshold": 200_000,
-        "high_input_per_m": Decimal("4.00"),
-        "high_output_per_m": Decimal("18.00"),
-        "high_cache_read_per_m": Decimal("0.40"),
-    },
+    # gemini-3-pro-preview was REMOVED here on 2026-09-15: Google shut it down
+    # on 2026-03-09 (released 2025-11-18), replacement gemini-3.1-pro-preview.
+    # Source: https://ai.google.dev/gemini-api/docs/deprecations
+    # It has no pricing entry and no model page, so any rate carried for it
+    # would be a number this repo invented. compute_cost() returning None for
+    # a dead model is the honest answer.
     # ------------------------------------------------------------------
     # gemini-3.1-pro-preview  (alternate API ID — same rates as 3-pro-preview)
     # ------------------------------------------------------------------
@@ -153,10 +191,36 @@ _RATES: dict[str, dict] = {
     # Source: https://ai.google.dev/gemini-api/docs/pricing, "Gemini 3.6
     # Flash" section, Standard tier (verified 2026-08-12).
     # ------------------------------------------------------------------
-    "gemini-3.6-flash": {
-        "input_per_m": Decimal("1.50"),
-        "output_per_m": Decimal("7.50"),
-        "cache_read_per_m": Decimal("0.15"),
+    # ------------------------------------------------------------------
+    # gemini-3.6-flash  (promo: $0.75 / $3.75 / $0.075 per 1M through
+    # 2026-12-31; $1.50 / $7.50 / $0.15 from 2027-01-01)
+    # Source: pricing page, "Gemini 3.6 Flash" section (verified 2026-09-15).
+    # The pre-2026-09 table here carried 1.50/7.50 -- the POST-promo rate --
+    # as if it were current, over-reporting this model's cost by 2x.
+    # ------------------------------------------------------------------
+    "gemini-3.6-flash": _flash_promo_rates(),
+    # ------------------------------------------------------------------
+    # gemini-3.7-flash  (same promo structure; THIS PROVIDER'S DEFAULT MODEL,
+    # and it was missing from this table entirely -- every call on the default
+    # model reported cost None.)
+    # Source: pricing page, "Gemini 3.7 Flash" section (verified 2026-09-15).
+    # ------------------------------------------------------------------
+    "gemini-3.7-flash": _flash_promo_rates(),
+    # ------------------------------------------------------------------
+    # gemini-3.8-flash  (GA 2026-09-02, same promo structure)
+    # Source: pricing page, "Gemini 3.8 Flash" section (verified 2026-09-15).
+    # ------------------------------------------------------------------
+    "gemini-3.8-flash": _flash_promo_rates(),
+    # ------------------------------------------------------------------
+    # gemini-3.5-flash-lite  (flat rate: $0.30 / $2.50 / $0.03 per 1M)
+    # Source: pricing page, "Gemini 3.5 Flash-Lite" section (verified
+    # 2026-09-15). Replacement for gemini-3.1-flash-lite, which Google has
+    # scheduled for shutdown on 2027-05-07.
+    # ------------------------------------------------------------------
+    "gemini-3.5-flash-lite": {
+        "input_per_m": Decimal("0.30"),
+        "output_per_m": Decimal("2.50"),
+        "cache_read_per_m": Decimal("0.03"),
     },
     # ------------------------------------------------------------------
     # gemini-3.1-flash-lite  (flat rate: $0.25 / $1.50 / $0.025 per 1M)
@@ -201,6 +265,19 @@ _RATES: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 
 
+
+def _rates_effective_on(rates: dict, today: date) -> dict:
+    """Return *rates*, swapped for its post-promo block once the promo ends.
+
+    A model with no ``promo_until`` is returned unchanged, so this is a no-op
+    for every flat or tiered model.
+    """
+    promo_until = rates.get("promo_until")
+    if promo_until is None or today <= promo_until:
+        return rates
+    return {**rates, **rates["post_promo"]}
+
+
 def compute_cost(
     model: str,
     *,
@@ -208,6 +285,7 @@ def compute_cost(
     candidates_token_count: int = 0,
     cached_content_token_count: int = 0,
     thoughts_token_count: int = 0,
+    today: date | None = None,
 ) -> Decimal | None:
     """Return the USD cost for a Gemini API call as a :class:`~decimal.Decimal`.
 
@@ -231,15 +309,24 @@ def compute_cost(
         callers with no thinking activity (or providers/tests that don't pass
         it) are unaffected.
 
+    today:
+        Date used to decide whether a model's promotional rates still apply.
+        Defaults to the real current date; inject one to test either side of a
+        promo boundary without freezing the clock.
+
     Returns
     -------
     Decimal | None
         The computed cost in USD, or ``None`` if *model* is not recognised.
         ``None`` is semantically distinct from ``Decimal('0')`` (a free call).
+        A model Google has shut down is deliberately absent from the table and
+        so returns ``None`` rather than a rate this repo would have to invent.
     """
     rates = _RATES.get(model)
     if rates is None:
         return None
+
+    rates = _rates_effective_on(rates, today or date.today())
 
     fresh_input = max(0, prompt_token_count - cached_content_token_count)
 

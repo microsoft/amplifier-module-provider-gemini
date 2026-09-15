@@ -36,6 +36,7 @@ Defect D regression tests (t–w): new-model rates + still-missing model
       official rate) -- returns None, not a guessed number.
 """
 
+from datetime import date
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -105,20 +106,20 @@ def test_pro_preview_alias_low_tier():
 # ---------------------------------------------------------------------------
 # (f) Gemini-3-pro-preview tiered rates
 # ---------------------------------------------------------------------------
-def test_gemini3_pro_preview_low_tier():
+def test_gemini31_pro_preview_low_tier():
     """gemini-3-pro-preview low tier: 100K input → $0.20"""
     # 100K × $2.00/M = $0.20
     result = compute_cost(
-        "gemini-3-pro-preview", prompt_token_count=100_000, candidates_token_count=0
+        "gemini-3.1-pro-preview", prompt_token_count=100_000, candidates_token_count=0
     )
     assert result == Decimal("0.20"), f"Expected Decimal('0.20'), got {result!r}"
 
 
-def test_gemini3_pro_preview_high_tier():
+def test_gemini31_pro_preview_high_tier():
     """gemini-3-pro-preview high tier (>200K): 500K input → $2.00"""
     # 500K × $4.00/M = $2.00
     result = compute_cost(
-        "gemini-3-pro-preview", prompt_token_count=500_000, candidates_token_count=0
+        "gemini-3.1-pro-preview", prompt_token_count=500_000, candidates_token_count=0
     )
     assert result == Decimal("2.00"), f"Expected Decimal('2.00'), got {result!r}"
 
@@ -126,15 +127,18 @@ def test_gemini3_pro_preview_high_tier():
 # ---------------------------------------------------------------------------
 # (g) Gemini-3.1-pro-preview alias
 # ---------------------------------------------------------------------------
-def test_gemini31_pro_preview_alias():
-    """gemini-3.1-pro-preview: same rates as gemini-3-pro-preview"""
-    result_3 = compute_cost(
-        "gemini-3-pro-preview", prompt_token_count=100_000, candidates_token_count=0
-    )
-    result_31 = compute_cost(
-        "gemini-3.1-pro-preview", prompt_token_count=100_000, candidates_token_count=0
-    )
-    assert result_3 == result_31
+def test_shutdown_model_returns_none_rather_than_an_invented_rate():
+    """gemini-3-pro-preview was shut down by Google on 2026-03-09.
+
+    It has no pricing entry and no model page, so any rate carried for it
+    would be a number this repo invented. None -- "not recognised" -- is
+    the honest answer, and is already semantically distinct from
+    Decimal('0') (a free call). Its replacement, gemini-3.1-pro-preview,
+    is priced and tested above.
+    Source: https://ai.google.dev/gemini-api/docs/deprecations
+    """
+    assert compute_cost("gemini-3-pro-preview", prompt_token_count=100_000, candidates_token_count=0) is None
+    assert compute_cost("gemini-3.1-pro-preview", prompt_token_count=100_000, candidates_token_count=0) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -433,14 +437,28 @@ def test_gemini_3_5_flash_rates():
 # (u) gemini-3.6-flash flat rate: $1.50 / $7.50 / $0.15 per 1M
 # ---------------------------------------------------------------------------
 def test_gemini_3_6_flash_rates():
+    """Promotional rates through 2026-12-31, post-promo rates after.
+
+    The pre-2026-09 table carried 1.50/7.50 -- the POST-promo rate -- as if it
+    were current, over-reporting this model by 2x.
+    """
+    promo = date(2026, 9, 15)
     input_cost = compute_cost(
-        "gemini-3.6-flash", prompt_token_count=1_000_000, candidates_token_count=0
+        "gemini-3.6-flash", prompt_token_count=1_000_000, candidates_token_count=0, today=promo
     )
     output_cost = compute_cost(
-        "gemini-3.6-flash", prompt_token_count=0, candidates_token_count=1_000_000
+        "gemini-3.6-flash", prompt_token_count=0, candidates_token_count=1_000_000, today=promo
     )
-    assert input_cost == Decimal("1.50")
-    assert output_cost == Decimal("7.50")
+    assert input_cost == Decimal("0.75")
+    assert output_cost == Decimal("3.75")
+
+    after = date(2027, 1, 1)
+    assert compute_cost(
+        "gemini-3.6-flash", prompt_token_count=1_000_000, candidates_token_count=0, today=after
+    ) == Decimal("1.50")
+    assert compute_cost(
+        "gemini-3.6-flash", prompt_token_count=0, candidates_token_count=1_000_000, today=after
+    ) == Decimal("7.50")
 
 
 # ---------------------------------------------------------------------------
