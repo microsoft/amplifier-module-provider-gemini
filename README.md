@@ -443,6 +443,17 @@ version is covered by this exact generation/count wire check. The checked-in
 `uv.lock` still pins 1.46.0 despite this package's pre-existing `>=1.56.0`
 floor; this baseline lock discrepancy is intentionally not upgraded here.
 
+Counting is unavailable when the SDK would route generation away from the
+canonical Gemini Developer endpoint: a nonempty `GOOGLE_GEMINI_BASE_URL`, or
+effective Vertex/Enterprise selection through `GOOGLE_GENAI_USE_VERTEXAI` /
+`GOOGLE_GENAI_USE_ENTERPRISE`, disables both count advertisement and dispatch.
+The SDK's 2.23 parsing is followed exactly: `true`/`1` are case-insensitive,
+and a present Enterprise variable wins over Vertex even when it is explicitly
+false. A client constructed by this provider retains its route decision; an
+injected client has no public base-URL guarantee and therefore fails closed.
+`get_info()` reads only these route-selection variables and never constructs
+an SDK client, authenticates, or performs I/O.
+
 ## Dependencies
 
 - `google-genai>=1.56.0` - Official Google AI Python SDK. 1.56.0 is the floor because it's the first release whose `ThinkingConfig` exposes the full `thinking_level` enum (`minimal`/`low`/`medium`/`high`) this provider needs -- verified by probing the SDK's own installed types directly: 1.46.0 has no `thinking_level` field at all; 1.51.0 adds it with only `LOW`/`HIGH`; 1.56.0 completes the four-level enum.

@@ -429,8 +429,6 @@ async def test_request_budget_cancellation_does_not_dispatch_generation(
 
     monkeypatch.setattr(httpx, "AsyncClient", client_factory)
     provider = _provider()
-    generation_client = object()
-    provider._client = generation_client
     task = asyncio.create_task(
         provider.request_budget(_request(), context_estimate=400)
     )
@@ -451,7 +449,7 @@ async def test_request_budget_cancellation_does_not_dispatch_generation(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert provider._client is generation_client
+    assert provider._client is None
 
 
 def test_only_developer_api_instances_advertise_native_counting() -> None:
@@ -468,3 +466,125 @@ def test_only_developer_api_instances_advertise_native_counting() -> None:
     assert "request_budget:provider_count" not in no_key
     assert "request_budget" not in unknown
     assert "request_budget:provider_count" not in unknown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("environment", "counting_available"),
+    [
+        ({}, True),
+        ({"GOOGLE_GEMINI_BASE_URL": "https://alternate.example/"}, False),
+        ({"GOOGLE_GEMINI_BASE_URL": ""}, True),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "TRUE"}, False),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "TrUe"}, False),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "1"}, False),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "false"}, True),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": ""}, True),
+        ({"GOOGLE_GENAI_USE_VERTEXAI": "yes"}, True),
+        (
+            {
+                "GOOGLE_GENAI_USE_ENTERPRISE": "false",
+                "GOOGLE_GENAI_USE_VERTEXAI": "true",
+            },
+            True,
+        ),
+        (
+            {
+                "GOOGLE_GENAI_USE_ENTERPRISE": "TRUE",
+                "GOOGLE_GENAI_USE_VERTEXAI": "false",
+            },
+            False,
+        ),
+    ],
+    ids=[
+        "canonical-developer",
+        "custom-base-url",
+        "empty-base-url",
+        "vertex-upper-true",
+        "vertex-mixed-true",
+        "vertex-one",
+        "vertex-false",
+        "vertex-empty",
+        "vertex-other-false",
+        "enterprise-false-wins",
+        "enterprise-true-wins",
+    ],
+)
+async def test_native_count_advertisement_and_dispatch_follow_sdk_route_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: dict[str, str],
+    counting_available: bool,
+) -> None:
+    """Neither advertisement nor HTTP can claim a route the SDK would not use."""
+    for name in (
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    sent: list[httpx.Request] = []
+    real_client = httpx.AsyncClient
+
+    def client_factory(*, timeout: float) -> httpx.AsyncClient:
+        return real_client(
+            timeout=timeout,
+            transport=httpx.MockTransport(
+                lambda request: sent.append(request)
+                or httpx.Response(200, json={"totalTokens": 100})
+            ),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    provider = _provider()
+
+    assert ("request_budget" in provider.get_info().capabilities) is counting_available
+    assert (
+        await provider.request_budget(_request(), context_estimate=400) is not None
+    ) is counting_available
+    assert len(sent) == int(counting_available)
+    assert provider._client is None
+
+
+@pytest.mark.asyncio
+async def test_initialized_noncanonical_client_stays_uncountable_after_environment_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider records its own client's route instead of rereading later env."""
+    monkeypatch.delenv("GOOGLE_GEMINI_BASE_URL", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    provider = _provider()
+    client = provider.client
+    assert client.vertexai is True
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+
+    def no_count_client(*, timeout: float) -> httpx.AsyncClient:
+        raise AssertionError("noncanonical generation client must not reach countTokens")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_count_client)
+    try:
+        assert "request_budget" not in provider.get_info().capabilities
+        assert await provider.request_budget(_request(), context_estimate=400) is None
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
+async def test_injected_client_with_unknown_route_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No public SDK base_url means an injected client cannot prove canonical."""
+    provider = _provider()
+    provider._client = object()
+
+    def no_count_client(*, timeout: float) -> httpx.AsyncClient:
+        raise AssertionError("unknown injected client must not reach countTokens")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_count_client)
+
+    assert "request_budget" not in provider.get_info().capabilities
+    assert await provider.request_budget(_request(), context_estimate=400) is None

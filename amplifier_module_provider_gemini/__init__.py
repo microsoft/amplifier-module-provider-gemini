@@ -103,6 +103,25 @@ class _UnsupportedCountRequest(ValueError):
     """The finalized request cannot be represented by Developer countTokens."""
 
 
+def _sdk_environment_uses_vertexai() -> bool:
+    """Match google-genai 2.23's environment route selection without loading it."""
+    enterprise = os.environ.get("GOOGLE_GENAI_USE_ENTERPRISE")
+    vertexai = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI")
+    if enterprise is not None:
+        return enterprise.lower() in ("true", "1")
+    if vertexai is not None:
+        return vertexai.lower() in ("true", "1")
+    return False
+
+
+def _sdk_environment_uses_canonical_developer_route() -> bool:
+    """Whether SDK environment defaults select this counter's fixed endpoint."""
+    return not (
+        os.environ.get("GOOGLE_GEMINI_BASE_URL")
+        or _sdk_environment_uses_vertexai()
+    )
+
+
 @dataclass(frozen=True)
 class _GeminiRequestPlan:
     """The one provider-owned plan used for generation and native counting."""
@@ -988,6 +1007,10 @@ class GeminiProvider:
         """
         self._api_key = api_key
         self._client = None  # Lazy init
+        # ``None`` means an injected client whose base route cannot be
+        # established through public SDK API. Such clients fail closed for the
+        # fixed Developer counter; generation keeps using the caller's client.
+        self._client_uses_canonical_developer_route: bool | None = None
         self._add_cost = (
             add_cost if add_cost is not None else lambda cost, model=None: None
         )
@@ -1095,8 +1118,32 @@ class GeminiProvider:
                 raise ValueError("api_key must be provided for API calls")
             from google import genai
 
+            # The SDK selects its route at construction from these environment
+            # defaults. Keep the selection with this client so a later
+            # environment change cannot make the fixed Developer counter
+            # describe an already noncanonical generation client.
+            route_is_canonical = _sdk_environment_uses_canonical_developer_route()
             self._client = genai.Client(api_key=self._api_key)
+            self._client_uses_canonical_developer_route = route_is_canonical
         return self._client
+
+    def _native_counting_available(self, model: Any) -> bool:
+        """Return whether a fixed Developer countTokens request can match generation."""
+        if (
+            not isinstance(self._api_key, str)
+            or not self._api_key
+            or not isinstance(model, str)
+            or not model.startswith("gemini-")
+            or not has_known_limits(model)
+        ):
+            return False
+        if self._client is not None:
+            # google-genai exposes ``Client.vertexai`` but has no established
+            # public base_url property. A false value therefore cannot prove
+            # an injected client is canonical, so only our creation snapshot
+            # is eligible.
+            return self._client_uses_canonical_developer_route is True
+        return _sdk_environment_uses_canonical_developer_route()
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata.
@@ -1114,12 +1161,7 @@ class GeminiProvider:
         capabilities = ["streaming", "tools", "thinking", "json_mode", "batch"]
         # The adapter is Developer API-only. Individual request shapes still
         # return no decision when their public serialization cannot be counted.
-        if (
-            isinstance(self._api_key, str)
-            and self._api_key
-            and self.default_model.startswith("gemini-")
-            and has_known_limits(self.default_model)
-        ):
+        if self._native_counting_available(self.default_model):
             capabilities.extend(["request_budget", "request_budget:provider_count"])
         return ProviderInfo(
             id="gemini",
@@ -1872,7 +1914,7 @@ class GeminiProvider:
 
     async def _count_request_tokens(self, plan: _GeminiRequestPlan) -> int | None:
         """Call the documented Developer REST counter without SDK internals."""
-        if not isinstance(self._api_key, str) or not self._api_key:
+        if not self._native_counting_available(plan.model):
             return None
         if plan.count_unsupported_reason is not None:
             logger.debug(
@@ -1934,6 +1976,10 @@ class GeminiProvider:
             raise ValueError("context_estimate must be a nonnegative integer")
 
         options = self._merge_request_options(request_options, kwargs)
+        if not self._native_counting_available(
+            options.get("model", self.default_model)
+        ):
+            return None
         # `complete()` repairs incomplete tool pairs before it builds the
         # wire request. Plan the same repair on a deep copy: probing must not
         # mutate conversation history or mark an uncommitted repair as done.
@@ -1947,11 +1993,7 @@ class GeminiProvider:
                 exc_info=True,
             )
             return None
-        if (
-            not isinstance(plan.model, str)
-            or not plan.model.startswith("gemini-")
-            or not has_known_limits(plan.model)
-        ):
+        if not self._native_counting_available(plan.model):
             return None
         max_output_tokens = getattr(plan.config, "max_output_tokens", None)
         if (
