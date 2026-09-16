@@ -524,3 +524,113 @@ async def test_complete_preserves_thinking_fields_in_actual_sdk_http_body(
     finally:
         await client.aio.aclose()
         client.close()
+
+
+# ============================================================
+# AutomaticFunctionCalling is disabled on EVERY request
+# ============================================================
+#
+# AFC is the SDK's own function-calling loop: given a Python callable it will
+# invoke it and round-trip the result itself. This provider never wants that --
+# it returns tool calls to the Loop. Disabling it only on tool-carrying
+# requests left the no-tool path relying on an SDK default, so these tests
+# assert the flag on the config object the SDK actually receives.
+
+
+def _config_for(provider, request, *, streaming=False):
+    """Return the GenerateContentConfig the SDK was actually called with."""
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=_make_gemini_response()
+    )
+    if streaming:
+
+        async def _stream():
+            yield _make_gemini_response()
+
+        mock_client.aio.models.generate_content_stream = AsyncMock(
+            return_value=_stream()
+        )
+    provider._client = mock_client
+    asyncio.run(provider.complete(request))
+    method = (
+        mock_client.aio.models.generate_content_stream
+        if streaming
+        else mock_client.aio.models.generate_content
+    )
+    call_kwargs = method.await_args
+    return call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
+
+
+def _tool_request():
+    from amplifier_core.message_models import ToolSpec
+
+    return ChatRequest(
+        messages=[Message(role="user", content="Use the tool")],
+        tools=[
+            ToolSpec(
+                name="lookup",
+                description="Look up a value",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            )
+        ],
+    )
+
+
+def test_afc_disabled_without_tools_nonstreaming():
+    provider = _make_provider(use_streaming=False)
+    config = _config_for(
+        provider, ChatRequest(messages=[Message(role="user", content="Hello")])
+    )
+    assert config.tools is None
+    assert config.automatic_function_calling is not None
+    assert config.automatic_function_calling.disable is True
+
+
+def test_afc_disabled_without_tools_streaming():
+    provider = _make_provider(use_streaming=True)
+    config = _config_for(
+        provider,
+        ChatRequest(messages=[Message(role="user", content="Hello")]),
+        streaming=True,
+    )
+    assert config.tools is None
+    assert config.automatic_function_calling is not None
+    assert config.automatic_function_calling.disable is True
+
+
+def test_afc_disabled_with_declared_tools():
+    provider = _make_provider(use_streaming=False)
+    config = _config_for(provider, _tool_request())
+    assert config.tools
+    assert config.automatic_function_calling.disable is True
+
+
+def test_afc_disabled_with_declared_tools_streaming():
+    provider = _make_provider(use_streaming=True)
+    config = _config_for(provider, _tool_request(), streaming=True)
+    assert config.tools
+    assert config.automatic_function_calling.disable is True
+
+
+def test_explicit_afc_override_is_preserved():
+    """extra_request_params still wins, exactly as it does for every field."""
+    from google.genai import types
+
+    provider = _make_provider(
+        use_streaming=False,
+        extra_request_params={
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=False, maximum_remote_calls=3
+            )
+        },
+    )
+    config = _config_for(
+        provider, ChatRequest(messages=[Message(role="user", content="Hello")])
+    )
+    assert config.automatic_function_calling.disable is False
+    assert config.automatic_function_calling.maximum_remote_calls == 3

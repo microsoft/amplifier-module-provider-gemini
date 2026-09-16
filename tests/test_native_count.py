@@ -141,7 +141,17 @@ async def test_count_projection_matches_the_real_sdk_generation_body(
     provider = _provider(use_streaming=streaming)
     request = _request()
     plan = provider._build_request_plan(request)
-    expected = provider._count_request_payload(plan)["generateContentRequest"]
+    count_body = provider._count_request_payload(plan)["generateContentRequest"]
+    # The nested model is asserted against a literal resource name, not against
+    # anything the production projection computed, so a wrong prefix or a
+    # dropped field cannot be self-confirming.
+    assert count_body.pop("model") == "models/gemini-3.7-flash"
+    # Everything that remains after removing ONLY the count-only model field
+    # must equal the body the SDK itself puts on the wire for generation.
+    expected = count_body
+    assert "automaticFunctionCalling" not in expected
+    assert expected["systemInstruction"]["parts"] == [{"text": "System instructions"}]
+    assert expected["tools"][0]["functionDeclarations"][0]["name"] == "lookup"
     client = genai.Client(
         api_key="test-key",
         http_options=types.HttpOptions(
@@ -303,9 +313,10 @@ async def test_request_budget_posts_full_request_and_keeps_input_limit_raw(
         "gemini-3.7-flash:countTokens"
     )
     assert sent[0].headers["x-goog-api-key"] == "test-key"
-    assert json.loads(sent[0].content)["generateContentRequest"]["cachedContent"] == (
-        "cachedContents/unit-test"
-    )
+    posted = json.loads(sent[0].content)["generateContentRequest"]
+    assert posted["cachedContent"] == "cachedContents/unit-test"
+    # The endpoint above and this nested field must name the same model.
+    assert posted["model"] == "models/gemini-3.7-flash"
 
 
 @pytest.mark.asyncio
@@ -621,3 +632,394 @@ async def test_replaced_client_cannot_inherit_a_canonical_route(
     # Reinjecting the old closed client must not restore its discarded stamp.
     provider._client = client
     assert "request_budget" not in provider.get_info().capabilities
+
+# ===========================================================================
+# provider:request_budget_unavailable -- the reason behind a None budget
+# ===========================================================================
+
+
+class _RecordingHooks:
+    """Minimal hooks double matching the fixture shape used elsewhere."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(self, name: str, payload: dict[str, Any]) -> None:
+        self.events.append((name, payload))
+
+
+class _RaisingHooks(_RecordingHooks):
+    """A diagnostic subscriber that fails the way a broken one would."""
+
+    async def emit(self, name: str, payload: dict[str, Any]) -> None:
+        await super().emit(name, payload)
+        raise RuntimeError("diagnostic hook exploded")
+
+
+class _RecordingCoordinator:
+    def __init__(self, hooks: _RecordingHooks | None = None) -> None:
+        self.hooks = hooks or _RecordingHooks()
+
+
+def _unavailable_events(coordinator: Any) -> list[dict[str, Any]]:
+    return [
+        payload
+        for name, payload in coordinator.hooks.events
+        if name == "provider:request_budget_unavailable"
+    ]
+
+
+def _count_transport(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+    """Route this provider's own countTokens client through *handler*."""
+    real_client = httpx.AsyncClient
+
+    def client_factory(*, timeout: float) -> httpx.AsyncClient:
+        return real_client(timeout=timeout, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+
+def _refuse_count(monkeypatch: pytest.MonkeyPatch, why: str) -> None:
+    def no_count_client(*, timeout: float) -> httpx.AsyncClient:
+        raise AssertionError(why)
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_count_client)
+
+
+def _ok_count(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"totalTokens": 100})
+
+
+def _budget_provider() -> tuple[GeminiProvider, Any]:
+    provider = _provider()
+    coordinator = _RecordingCoordinator()
+    provider.coordinator = coordinator  # type: ignore[assignment]
+    return provider, coordinator
+
+
+@pytest.mark.asyncio
+async def test_successful_count_emits_no_unavailable_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A working count is not a diagnostic event."""
+    _count_transport(monkeypatch, _ok_count)
+    provider, coordinator = _budget_provider()
+
+    assert await provider.request_budget(_request(), context_estimate=400)
+    assert _unavailable_events(coordinator) == []
+
+
+@pytest.mark.asyncio
+async def test_model_override_moves_endpoint_and_nested_model_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The count URL and the nested count model always name one model."""
+    sent: list[httpx.Request] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"totalTokens": 100})
+
+    _count_transport(monkeypatch, receive)
+    provider, _ = _budget_provider()
+
+    assert await provider.request_budget(
+        _request(), context_estimate=400, model="gemini-2.5-flash"
+    )
+    assert sent[0].url == (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash:countTokens"
+    )
+    body = json.loads(sent[0].content)["generateContentRequest"]
+    assert body["model"] == "models/gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_model_reports_unsupported_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse_count(monkeypatch, "unknown model must not reach countTokens")
+    provider, coordinator = _budget_provider()
+
+    assert (
+        await provider.request_budget(
+            _request(), context_estimate=400, model="gemini-9.9-unverified"
+        )
+        is None
+    )
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0] == {
+        "provider": "gemini",
+        "method": "developer.countTokens",
+        "reason": "unsupported_model",
+        "model": "gemini-9.9-unverified",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unsupported_route_reports_unsupported_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    _refuse_count(monkeypatch, "noncanonical route must not reach countTokens")
+    provider, coordinator = _budget_provider()
+
+    assert await provider.request_budget(_request(), context_estimate=400) is None
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "unsupported_route"
+    assert events[0]["model"] == "gemini-3.7-flash"
+
+
+@pytest.mark.asyncio
+async def test_missing_credential_reports_unsupported_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No usable Developer credential is a route fact, not a model fact."""
+    _refuse_count(monkeypatch, "a keyless provider must not reach countTokens")
+    provider, coordinator = _budget_provider()
+    provider._api_key = None
+
+    assert await provider.request_budget(_request(), context_estimate=400) is None
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "unsupported_route"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_request_params",
+    [{"tools": []}, {"response_schema": {"type": "object"}}],
+    ids=["extra-tools", "response-schema"],
+)
+async def test_unprojectable_plan_reports_request_projection_unavailable(
+    monkeypatch: pytest.MonkeyPatch, extra_request_params: dict[str, Any]
+) -> None:
+    _refuse_count(monkeypatch, "unprojectable plan must not reach countTokens")
+    provider, coordinator = _budget_provider()
+    provider.extra_request_params = extra_request_params
+
+    assert await provider.request_budget(_request(), context_estimate=400) is None
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "request_projection_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_unbuildable_plan_reports_request_plan_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse_count(monkeypatch, "an unbuildable plan must not reach countTokens")
+    provider, coordinator = _budget_provider()
+
+    def explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise ValueError("secret-bearing plan failure")
+
+    monkeypatch.setattr(provider, "_build_request_plan", explode)
+
+    assert await provider.request_budget(_request(), context_estimate=400) is None
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "request_plan_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_invalid_output_limit_reports_invalid_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refuse_count(monkeypatch, "an invalid output limit must not reach countTokens")
+    provider, coordinator = _budget_provider()
+
+    assert (
+        await provider.request_budget(
+            ChatRequest(messages=[Message(role="user", content="Hi")]),
+            context_estimate=400,
+            max_tokens=0,
+        )
+        is None
+    )
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "invalid_output_limit"
+
+
+@pytest.mark.asyncio
+async def test_http_status_reports_http_error_with_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _count_transport(
+        monkeypatch,
+        lambda request: httpx.Response(400, json={"error": {"message": "nope"}}),
+    )
+    provider, coordinator = _budget_provider()
+
+    assert await provider.request_budget(_request(), context_estimate=400) is None
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "http_error"
+    assert events[0]["http_status"] == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"totalTokens": "many"}, {"totalTokens": -1}, {"totalTokens": True}],
+    ids=["missing", "string", "negative", "bool"],
+)
+async def test_malformed_count_reports_invalid_response(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]
+) -> None:
+    _count_transport(monkeypatch, lambda request: httpx.Response(200, json=payload))
+    provider, coordinator = _budget_provider()
+
+    assert await provider.request_budget(_request(), context_estimate=400) is None
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "invalid_response"
+    assert "http_status" not in events[0]
+
+
+@pytest.mark.asyncio
+async def test_missing_coordinator_still_states_the_same_reason(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With no hooks channel the reason is still visible -- as a warning."""
+    _refuse_count(monkeypatch, "unknown model must not reach countTokens")
+    provider = _provider()
+    provider.coordinator = None
+
+    with caplog.at_level("WARNING"):
+        assert (
+            await provider.request_budget(
+                _request(), context_estimate=400, model="gemini-9.9-unverified"
+            )
+            is None
+        )
+    assert any("unsupported_model" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_failing_diagnostic_hook_does_not_become_a_product_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken subscriber must not turn a None count into a raised error."""
+    _refuse_count(monkeypatch, "unknown model must not reach countTokens")
+    provider = _provider()
+    hooks = _RaisingHooks()
+    provider.coordinator = _RecordingCoordinator(hooks)  # type: ignore[assignment]
+
+    assert (
+        await provider.request_budget(
+            _request(), context_estimate=400, model="gemini-9.9-unverified"
+        )
+        is None
+    )
+    assert len(hooks.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_failing_diagnostic_hook_does_not_spoil_a_successful_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _count_transport(monkeypatch, _ok_count)
+    provider = _provider()
+    provider.coordinator = _RecordingCoordinator(_RaisingHooks())  # type: ignore[assignment]
+
+    decision = await provider.request_budget(_request(), context_estimate=400)
+    assert decision is not None
+    assert decision["estimated_input_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_cancelled_count_propagates_without_emitting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def receive(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await release.wait()
+        return httpx.Response(200, json={"totalTokens": 100})
+
+    _count_transport(monkeypatch, receive)
+    provider, coordinator = _budget_provider()
+
+    task = asyncio.create_task(
+        provider.request_budget(_request(), context_estimate=400)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _unavailable_events(coordinator) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    [object(), 123, "gemini-unknown model", "gemini-" + "x" * 200],
+    ids=["object", "int", "whitespace", "overlong"],
+)
+async def test_unsafe_model_values_are_omitted_from_telemetry(
+    monkeypatch: pytest.MonkeyPatch, model: Any
+) -> None:
+    """Arbitrary caller-supplied model input is never serialized into an event."""
+    _refuse_count(monkeypatch, "an unsupported model must not reach countTokens")
+    provider, coordinator = _budget_provider()
+
+    assert (
+        await provider.request_budget(_request(), context_estimate=400, model=model)
+        is None
+    )
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "unsupported_model"
+    assert "model" not in events[0]
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_carry_no_secret_payload_or_exception_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Seeded secrets must appear in neither the event nor the log record."""
+    secret = "SEEDED-API-KEY-8f3a21"
+    payload_marker = "SEEDED-PROMPT-CONTENT-4b19de"
+    exception_marker = "SEEDED-EXCEPTION-TEXT-77c0aa"
+
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(exception_marker)
+
+    _count_transport(monkeypatch, explode)
+    provider = _provider()
+    provider._api_key = secret
+    coordinator = _RecordingCoordinator()
+    provider.coordinator = coordinator  # type: ignore[assignment]
+
+    with caplog.at_level("DEBUG"):
+        assert (
+            await provider.request_budget(
+                ChatRequest(
+                    messages=[Message(role="user", content=payload_marker)],
+                    max_output_tokens=321,
+                ),
+                context_estimate=400,
+            )
+            is None
+        )
+
+    events = _unavailable_events(coordinator)
+    assert len(events) == 1
+    assert events[0]["reason"] == "http_error"
+    serialized = json.dumps(events[0])
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    for marker in (secret, payload_marker, exception_marker):
+        assert marker not in serialized
+        assert marker not in logged
