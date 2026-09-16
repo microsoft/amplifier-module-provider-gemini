@@ -19,6 +19,7 @@ dependencies = [
     # See amplifier_module_provider_gemini/__init__.py's
     # _THINKING_LEVEL_TABLE comment for the per-model support matrix.
     "google-genai>=1.56.0",
+    "httpx>=0.28.1",
 ]
 
 [project.entry-points."amplifier.modules"]

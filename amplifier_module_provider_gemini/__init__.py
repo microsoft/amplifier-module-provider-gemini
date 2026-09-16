@@ -11,13 +11,16 @@ __amplifier_module_type__ = "provider"
 import asyncio
 import base64
 import difflib
+import math
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from decimal import Decimal
 import json
 import logging
 import os
 import time
+from urllib.parse import quote
 import uuid
 from contextlib import suppress
 from typing import Any
@@ -46,6 +49,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from ._capabilities import DEFAULT_LIMITS
 from ._capabilities import get_limits
+from ._capabilities import has_known_limits
 from ._cost import compute_cost
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
@@ -93,6 +97,75 @@ logger = logging.getLogger(__name__)
 # `close_timeout` config key, matching anthropic/openai/vllm/azure-openai/
 # chat-completions/github-copilot.
 _DEFAULT_CLOSE_TIMEOUT: float = 5.0
+
+
+class _UnsupportedCountRequest(ValueError):
+    """The finalized request cannot be represented by Developer countTokens."""
+
+
+@dataclass(frozen=True)
+class _GeminiRequestPlan:
+    """The one provider-owned plan used for generation and native counting."""
+
+    model: str
+    contents: list[dict[str, Any]]
+    config: Any
+    count_unsupported_reason: str | None
+
+
+# GenerateContentConfig has local controls that do not reach the Developer REST
+# request.  The count projection intentionally omits only these known fields.
+_COUNT_LOCAL_CONFIG_FIELDS = frozenset(
+    {
+        "automaticFunctionCalling",
+        "httpOptions",
+        "shouldReturnHttpResponse",
+    }
+)
+_COUNT_TOP_LEVEL_CONFIG_FIELDS = frozenset(
+    {
+        "cachedContent",
+        "safetySettings",
+        "serviceTier",
+        "systemInstruction",
+        "toolConfig",
+        "tools",
+    }
+)
+_COUNT_GENERATION_CONFIG_FIELDS = frozenset(
+    {
+        "candidateCount",
+        "enableEnhancedCivicAnswers",
+        "frequencyPenalty",
+        "logprobs",
+        "maxOutputTokens",
+        "mediaResolution",
+        "presencePenalty",
+        "responseLogprobs",
+        "responseMimeType",
+        "responseModalities",
+        "seed",
+        "stopSequences",
+        "temperature",
+        "thinkingConfig",
+        "topK",
+        "topP",
+    }
+)
+_COUNT_UNSUPPORTED_CONFIG_FIELDS = frozenset(
+    {
+        "audioTimestamp",
+        "audioTranscriptionConfig",
+        "imageConfig",
+        "labels",
+        "modelArmorConfig",
+        "modelSelectionConfig",
+        "responseJsonSchema",
+        "responseSchema",
+        "routingConfig",
+        "speechConfig",
+    }
+)
 
 
 def _retrieve_task_exception(task: "asyncio.Future[Any]") -> None:
@@ -673,7 +746,9 @@ def _merge_thinking_config(existing: Any, override: Any):
     return merged
 
 
-def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) -> None:
+def _apply_extra_request_params(
+    config, extra_request_params: dict[str, Any], *, warn: bool = True
+) -> None:
     """Merge extra_request_params into a GenerateContentConfig, in place.
 
     `extra_request_params` is a settings-only escape hatch (bundle/settings
@@ -714,18 +789,19 @@ def _apply_extra_request_params(config, extra_request_params: dict[str, Any]) ->
         )
     for key, value in extra_request_params.items():
         if key not in valid_fields:
-            logger.warning(
-                "[PROVIDER] Gemini: extra_request_params key %r is not a "
-                "recognized GenerateContentConfig field -- ignored. See "
-                "google.genai.types.GenerateContentConfig for valid fields.",
-                key,
-            )
+            if warn:
+                logger.warning(
+                    "[PROVIDER] Gemini: extra_request_params key %r is not a "
+                    "recognized GenerateContentConfig field -- ignored. See "
+                    "google.genai.types.GenerateContentConfig for valid fields.",
+                    key,
+                )
             continue
         if key == "thinking_config" and value is not None:
             config.thinking_config = merged_thinking_config
             continue
         existing = getattr(config, key, None)
-        if existing is not None:
+        if existing is not None and warn:
             logger.warning(
                 "[PROVIDER] Gemini: extra_request_params overrides '%s' "
                 "(provider computed %r, extra_request_params sets %r) -- "
@@ -961,11 +1037,21 @@ class GeminiProvider:
         actually configured with -- not a hardcoded id.
         """
         limits = get_limits(self.default_model)
+        capabilities = ["streaming", "tools", "thinking", "json_mode", "batch"]
+        # The adapter is Developer API-only. Individual request shapes still
+        # return no decision when their public serialization cannot be counted.
+        if (
+            isinstance(self._api_key, str)
+            and self._api_key
+            and self.default_model.startswith("gemini-")
+            and has_known_limits(self.default_model)
+        ):
+            capabilities.extend(["request_budget", "request_budget:provider_count"])
         return ProviderInfo(
             id="gemini",
             display_name="Google Gemini",
             credential_env_vars=["GOOGLE_API_KEY", "GEMINI_API_KEY"],
-            capabilities=["streaming", "tools", "thinking", "json_mode", "batch"],
+            capabilities=capabilities,
             defaults={
                 "model": self.default_model,
                 "max_tokens": limits.max_output_tokens,
@@ -1326,7 +1412,58 @@ class GeminiProvider:
             name=tool_name,
         )
 
-    async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    def _repair_missing_tool_results(
+        self, request: ChatRequest, *, record_repairs: bool
+    ) -> list[tuple[int, str, str, dict]]:
+        """Apply the existing tool-result repair to one request and return it."""
+        missing = self._find_missing_tool_results(request.messages)
+        if not missing:
+            return missing
+
+        by_message_index: dict[int, list[tuple[str, str]]] = defaultdict(list)
+        for message_index, call_id, tool_name, _ in missing:
+            by_message_index[message_index].append((call_id, tool_name))
+        for message_index in sorted(by_message_index, reverse=True):
+            synthetics = [
+                self._create_synthetic_result(call_id, tool_name)
+                for call_id, tool_name in by_message_index[message_index]
+            ]
+            if record_repairs:
+                self._repaired_tool_ids.update(
+                    call_id for call_id, _ in by_message_index[message_index]
+                )
+            insert_position = message_index + 1
+            for offset, synthetic in enumerate(synthetics):
+                request.messages.insert(insert_position + offset, synthetic)
+            post_insert_index = insert_position + len(synthetics)
+            if post_insert_index >= len(request.messages):
+                continue
+            next_message = request.messages[post_insert_index]
+            is_real_user_message = (
+                next_message.role == "user"
+                and not getattr(next_message, "tool_call_id", None)
+                and not (
+                    isinstance(next_message.content, str)
+                    and next_message.content.startswith("<system-reminder>")
+                )
+            )
+            if is_real_user_message:
+                request.messages.insert(
+                    post_insert_index,
+                    Message(
+                        role="assistant",
+                        content="[SYSTEM: Tool results received. Continuing conversation.]",
+                    ),
+                )
+        return missing
+
+    async def complete(
+        self,
+        request: ChatRequest,
+        *,
+        request_options: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatResponse:
         """
         Generate completion from ChatRequest.
 
@@ -1337,61 +1474,16 @@ class GeminiProvider:
         Returns:
             ChatResponse with content blocks, tool calls, usage
         """
-        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
-        missing = self._find_missing_tool_results(request.messages)
+        kwargs = self._merge_request_options(request_options, kwargs)
 
+        # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
+        missing = self._repair_missing_tool_results(request, record_repairs=True)
         if missing:
             logger.warning(
                 f"[PROVIDER] Gemini: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
                 f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
-
-            # Group missing results by the index of their source assistant message
-            # so that synthetics are inserted immediately after that message,
-            # preserving the required tool_call → tool_result → ... ordering.
-            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
-            for msg_idx, call_id, tool_name, _ in missing:
-                by_msg_idx[msg_idx].append((call_id, tool_name))
-
-            # Process groups in reverse order so that earlier insertions don't
-            # shift the indices of later groups that haven't been processed yet.
-            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
-                synthetics = []
-                for call_id, tool_name in by_msg_idx[msg_idx]:
-                    synthetics.append(self._create_synthetic_result(call_id, tool_name))
-                    # Track this ID so we don't detect it as missing again in future iterations
-                    self._repaired_tool_ids.add(call_id)
-
-                insert_pos = msg_idx + 1
-                for i, synthetic in enumerate(synthetics):
-                    request.messages.insert(insert_pos + i, synthetic)
-
-                # FM3: If a real user message immediately follows the injected synthetics,
-                # the assistant turn is incomplete (tool calls with no follow-up assistant
-                # text). Insert a minimal assistant bridge to satisfy the API's alternating
-                # turn requirement before the user message.
-                post_insert_idx = insert_pos + len(synthetics)
-                if post_insert_idx < len(request.messages):
-                    next_msg = request.messages[post_insert_idx]
-                    is_real_user_msg = (
-                        next_msg.role == "user"
-                        and not getattr(next_msg, "tool_call_id", None)
-                        and not (
-                            isinstance(next_msg.content, str)
-                            and next_msg.content.startswith("<system-reminder>")
-                        )
-                    )
-                    if is_real_user_msg:
-                        assistant_bridge = Message(
-                            role="assistant",
-                            content=(
-                                "[SYSTEM: Tool results received. Continuing conversation.]"
-                            ),
-                        )
-                        request.messages.insert(post_insert_idx, assistant_bridge)
-
-            # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "provider:tool_sequence_repaired",
@@ -1523,6 +1615,298 @@ class GeminiProvider:
         # --- 3. No directive at all -----------------------------------------
         return genai.types.ThinkingConfig(include_thoughts=include_thoughts)
 
+    @staticmethod
+    def _merge_request_options(
+        request_options: Mapping[str, Any] | None, kwargs: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Merge released Loop options before direct keyword overrides."""
+        if request_options is None:
+            return dict(kwargs)
+        if not isinstance(request_options, Mapping):
+            raise ValueError("request_options must be a mapping or None")
+        merged = dict(request_options)
+        merged.update(kwargs)
+        return merged
+
+    def _build_request_plan(
+        self, request: ChatRequest, *, warn_on_extra: bool = False, **kwargs: Any
+    ) -> _GeminiRequestPlan:
+        """Purely assemble the one GenerateContent plan used by both paths."""
+        from google import genai
+
+        system_msgs = [
+            message for message in request.messages if message.role == "system"
+        ]
+        developer_msgs = [
+            message for message in request.messages if message.role == "developer"
+        ]
+        conversation = [
+            message
+            for message in request.messages
+            if message.role in ("user", "assistant", "tool")
+        ]
+        system_instruction = (
+            "\n\n".join(
+                message.content if isinstance(message.content, str) else ""
+                for message in system_msgs
+            )
+            if system_msgs
+            else None
+        )
+        context_user_messages = []
+        for message in developer_msgs:
+            developer_content = (
+                message.content if isinstance(message.content, str) else ""
+            )
+            context_user_messages.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                f"<context_file>\n{developer_content}\n</context_file>"
+                            )
+                        }
+                    ],
+                }
+            )
+        _, conversation_messages = self._convert_messages(
+            [message.model_dump() for message in conversation]
+        )
+        model = kwargs.get("model", self.default_model)
+        temperature = request.temperature or kwargs.get("temperature", self.temperature)
+        max_tokens = request.max_output_tokens or kwargs.get(
+            "max_tokens", self.max_tokens
+        )
+        config = genai.types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+        config.thinking_config = self._resolve_thinking_config(model, request, kwargs)
+        if system_instruction:
+            config.system_instruction = system_instruction
+        if request.tools:
+            config.tools = [
+                genai.types.Tool(
+                    function_declarations=self._convert_tools_from_request(
+                        request.tools
+                    )
+                )
+            ]
+            config.automatic_function_calling = (
+                genai.types.AutomaticFunctionCallingConfig(disable=True)
+            )
+        _apply_extra_request_params(
+            config,
+            self.extra_request_params,
+            warn=warn_on_extra,
+        )
+        count_unsupported_reason = None
+        if "tools" in self.extra_request_params:
+            count_unsupported_reason = (
+                "extra tools require SDK tool-list transformation"
+            )
+        elif "system_instruction" in self.extra_request_params:
+            count_unsupported_reason = (
+                "extra system instruction requires SDK normalization"
+            )
+        elif "cached_content" in self.extra_request_params and not (
+            isinstance(self.extra_request_params["cached_content"], str)
+            and self.extra_request_params["cached_content"].startswith("cachedContents/")
+        ):
+            count_unsupported_reason = (
+                "cached content must use a canonical resource name"
+            )
+        return _GeminiRequestPlan(
+            model=model,
+            contents=context_user_messages + conversation_messages,
+            config=config,
+            count_unsupported_reason=count_unsupported_reason,
+        )
+
+    @staticmethod
+    def _count_request_payload(plan: _GeminiRequestPlan) -> dict[str, Any]:
+        """Project the public typed plan into REST ``generateContentRequest``.
+
+        The projection intentionally has no catch-all omission path: every
+        serialized SDK field needs a named top-level, generation, local, or
+        unsupported disposition before it can be counted.
+        """
+        from google import genai
+
+        try:
+            contents = [
+                json.loads(
+                    genai.types.Content.model_validate(content).model_dump_json(
+                        by_alias=True,
+                        exclude_none=True,
+                    )
+                )
+                for content in plan.contents
+            ]
+            # extra_request_params is intentionally applied after construction
+            # and can contain mappings. Re-validate through the SDK's public
+            # typed model before serialization so nested aliases match the
+            # SDK's generation transformer as well.
+            config = type(plan.config).model_validate(plan.config.model_dump())
+            serialized_config = json.loads(
+                config.model_dump_json(by_alias=True, exclude_none=True)
+            )
+        except (TypeError, ValueError) as exc:
+            raise _UnsupportedCountRequest(
+                "Gemini request plan cannot be publicly serialized for countTokens"
+            ) from exc
+
+        request: dict[str, Any] = {"contents": contents}
+        generation_config: dict[str, Any] = {}
+        for key, value in serialized_config.items():
+            if key in _COUNT_LOCAL_CONFIG_FIELDS:
+                continue
+            if key == "systemInstruction" and not isinstance(
+                getattr(config, "system_instruction", None), genai.types.Content
+            ):
+                instruction = config.system_instruction
+                value = json.loads(
+                    genai.types.Content(
+                        parts=(
+                            instruction
+                            if isinstance(instruction, list)
+                            else [instruction]
+                        )
+                    ).model_dump_json(by_alias=True, exclude_none=True)
+                )
+            if key in _COUNT_TOP_LEVEL_CONFIG_FIELDS:
+                request[key] = value
+            elif key in _COUNT_GENERATION_CONFIG_FIELDS:
+                generation_config[key] = value
+            elif key in _COUNT_UNSUPPORTED_CONFIG_FIELDS:
+                raise _UnsupportedCountRequest(
+                    f"Gemini Developer countTokens cannot project {key}"
+                )
+            else:
+                raise _UnsupportedCountRequest(
+                    f"Gemini count projection lacks a disposition for {key}"
+                )
+        if generation_config:
+            request["generationConfig"] = generation_config
+        return {"generateContentRequest": request}
+
+    async def _count_request_tokens(self, plan: _GeminiRequestPlan) -> int | None:
+        """Call the documented Developer REST counter without SDK internals."""
+        if not isinstance(self._api_key, str) or not self._api_key:
+            return None
+        if plan.count_unsupported_reason is not None:
+            logger.debug(
+                "[PROVIDER] Gemini native countTokens is unavailable: %s",
+                plan.count_unsupported_reason,
+            )
+            return None
+        try:
+            payload = self._count_request_payload(plan)
+        except _UnsupportedCountRequest:
+            return None
+
+        import httpx
+
+        endpoint = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{quote(plan.model, safe='')}:countTokens"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    endpoint,
+                    headers={"x-goog-api-key": self._api_key},
+                    json=payload,
+                )
+                response.raise_for_status()
+                result = response.json()
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, TypeError, ValueError):
+            logger.debug(
+                "[PROVIDER] Gemini native countTokens was unavailable",
+                exc_info=True,
+            )
+            return None
+
+        total_tokens = result.get("totalTokens") if isinstance(result, dict) else None
+        if (
+            isinstance(total_tokens, bool)
+            or not isinstance(total_tokens, int)
+            or total_tokens < 0
+        ):
+            logger.debug("[PROVIDER] Gemini countTokens returned no valid totalTokens")
+            return None
+        return total_tokens
+
+    async def request_budget(
+        self,
+        request: ChatRequest,
+        *,
+        context_estimate: int,
+        request_options: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        """Return one exact Developer API input count when this request supports it."""
+        if isinstance(context_estimate, bool) or not isinstance(context_estimate, int):
+            raise ValueError("context_estimate must be a nonnegative integer")
+        if context_estimate < 0:
+            raise ValueError("context_estimate must be a nonnegative integer")
+
+        options = self._merge_request_options(request_options, kwargs)
+        # `complete()` repairs incomplete tool pairs before it builds the
+        # wire request. Plan the same repair on a deep copy: probing must not
+        # mutate conversation history or mark an uncommitted repair as done.
+        try:
+            planned_request = request.model_copy(deep=True)
+            self._repair_missing_tool_results(planned_request, record_repairs=False)
+            plan = self._build_request_plan(planned_request, **options)
+        except (AttributeError, TypeError, ValueError):
+            logger.debug(
+                "[PROVIDER] Gemini native countTokens request plan was unavailable",
+                exc_info=True,
+            )
+            return None
+        if (
+            not isinstance(plan.model, str)
+            or not plan.model.startswith("gemini-")
+            or not has_known_limits(plan.model)
+        ):
+            return None
+        max_output_tokens = getattr(plan.config, "max_output_tokens", None)
+        if (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens <= 0
+        ):
+            return None
+        count = await self._count_request_tokens(plan)
+        if count is None:
+            return None
+
+        input_limit = get_limits(plan.model).context_window
+        if count <= input_limit:
+            target = context_estimate
+        elif context_estimate <= 0:
+            target = 0
+        else:
+            target = min(
+                context_estimate - 1,
+                max(1, math.floor(context_estimate * input_limit / count) - 1),
+            )
+        return {
+            "estimated_input_tokens": count,
+            "input_limit_tokens": input_limit,
+            "context_token_budget": target,
+            "max_output_tokens": max_output_tokens,
+            "measurement": {
+                "kind": "provider_count",
+                "source": "gemini.developer.countTokens",
+                "input_tokens": count,
+            },
+        }
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> ChatResponse:
@@ -1539,83 +1923,14 @@ class GeminiProvider:
         Returns:
             ChatResponse with content blocks
         """
-        from google import genai
-
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
-
-        # Separate messages by role
-        system_msgs = [m for m in request.messages if m.role == "system"]
-        developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [
-            m for m in request.messages if m.role in ("user", "assistant", "tool")
-        ]
-
-        # Combine system messages
-        system_instruction = (
-            "\n\n".join(
-                m.content if isinstance(m.content, str) else "" for m in system_msgs
-            )
-            if system_msgs
-            else None
-        )
-
-        # Convert developer messages to XML-wrapped user messages
-        context_user_msgs = []
-        for dev_msg in developer_msgs:
-            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
-            wrapped = f"<context_file>\n{content}\n</context_file>"
-            context_user_msgs.append({"role": "user", "parts": [{"text": wrapped}]})
-
-        # Convert conversation messages
-        conversation_msgs = []
-        if conversation:
-            _, conversation_msgs = self._convert_messages(
-                [m.model_dump() for m in conversation]
-            )
-
-        # Combine: context THEN conversation
-        all_messages = context_user_msgs + conversation_msgs
-
-        # Prepare request parameters
-        model = kwargs.get("model", self.default_model)
-        temperature = request.temperature or kwargs.get("temperature", self.temperature)
-        max_tokens = request.max_output_tokens or kwargs.get(
-            "max_tokens", self.max_tokens
-        )
-
-        # Resolve thinking configuration -- see _resolve_thinking_config for
-        # the full precedence (explicit thinking_budget > reasoning_effort ->
-        # thinking_level, clamped per-model > model default).
-        thinking_config = self._resolve_thinking_config(model, request, kwargs)
-
-        # Build Gemini config with thinking support
-        config = genai.types.GenerateContentConfig(
-            temperature=temperature, max_output_tokens=max_tokens
-        )
-        config.thinking_config = thinking_config
-
-        if system_instruction:
-            config.system_instruction = system_instruction
-
-        # Add tools if provided
-        if request.tools:
-            config.tools = [
-                genai.types.Tool(
-                    function_declarations=self._convert_tools_from_request(
-                        request.tools
-                    )
-                )
-            ]
-            # CRITICAL: Disable automatic function calling - Amplifier handles tool execution
-            config.automatic_function_calling = (
-                genai.types.AutomaticFunctionCallingConfig(disable=True)
-            )
-
-        # extra_request_params merged LAST -- see _apply_extra_request_params
-        # for the full contract (owner-beware override, warns loudly).
-        # Single site: both the streaming and non-streaming call paths below
-        # reuse this same `config` object.
-        _apply_extra_request_params(config, self.extra_request_params)
+        plan = self._build_request_plan(request, warn_on_extra=True, **kwargs)
+        model = plan.model
+        all_messages = plan.contents
+        config = plan.config
+        system_instruction = config.system_instruction
+        temperature = config.temperature
+        max_tokens = config.max_output_tokens
 
         logger.info(f"Gemini API call - model: {model}, messages: {len(all_messages)}")
 

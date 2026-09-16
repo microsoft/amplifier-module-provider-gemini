@@ -412,9 +412,41 @@ The provider implements text generation, tool calling, and thinking support. Mul
 
 Verified live: `thinking_budget=0` on `gemini-3.7-flash` still produced thinking tokens, and there is no "off" `thinking_level`. Thinking is mandatory for Gemini 3.x models regardless of what this provider sends. `reasoning_effort="none"` on these models falls back to the model's own default thinking amount rather than actually disabling it -- this is a vendor limitation, not something this provider can work around.
 
+### Native preflight counting is Gemini Developer API-only
+
+For a configured, limit-tabled `gemini-*` Developer API model, `request_budget()` can call
+`POST /v1beta/models/{model}:countTokens` with the documented nested
+`generateContentRequest` body. It uses the same provider-owned request plan as
+generation and includes converted system/developer messages, inline images,
+thought signatures, function declarations/results, `toolConfig`,
+`safetySettings`, `generationConfig`, and `cachedContent`.
+
+The counter uses the response's `totalTokens` as the input measurement. It does
+not add `cachedContentTokenCount` a second time, does not estimate output, and
+does not increase the documented raw input limit when a caller lowers
+`max_output_tokens`. A missing/malformed response, HTTP failure, or request
+that cannot be publicly serialized returns no budget decision rather than a
+partial native count. This includes the Developer-unsupported or
+transformer-specific `labels`, routing/model-selection, response-schema,
+speech/image/audio, and Model Armor extras. Cancellation propagates without
+starting generation. An unknown model ID is also unavailable: an exact count
+cannot justify an inferred input-window admission limit. An `extra_request_params`
+override for `tools` or `system_instruction`, and a noncanonical
+`cached_content` value, are likewise unavailable rather than reimplementing
+the SDK's private normalization.
+
+This adapter is not Vertex AI support and does not use
+`client.models.count_tokens`: that Python helper cannot send a full Gemini
+Developer `generateContentRequest`. The request-projection wire regression is
+written against `google-genai` 2.23.0, the retained DTU version. The checked-in
+`uv.lock` still pins 1.46.0 despite this package's pre-existing `>=1.56.0`
+floor; this baseline lock discrepancy is intentionally not upgraded here.
+
 ## Dependencies
 
 - `google-genai>=1.56.0` - Official Google AI Python SDK. 1.56.0 is the floor because it's the first release whose `ThinkingConfig` exposes the full `thinking_level` enum (`minimal`/`low`/`medium`/`high`) this provider needs -- verified by probing the SDK's own installed types directly: 1.46.0 has no `thinking_level` field at all; 1.51.0 adds it with only `LOW`/`HIGH`; 1.56.0 completes the four-level enum.
+- `httpx>=0.28.1` - Async transport for the documented Developer
+  `countTokens` REST endpoint.
 
 ## Development
 
