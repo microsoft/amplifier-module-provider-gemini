@@ -174,16 +174,16 @@ def _count_system_instruction_content(instruction: Any, types: Any) -> Any:
     ``GenerateContentConfig`` accepts strings and public ``Part``/``Content``
     values for generation.  The REST counter accepts only a content object, so
     preserve a supplied ``Content`` (including its role) and wrap all
-    part-level forms in one content object.  Other values would require SDK
+    part-level forms with the SDK's default ``user`` role. Other values require SDK
     normalization beyond this bounded public projection.
     """
     try:
         if isinstance(instruction, types.Content):
             return instruction
         if isinstance(instruction, types.Part):
-            return types.Content(parts=[instruction])
+            return types.Content(role="user", parts=[instruction])
         if isinstance(instruction, str):
-            return types.Content(parts=[types.Part(text=instruction)])
+            return types.Content(role="user", parts=[types.Part(text=instruction)])
         if isinstance(instruction, list):
             parts = [
                 part
@@ -193,11 +193,13 @@ def _count_system_instruction_content(instruction: Any, types: Any) -> Any:
                 else types.Part.model_validate(part)
                 for part in instruction
             ]
-            return types.Content(parts=parts)
+            return types.Content(role="user", parts=parts)
         if isinstance(instruction, Mapping):
             if "parts" in instruction:
                 return types.Content.model_validate(instruction)
-            return types.Content(parts=[types.Part.model_validate(instruction)])
+            return types.Content(
+                role="user", parts=[types.Part.model_validate(instruction)]
+            )
     except (TypeError, ValueError):
         pass
     raise _UnsupportedCountRequest(

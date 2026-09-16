@@ -190,7 +190,8 @@ async def test_request_budget_normalizes_plain_system_and_developer_messages(
     )
     payload = sent[0]["generateContentRequest"]
     assert payload["systemInstruction"] == {
-        "parts": [{"text": "System instructions"}]
+        "parts": [{"text": "System instructions"}],
+        "role": "user",
     }
     assert payload["contents"][0] == {
         "role": "user",
@@ -206,11 +207,16 @@ def test_system_instruction_normalization_accepts_public_part_content_and_list()
     content = types.Content(role="user", parts=[part])
 
     assert _count_system_instruction_content(part, types).parts == [part]
+    assert _count_system_instruction_content(part, types).role == "user"
     assert _count_system_instruction_content(content, types) is content
+    roleless_content = types.Content(parts=[part])
+    assert _count_system_instruction_content(roleless_content, types) is roleless_content
+    assert roleless_content.role is None
     assert _count_system_instruction_content(
         ["First instruction", part], types
     ).model_dump(exclude_none=True) == {
-        "parts": [{"text": "First instruction"}, {"text": "Part instruction"}]
+        "parts": [{"text": "First instruction"}, {"text": "Part instruction"}],
+        "role": "user",
     }
 
 
