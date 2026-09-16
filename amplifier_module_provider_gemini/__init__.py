@@ -49,6 +49,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from ._capabilities import DEFAULT_LIMITS
 from ._capabilities import get_limits
+from ._capabilities import has_exact_model_limits
 from ._capabilities import has_known_limits
 from ._cost import compute_cost
 from amplifier_core.message_models import ChatResponse
@@ -122,27 +123,11 @@ _BUDGET_UNAVAILABLE_INVALID_OUTPUT_LIMIT = "invalid_output_limit"
 _BUDGET_UNAVAILABLE_HTTP_ERROR = "http_error"
 _BUDGET_UNAVAILABLE_INVALID_RESPONSE = "invalid_response"
 
-#: Upper bound on a model id copied into telemetry. Real Gemini ids are far
-#: shorter; anything longer is not a model id this counter could have used.
-_BUDGET_EVENT_MAX_MODEL_LENGTH = 128
-
-
 def _safe_event_model(model: Any) -> str | None:
-    """Return *model* only when it is safe to publish verbatim.
-
-    ``model`` reaches this counter from caller-controlled request options and
-    can be an arbitrary object. Telemetry must never serialize an arbitrary
-    object (``repr`` of a custom class can carry credentials or state), so
-    anything that is not a plain, bounded, printable string is omitted
-    entirely rather than coerced.
-    """
-    if not isinstance(model, str) or type(model) is not str:
-        return None
-    if not model or len(model) > _BUDGET_EVENT_MAX_MODEL_LENGTH:
-        return None
-    if any(character.isspace() or not character.isprintable() for character in model):
-        return None
-    return model
+    """Publish only an exact documented ID, never caller-controlled suffixes."""
+    # Limit lookup intentionally accepts suffixed aliases, but telemetry must
+    # not expose unknown strings, even when they start with a known model ID.
+    return model if type(model) is str and has_exact_model_limits(model) else None
 
 
 def _sdk_environment_uses_vertexai() -> bool:
@@ -2115,6 +2100,7 @@ class GeminiProvider:
             logger.debug("[PROVIDER] Gemini countTokens returned no valid totalTokens")
             return None, _BUDGET_UNAVAILABLE_INVALID_RESPONSE, None
         return total_tokens, None, None
+
     async def request_budget(
         self,
         request: ChatRequest,

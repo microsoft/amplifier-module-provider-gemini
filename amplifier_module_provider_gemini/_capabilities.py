@@ -37,7 +37,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["ModelLimits", "get_limits", "has_known_limits", "DEFAULT_LIMITS"]
+__all__ = [
+    "ModelLimits",
+    "get_limits",
+    "has_known_limits",
+    "has_exact_model_limits",
+    "DEFAULT_LIMITS",
+]
 
 
 @dataclass(frozen=True)
@@ -96,3 +102,8 @@ def get_limits(model_id: str) -> ModelLimits:
 def has_known_limits(model_id: str) -> bool:
     """Whether a model has a documented exact/prefix token-limit entry."""
     return model_id in _LIMITS or any(model_id.startswith(known) for known in _LIMITS)
+
+
+def has_exact_model_limits(model_id: str) -> bool:
+    """Whether the literal model ID is documented, without trusting a suffix."""
+    return model_id in _LIMITS

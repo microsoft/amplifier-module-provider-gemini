@@ -753,8 +753,47 @@ async def test_unsupported_model_reports_unsupported_model(
         "provider": "gemini",
         "method": "developer.countTokens",
         "reason": "unsupported_model",
-        "model": "gemini-9.9-unverified",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_hooks", [True, False])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "SYNTHETIC-PRIVATE-MODEL-VALUE",
+        "https://unit.test/SYNTHETIC-PRIVATE-MODEL-VALUE",
+        "gemini-3.8-flash-SYNTHETIC-PRIVATE-MODEL-VALUE",
+    ],
+    ids=["printable", "url", "known-prefix-with-private-suffix"],
+)
+async def test_unknown_model_text_is_not_published(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    with_hooks: bool,
+    model: str,
+) -> None:
+    # Prefix-compatible aliases may pass limit lookup. A route rejection keeps
+    # this test offline while exercising the same diagnostic sanitization.
+    monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    _refuse_count(monkeypatch, "a rejected route must not reach countTokens")
+    provider, coordinator = _budget_provider()
+    if not with_hooks:
+        provider.coordinator = None
+    with caplog.at_level("DEBUG"):
+        decision = await provider.request_budget(
+            _request(), context_estimate=400, model=model
+        )
+    assert decision is None
+    events = _unavailable_events(coordinator)
+    if with_hooks:
+        assert len(events) == 1
+        assert "model" not in events[0]
+    else:
+        assert "countTokens unavailable" in caplog.text
+    assert model not in json.dumps(events)
+    assert "SYNTHETIC-PRIVATE-MODEL-VALUE" not in caplog.text
 
 
 @pytest.mark.asyncio
