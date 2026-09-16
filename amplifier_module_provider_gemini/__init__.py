@@ -49,6 +49,7 @@ from amplifier_core.utils import redact_secrets
 from amplifier_core.message_models import ChatRequest
 from ._capabilities import DEFAULT_LIMITS
 from ._capabilities import get_limits
+from ._capabilities import has_exact_model_limits
 from ._capabilities import has_known_limits
 from ._cost import compute_cost
 from amplifier_core.message_models import ChatResponse
@@ -101,6 +102,32 @@ _DEFAULT_CLOSE_TIMEOUT: float = 5.0
 
 class _UnsupportedCountRequest(ValueError):
     """The finalized request cannot be represented by Developer countTokens."""
+
+
+# `request_budget()` returns None when a native count cannot be produced. That
+# is a correct decision, but on its own it is indistinguishable from "this
+# provider has no counter at all" -- the exact ambiguity a live session hit
+# (two estimate-based truncations, no successful provider_budget event, and no
+# way to tell which precondition failed). This event carries the REASON out,
+# without carrying anything sensitive with it.
+PROVIDER_REQUEST_BUDGET_UNAVAILABLE = "provider:request_budget_unavailable"
+
+# Fixed, safe reason codes. These are the entire diagnostic vocabulary: no
+# exception text, response body, request body, URL, credential, or environment
+# value is ever placed in the payload or in the matching log line.
+_BUDGET_UNAVAILABLE_UNSUPPORTED_MODEL = "unsupported_model"
+_BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE = "unsupported_route"
+_BUDGET_UNAVAILABLE_REQUEST_PLAN = "request_plan_unavailable"
+_BUDGET_UNAVAILABLE_REQUEST_PROJECTION = "request_projection_unavailable"
+_BUDGET_UNAVAILABLE_INVALID_OUTPUT_LIMIT = "invalid_output_limit"
+_BUDGET_UNAVAILABLE_HTTP_ERROR = "http_error"
+_BUDGET_UNAVAILABLE_INVALID_RESPONSE = "invalid_response"
+
+def _safe_event_model(model: Any) -> str | None:
+    """Publish only an exact documented ID, never caller-controlled suffixes."""
+    # Limit lookup intentionally accepts suffixed aliases, but telemetry must
+    # not expose unknown strings, even when they start with a known model ID.
+    return model if type(model) is str and has_exact_model_limits(model) else None
 
 
 def _sdk_environment_uses_vertexai() -> bool:
@@ -423,6 +450,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "llm:request",
             "llm:response",
             "provider:concurrency",
+            "provider:request_budget_unavailable",
             "provider:tool_sequence_repaired",
             "thinking:final",
             "llm:stream_block_start",
@@ -1129,26 +1157,87 @@ class GeminiProvider:
             self._count_route_client = self._client
         return self._client
 
-    def _native_counting_available(self, model: Any) -> bool:
-        """Return whether a fixed Developer countTokens request can match generation."""
+    def _native_counting_unavailable_reason(self, model: Any) -> str | None:
+        """Return the safe reason code blocking native counting, or ``None``.
+
+        Splits the single eligibility predicate into the two distinguishable
+        causes a reader of the diagnostic actually needs: the MODEL is not one
+        this counter can count, or the ROUTE the SDK would generate on is not
+        the fixed Developer endpoint this counter posts to.
+        """
         if (
-            not isinstance(self._api_key, str)
-            or not self._api_key
-            or not isinstance(model, str)
+            not isinstance(model, str)
             or not model.startswith("gemini-")
             or not has_known_limits(model)
         ):
-            return False
+            return _BUDGET_UNAVAILABLE_UNSUPPORTED_MODEL
+        if not isinstance(self._api_key, str) or not self._api_key:
+            # No usable Developer credential means the fixed Developer counting
+            # route cannot be dispatched at all -- a route fact, not a model one.
+            return _BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE
         if self._client is not None:
             # google-genai exposes ``Client.vertexai`` but has no established
             # public base_url property. A false value therefore cannot prove
             # an injected client is canonical, so only our creation snapshot
             # is eligible.
-            return (
+            canonical = (
                 self._client is self._count_route_client
                 and self._client_uses_canonical_developer_route is True
             )
-        return _sdk_environment_uses_canonical_developer_route()
+        else:
+            canonical = _sdk_environment_uses_canonical_developer_route()
+        return None if canonical else _BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE
+
+    def _native_counting_available(self, model: Any) -> bool:
+        """Return whether a fixed Developer countTokens request can match generation."""
+        return self._native_counting_unavailable_reason(model) is None
+
+    async def _report_request_budget_unavailable(
+        self, reason: str, model: Any, *, http_status: int | None = None
+    ) -> None:
+        """Best-effort: publish why this budget call produced no native count.
+
+        Called exactly once per failed ``request_budget()`` invocation, from
+        ``request_budget`` alone, so a helper and its caller never double-report
+        the same failure. Never raises: a broken diagnostic hook must not turn a
+        successful or legitimately-None count into a product failure, so an
+        ordinary hook failure is caught -- ``BaseException`` (and therefore
+        cancellation) is deliberately NOT caught and keeps propagating.
+        """
+        payload: dict[str, Any] = {
+            "provider": "gemini",
+            "method": "developer.countTokens",
+            "reason": reason,
+        }
+        safe_model = _safe_event_model(model)
+        if safe_model is not None:
+            payload["model"] = safe_model
+        if isinstance(http_status, int) and not isinstance(http_status, bool):
+            payload["http_status"] = http_status
+
+        if not (self.coordinator and hasattr(self.coordinator, "hooks")):
+            # No observability channel exists: the same safe reason still has
+            # to be visible, so state it once at warning level.
+            logger.warning(
+                "[PROVIDER] Gemini native countTokens unavailable (reason=%s, "
+                "model=%s, http_status=%s)",
+                reason,
+                safe_model,
+                payload.get("http_status"),
+            )
+            return
+        try:
+            await self.coordinator.hooks.emit(
+                PROVIDER_REQUEST_BUDGET_UNAVAILABLE, payload
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "[PROVIDER] Gemini request_budget diagnostic hook failed "
+                "(reason=%s)",
+                reason,
+            )
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata.
@@ -1814,9 +1903,17 @@ class GeminiProvider:
                     )
                 )
             ]
-            config.automatic_function_calling = (
-                genai.types.AutomaticFunctionCallingConfig(disable=True)
-            )
+        # Disable the SDK's automatic function calling on EVERY request, not
+        # only tool-carrying ones. AFC is an SDK-local execution loop: this
+        # provider returns tool calls to the Loop and never lets the SDK call a
+        # Python callable on its own. Setting it unconditionally keeps one
+        # SDK-facing shape for both request kinds. It stays an SDK-local field
+        # excluded from the count projection (_COUNT_LOCAL_CONFIG_FIELDS), so
+        # it does not change the countTokens body. extra_request_params is
+        # still applied afterwards, so an explicit supported override wins.
+        config.automatic_function_calling = (
+            genai.types.AutomaticFunctionCallingConfig(disable=True)
+        )
         _apply_extra_request_params(
             config,
             self.extra_request_params,
@@ -1879,7 +1976,18 @@ class GeminiProvider:
             ) from exc
 
         _match_sdk_generation_wire(serialized_config)
-        request: dict[str, Any] = {"contents": contents}
+        # REST CountTokensRequest's `generateContentRequest` variant carries a
+        # nested GenerateContentRequest whose `model` field is REQUIRED
+        # (google/ai/generativelanguage/v1beta/generative_service.proto). It is a
+        # resource name, not a bare id, so it is prefixed here. Count eligibility
+        # only ever admits bare `gemini-` ids (see
+        # `_native_counting_unavailable_reason`), so this cannot double-prefix.
+        # The endpoint path is built from the same `plan.model`, so the URL and
+        # this field always name the same effective model.
+        request: dict[str, Any] = {
+            "model": f"models/{plan.model}",
+            "contents": contents,
+        }
         generation_config: dict[str, Any] = {}
         for key, value in serialized_config.items():
             if key in _COUNT_LOCAL_CONFIG_FIELDS:
@@ -1917,20 +2025,32 @@ class GeminiProvider:
             request["generationConfig"] = generation_config
         return {"generateContentRequest": request}
 
-    async def _count_request_tokens(self, plan: _GeminiRequestPlan) -> int | None:
-        """Call the documented Developer REST counter without SDK internals."""
-        if not self._native_counting_available(plan.model):
-            return None
+    async def _count_request_tokens(
+        self, plan: _GeminiRequestPlan
+    ) -> tuple[int | None, str | None, int | None]:
+        """Call the documented Developer REST counter without SDK internals.
+
+        Returns ``(count, reason, http_status)``; exactly one of ``count`` and
+        ``reason`` is ever set. This helper NEVER emits the diagnostic event
+        itself -- it hands the safe reason code back to ``request_budget()``,
+        which is the single reporting site. One failed budget call therefore
+        produces exactly one report, not one per layer.
+        """
+        route_or_model_reason = self._native_counting_unavailable_reason(plan.model)
+        if route_or_model_reason is not None:
+            return None, route_or_model_reason, None
         if plan.count_unsupported_reason is not None:
+            # plan.count_unsupported_reason is an internal English string kept
+            # for local debugging; only the fixed code leaves this module.
             logger.debug(
                 "[PROVIDER] Gemini native countTokens is unavailable: %s",
                 plan.count_unsupported_reason,
             )
-            return None
+            return None, _BUDGET_UNAVAILABLE_REQUEST_PROJECTION, None
         try:
             payload = self._count_request_payload(plan)
         except _UnsupportedCountRequest:
-            return None
+            return None, _BUDGET_UNAVAILABLE_REQUEST_PROJECTION, None
 
         import httpx
 
@@ -1949,12 +2069,27 @@ class GeminiProvider:
                 result = response.json()
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPError, TypeError, ValueError):
+        except httpx.HTTPStatusError as exc:
+            # The status code is a safe bounded integer. The response body,
+            # request body, URL and exception text stay unlogged on purpose.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if isinstance(status, bool) or not isinstance(status, int):
+                status = None
             logger.debug(
-                "[PROVIDER] Gemini native countTokens was unavailable",
-                exc_info=True,
+                "[PROVIDER] Gemini native countTokens returned an error status "
+                "(http_status=%s)",
+                status,
             )
-            return None
+            return None, _BUDGET_UNAVAILABLE_HTTP_ERROR, status
+        except httpx.HTTPError:
+            logger.debug("[PROVIDER] Gemini native countTokens transport failed")
+            return None, _BUDGET_UNAVAILABLE_HTTP_ERROR, None
+        except (TypeError, ValueError):
+            # Unserializable request payload, or an undecodable response body.
+            logger.debug(
+                "[PROVIDER] Gemini native countTokens produced no decodable result"
+            )
+            return None, _BUDGET_UNAVAILABLE_INVALID_RESPONSE, None
 
         total_tokens = result.get("totalTokens") if isinstance(result, dict) else None
         if (
@@ -1963,8 +2098,8 @@ class GeminiProvider:
             or total_tokens < 0
         ):
             logger.debug("[PROVIDER] Gemini countTokens returned no valid totalTokens")
-            return None
-        return total_tokens
+            return None, _BUDGET_UNAVAILABLE_INVALID_RESPONSE, None
+        return total_tokens, None, None
 
     async def request_budget(
         self,
@@ -1981,9 +2116,10 @@ class GeminiProvider:
             raise ValueError("context_estimate must be a nonnegative integer")
 
         options = self._merge_request_options(request_options, kwargs)
-        if not self._native_counting_available(
-            options.get("model", self.default_model)
-        ):
+        selected_model = options.get("model", self.default_model)
+        reason = self._native_counting_unavailable_reason(selected_model)
+        if reason is not None:
+            await self._report_request_budget_unavailable(reason, selected_model)
             return None
         # `complete()` repairs incomplete tool pairs before it builds the
         # wire request. Plan the same repair on a deep copy: probing must not
@@ -1993,12 +2129,18 @@ class GeminiProvider:
             self._repair_missing_tool_results(planned_request, record_repairs=False)
             plan = self._build_request_plan(planned_request, **options)
         except (AttributeError, TypeError, ValueError):
+            # No exc_info: a traceback here can carry request content into the
+            # log. The fixed code is the whole diagnostic.
             logger.debug(
-                "[PROVIDER] Gemini native countTokens request plan was unavailable",
-                exc_info=True,
+                "[PROVIDER] Gemini native countTokens request plan was unavailable"
+            )
+            await self._report_request_budget_unavailable(
+                _BUDGET_UNAVAILABLE_REQUEST_PLAN, selected_model
             )
             return None
-        if not self._native_counting_available(plan.model):
+        reason = self._native_counting_unavailable_reason(plan.model)
+        if reason is not None:
+            await self._report_request_budget_unavailable(reason, plan.model)
             return None
         max_output_tokens = getattr(plan.config, "max_output_tokens", None)
         if (
@@ -2006,9 +2148,17 @@ class GeminiProvider:
             or not isinstance(max_output_tokens, int)
             or max_output_tokens <= 0
         ):
+            await self._report_request_budget_unavailable(
+                _BUDGET_UNAVAILABLE_INVALID_OUTPUT_LIMIT, plan.model
+            )
             return None
-        count = await self._count_request_tokens(plan)
+        count, reason, http_status = await self._count_request_tokens(plan)
         if count is None:
+            await self._report_request_budget_unavailable(
+                reason or _BUDGET_UNAVAILABLE_INVALID_RESPONSE,
+                plan.model,
+                http_status=http_status,
+            )
             return None
 
         input_limit = get_limits(plan.model).context_window

@@ -421,6 +421,26 @@ generation and includes converted system/developer messages, inline images,
 thought signatures, function declarations/results, `toolConfig`,
 `safetySettings`, `generationConfig`, and `cachedContent`.
 
+The nested `generateContentRequest` carries its own REQUIRED `model` field
+(`models/<selected model>`), per the REST `CountTokensRequest` contract. It is
+always built from the same selected model as the `:countTokens` endpoint path,
+so the URL and the counted body can never name different models.
+
+When `request_budget()` returns no decision, it also makes a best-effort
+`provider:request_budget_unavailable` observability event carrying
+`provider`, `method`, an optional selected `model`, a fixed `reason` code, and an
+integer `http_status` when one exists. The reason codes are
+`unsupported_model`, `unsupported_route`, `request_plan_unavailable`,
+`request_projection_unavailable`, `invalid_output_limit`, `http_error`, and
+`invalid_response`. Exactly one event is emitted per failed budget call, and a
+successful count emits none. Nothing else travels with it: no exception text,
+response body, request body, URL, credential, or environment value, and a
+model ID is included only when it exactly matches a documented ID in the
+provider's limit table. Unknown strings, URLs, suffixed aliases and non-string
+values are omitted rather than coerced; limit lookup behavior is unchanged.
+A failing subscriber cannot turn a count into a product failure; with no hooks
+channel at all the same reason is logged as a warning instead.
+
 The counter uses the response's `totalTokens` as the input measurement. It does
 not add `cachedContentTokenCount` a second time, does not estimate output, and
 does not increase the documented raw input limit when a caller lowers
