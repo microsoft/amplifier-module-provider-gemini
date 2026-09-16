@@ -438,7 +438,8 @@ the SDK's private normalization.
 This adapter is not Vertex AI support and does not use
 `client.models.count_tokens`: that Python helper cannot send a full Gemini
 Developer `generateContentRequest`. The request-projection wire regression is
-written against `google-genai` 2.23.0, the retained DTU version. The checked-in
+written against `google-genai` 2.23.0, the retained DTU version; no other SDK
+version is covered by this exact generation/count wire check. The checked-in
 `uv.lock` still pins 1.46.0 despite this package's pre-existing `>=1.56.0`
 floor; this baseline lock discrepancy is intentionally not upgraded here.
 

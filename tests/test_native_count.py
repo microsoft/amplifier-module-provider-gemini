@@ -19,7 +19,11 @@ from amplifier_core.message_models import (
     ToolSpec,
 )
 
-from amplifier_module_provider_gemini import GeminiProvider
+from amplifier_module_provider_gemini import (
+    GeminiProvider,
+    _GeminiRequestPlan,
+    _count_system_instruction_content,
+)
 
 
 def _provider(*, use_streaming: bool = False) -> GeminiProvider:
@@ -152,6 +156,98 @@ async def test_count_projection_matches_the_real_sdk_generation_body(
     finally:
         await client.aio.aclose()
         client.close()
+
+
+@pytest.mark.asyncio
+async def test_request_budget_normalizes_plain_system_and_developer_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain system/developer text reaches countTokens as valid content."""
+    sent: list[dict[str, Any]] = []
+    real_client = httpx.AsyncClient
+
+    def client_factory(*, timeout: float) -> httpx.AsyncClient:
+        return real_client(
+            timeout=timeout,
+            transport=httpx.MockTransport(
+                lambda request: sent.append(json.loads(request.content))
+                or httpx.Response(200, json={"totalTokens": 100})
+            ),
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    assert await _provider().request_budget(
+        ChatRequest(
+            messages=[
+                Message(role="system", content="System instructions"),
+                Message(role="developer", content="Developer instructions"),
+                Message(role="user", content="User request"),
+            ],
+            max_output_tokens=321,
+        ),
+        context_estimate=400,
+    )
+    payload = sent[0]["generateContentRequest"]
+    assert payload["systemInstruction"] == {
+        "parts": [{"text": "System instructions"}]
+    }
+    assert payload["contents"][0] == {
+        "role": "user",
+        "parts": [{"text": "<context_file>\nDeveloper instructions\n</context_file>"}],
+    }
+
+
+def test_system_instruction_normalization_accepts_public_part_content_and_list() -> None:
+    """The projection supports the public instruction representations."""
+    from google.genai import types
+
+    part = types.Part(text="Part instruction")
+    content = types.Content(role="user", parts=[part])
+
+    assert _count_system_instruction_content(part, types).parts == [part]
+    assert _count_system_instruction_content(content, types) is content
+    assert _count_system_instruction_content(
+        ["First instruction", part], types
+    ).model_dump(exclude_none=True) == {
+        "parts": [{"text": "First instruction"}, {"text": "Part instruction"}]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instruction", [object(), [object()]])
+async def test_request_budget_returns_unavailable_for_unsupported_system_instruction(
+    monkeypatch: pytest.MonkeyPatch, instruction: object
+) -> None:
+    """Unsupported public forms must not raise or reach countTokens."""
+    provider = _provider()
+    plan = provider._build_request_plan(
+        ChatRequest(messages=[Message(role="user", content="User request")])
+    )
+    plan.config.system_instruction = instruction
+    monkeypatch.setattr(
+        provider,
+        "_build_request_plan",
+        lambda *_args, **_kwargs: _GeminiRequestPlan(
+            model=plan.model,
+            contents=plan.contents,
+            config=plan.config,
+            count_unsupported_reason=plan.count_unsupported_reason,
+        ),
+    )
+
+    def no_count_client(*, timeout: float) -> httpx.AsyncClient:
+        raise AssertionError("unsupported request must not reach countTokens")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_count_client)
+
+    assert (
+        await provider.request_budget(
+            ChatRequest(messages=[Message(role="user", content="User request")]),
+            context_estimate=400,
+        )
+        is None
+    )
 
 
 def test_direct_keywords_override_released_request_options() -> None:
@@ -332,7 +428,20 @@ async def test_request_budget_cancellation_does_not_dispatch_generation(
     task = asyncio.create_task(
         provider.request_budget(_request(), context_estimate=400)
     )
-    await started.wait()
+    started_wait = asyncio.create_task(started.wait())
+    done, _ = await asyncio.wait(
+        {task, started_wait}, timeout=1, return_when=asyncio.FIRST_COMPLETED
+    )
+    if task in done:
+        started_wait.cancel()
+        await asyncio.gather(started_wait, return_exceptions=True)
+        await task
+    if not started_wait.done():
+        started_wait.cancel()
+        task.cancel()
+        await asyncio.gather(started_wait, task, return_exceptions=True)
+        pytest.fail("countTokens did not dispatch within one second")
+    assert started.is_set(), "countTokens did not dispatch within one second"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

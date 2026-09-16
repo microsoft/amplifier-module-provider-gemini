@@ -168,6 +168,78 @@ _COUNT_UNSUPPORTED_CONFIG_FIELDS = frozenset(
 )
 
 
+def _count_system_instruction_content(instruction: Any, types: Any) -> Any:
+    """Normalize documented public system-instruction forms to ``Content``.
+
+    ``GenerateContentConfig`` accepts strings and public ``Part``/``Content``
+    values for generation.  The REST counter accepts only a content object, so
+    preserve a supplied ``Content`` (including its role) and wrap all
+    part-level forms in one content object.  Other values would require SDK
+    normalization beyond this bounded public projection.
+    """
+    try:
+        if isinstance(instruction, types.Content):
+            return instruction
+        if isinstance(instruction, types.Part):
+            return types.Content(parts=[instruction])
+        if isinstance(instruction, str):
+            return types.Content(parts=[types.Part(text=instruction)])
+        if isinstance(instruction, list):
+            parts = [
+                part
+                if isinstance(part, types.Part)
+                else types.Part(text=part)
+                if isinstance(part, str)
+                else types.Part.model_validate(part)
+                for part in instruction
+            ]
+            return types.Content(parts=parts)
+        if isinstance(instruction, Mapping):
+            if "parts" in instruction:
+                return types.Content.model_validate(instruction)
+            return types.Content(parts=[types.Part.model_validate(instruction)])
+    except (TypeError, ValueError):
+        pass
+    raise _UnsupportedCountRequest(
+        "Gemini system instruction cannot be publicly serialized for countTokens"
+    )
+
+
+def _match_sdk_generation_wire(serialized_config: dict[str, Any]) -> None:
+    """Apply the two SDK 2.23.0 nested wire spellings to a typed config dump.
+
+    The public typed aliases are not universally the aliases emitted by the
+    SDK's ``generate_content`` request transformer.  Keep this deliberately
+    narrow: broad recursive alias rewriting would hide new unsupported fields
+    instead of making counting unavailable.
+    """
+    tools = serialized_config.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            declarations = tool.get("functionDeclarations")
+            if not isinstance(declarations, list):
+                continue
+            for declaration in declarations:
+                if (
+                    isinstance(declaration, dict)
+                    and "parametersJsonSchema" in declaration
+                ):
+                    declaration["parameters_json_schema"] = declaration.pop(
+                        "parametersJsonSchema"
+                    )
+
+    thinking_config = serialized_config.get("thinkingConfig")
+    if isinstance(thinking_config, dict):
+        for public_alias, generation_key in (
+            ("includeThoughts", "include_thoughts"),
+            ("thinkingLevel", "thinking_level"),
+        ):
+            if public_alias in thinking_config:
+                thinking_config[generation_key] = thinking_config.pop(public_alias)
+
+
 def _retrieve_task_exception(task: "asyncio.Future[Any]") -> None:
     """Consume an abandoned close task's exception.
 
@@ -1757,6 +1829,7 @@ class GeminiProvider:
                 "Gemini request plan cannot be publicly serialized for countTokens"
             ) from exc
 
+        _match_sdk_generation_wire(serialized_config)
         request: dict[str, Any] = {"contents": contents}
         generation_config: dict[str, Any] = {}
         for key, value in serialized_config.items():
@@ -1766,15 +1839,19 @@ class GeminiProvider:
                 getattr(config, "system_instruction", None), genai.types.Content
             ):
                 instruction = config.system_instruction
-                value = json.loads(
-                    genai.types.Content(
-                        parts=(
-                            instruction
-                            if isinstance(instruction, list)
-                            else [instruction]
-                        )
-                    ).model_dump_json(by_alias=True, exclude_none=True)
-                )
+                try:
+                    value = json.loads(
+                        _count_system_instruction_content(
+                            instruction, genai.types
+                        ).model_dump_json(by_alias=True, exclude_none=True)
+                    )
+                except _UnsupportedCountRequest:
+                    raise
+                except (TypeError, ValueError) as exc:
+                    raise _UnsupportedCountRequest(
+                        "Gemini system instruction cannot be publicly serialized "
+                        "for countTokens"
+                    ) from exc
             if key in _COUNT_TOP_LEVEL_CONFIG_FIELDS:
                 request[key] = value
             elif key in _COUNT_GENERATION_CONFIG_FIELDS:
