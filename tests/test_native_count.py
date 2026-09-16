@@ -588,3 +588,36 @@ async def test_injected_client_with_unknown_route_fails_closed(
 
     assert "request_budget" not in provider.get_info().capabilities
     assert await provider.request_budget(_request(), context_estimate=400) is None
+
+
+@pytest.mark.asyncio
+async def test_replaced_client_cannot_inherit_a_canonical_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A route snapshot belongs to its client, not every later injected client."""
+    for name in (
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    provider = _provider()
+    client = provider.client
+    assert client.vertexai is False
+    assert "request_budget:provider_count" in provider.get_info().capabilities
+    provider._client = object()
+
+    def no_count_client(*, timeout: float) -> httpx.AsyncClient:
+        raise AssertionError("a replacement client must not inherit count eligibility")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_count_client)
+    try:
+        assert "request_budget" not in provider.get_info().capabilities
+        assert await provider.request_budget(_request(), context_estimate=400) is None
+    finally:
+        provider._client = client
+        await provider.close()
+
+    # Reinjecting the old closed client must not restore its discarded stamp.
+    provider._client = client
+    assert "request_budget" not in provider.get_info().capabilities

@@ -1011,6 +1011,7 @@ class GeminiProvider:
         # established through public SDK API. Such clients fail closed for the
         # fixed Developer counter; generation keeps using the caller's client.
         self._client_uses_canonical_developer_route: bool | None = None
+        self._count_route_client: Any = None
         self._add_cost = (
             add_cost if add_cost is not None else lambda cost, model=None: None
         )
@@ -1125,6 +1126,7 @@ class GeminiProvider:
             route_is_canonical = _sdk_environment_uses_canonical_developer_route()
             self._client = genai.Client(api_key=self._api_key)
             self._client_uses_canonical_developer_route = route_is_canonical
+            self._count_route_client = self._client
         return self._client
 
     def _native_counting_available(self, model: Any) -> bool:
@@ -1142,7 +1144,10 @@ class GeminiProvider:
             # public base_url property. A false value therefore cannot prove
             # an injected client is canonical, so only our creation snapshot
             # is eligible.
-            return self._client_uses_canonical_developer_route is True
+            return (
+                self._client is self._count_route_client
+                and self._client_uses_canonical_developer_route is True
+            )
         return _sdk_environment_uses_canonical_developer_route()
 
     def get_info(self) -> ProviderInfo:
@@ -3404,6 +3409,8 @@ class GeminiProvider:
         `Client.close()` runs in a worker thread (`asyncio.to_thread`).
         """
         client = self._client
+        self._count_route_client = None
+        self._client_uses_canonical_developer_route = None
         if client is None:
             # Client was never built (lazy init) -- nothing to close.
             return
