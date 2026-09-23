@@ -158,7 +158,7 @@ Every key below corresponds either to a real parameter in Google's `google.genai
 | `max_output_tokens` | int | model default (65,536 for every current model) | API: `max_output_tokens` | Maximum output tokens. **Renamed from `max_tokens`** to match Google's own parameter name -- `max_tokens` still works as a deprecated alias (one-shot warning; `max_output_tokens` always wins if both are set). |
 | `max_tokens` | int | -- | *(deprecated alias)* | Old name for `max_output_tokens`. Prefer the new name in new configs. |
 | `temperature` | float | 0.7 | API: `temperature` | Sampling temperature (0.0-2.0 per Google's docs; this provider does not clamp the range itself). |
-| `timeout` | float | 600.0 | Amplifier-only | API call timeout in seconds, enforced client-side via `asyncio.wait_for`. |
+| `timeout` | float or null | null | Provider and SDK | Optional API call / stream idle timeout in seconds; default waits for completion. |
 | `close_timeout` | float | 5.0 | Amplifier-only | Hard bound on closing the genai client at session teardown, seconds. Both of the SDK client's httpx transports are closed (`client.aio.aclose()` for the async one this provider actually uses, and the synchronous `client.close()`, offloaded to a worker thread so it never blocks the event loop); neither has a deadline of its own and either can block forever on a half-closed (CLOSE-WAIT) connection. On timeout the client is abandoned with a WARNING and the sockets are reclaimed at process exit. |
 | `priority` | int | 100 | Amplifier-only | Provider selection priority (lower = preferred). Read by the orchestrator's provider-selection logic, not by this module's own request-building code. |
 | `raw` | bool | false | Amplifier-only | Enable raw API request/response capture on the `llm:request` / `llm:response` events (non-streaming path only). |
@@ -564,3 +564,7 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Waiting for model work
+
+The default `timeout` is `null`: model work waits for completion, explicit cancellation, or a provider/transport error. Set a numeric `timeout` in seconds to opt into a deadline. Existing cleanup limits are unchanged.

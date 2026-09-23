@@ -1062,8 +1062,11 @@ class GeminiProvider:
             "temperature", self.config.get("temperature"), 0.7, float
         )
         self.timeout = _parse_config_number(
-            "timeout", self.config.get("timeout"), 600.0, float
+            "timeout", self.config.get("timeout"), None, float
         )
+        # Native token counting is a budgeting probe, not model generation.
+        # Preserve its existing transport bound independently of model waits.
+        self._count_timeout = 600.0 if self.timeout is None else self.timeout
         # Hard bound on session-teardown client close -- see close().
         self._close_timeout = _parse_config_number(
             "close_timeout",
@@ -1152,7 +1155,14 @@ class GeminiProvider:
             # environment change cannot make the fixed Developer counter
             # describe an already noncanonical generation client.
             route_is_canonical = _sdk_environment_uses_canonical_developer_route()
-            self._client = genai.Client(api_key=self._api_key)
+            # GenAI accepts milliseconds; None disables its model-work deadline.
+            # Keep this explicit so its transport cannot impose a shorter wait.
+            self._client = genai.Client(
+                api_key=self._api_key,
+                http_options=genai.types.HttpOptions(
+                    timeout=None if self.timeout is None else self.timeout * 1000
+                ),
+            )
             self._client_uses_canonical_developer_route = route_is_canonical
             self._count_route_client = self._client
         return self._client
@@ -1268,7 +1278,7 @@ class GeminiProvider:
                 "context_window": limits.context_window,
                 "max_output_tokens": limits.max_output_tokens,
                 "temperature": 0.7,
-                "timeout": 600.0,
+                "timeout": None,
             },
             config_fields=[
                 ConfigField(
@@ -2059,7 +2069,7 @@ class GeminiProvider:
             f"{quote(plan.model, safe='')}:countTokens"
         )
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self._count_timeout) as client:
                 response = await client.post(
                     endpoint,
                     headers={"x-goog-api-key": self._api_key},
