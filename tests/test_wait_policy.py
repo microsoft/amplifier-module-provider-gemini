@@ -137,3 +137,68 @@ def test_sdk_transport_has_no_hidden_deadline(timeout):
 def test_token_count_probe_keeps_its_existing_transport_bound(timeout, expected):
     provider = GeminiProvider(api_key="fixture", config={"timeout": timeout})
     assert provider._count_timeout == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("timeout", [None, 30])
+async def test_real_sdk_http_request_carries_effective_timeout(
+    monkeypatch, streaming, timeout
+):
+    import json
+
+    import httpx
+    from google import genai
+
+    seen = []
+    body = {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": [{"text": "done"}]},
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 2,
+        },
+    }
+
+    async def handle(request):
+        seen.append(request)
+        if streaming:
+            return httpx.Response(
+                200,
+                text="data: " + json.dumps(body) + "\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json=body)
+
+    real_client = genai.Client
+
+    def client_with_in_memory_transport(**kwargs):
+        # Keep the provider's HttpOptions unchanged except for a network-free
+        # transport whose own short default exposes accidental SDK inheritance.
+        kwargs["http_options"].async_client_args = {
+            "transport": httpx.MockTransport(handle),
+            "timeout": 0.001,
+        }
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(genai, "Client", client_with_in_memory_transport)
+    provider = GeminiProvider(
+        api_key="fixture",
+        config={"timeout": timeout, "use_streaming": streaming, "max_retries": 0},
+    )
+    provider.coordinator = FakeCoordinator()
+    try:
+        result = await provider.complete(
+            ChatRequest(messages=[Message(role="user", content="hello")])
+        )
+        assert result is not None
+        assert len(seen) == 1
+        assert seen[0].extensions["timeout"]["read"] == timeout
+        assert "http_options" not in json.loads(seen[0].content)
+    finally:
+        await provider.close()
