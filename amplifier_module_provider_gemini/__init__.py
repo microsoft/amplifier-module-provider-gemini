@@ -253,19 +253,6 @@ def _count_system_instruction_content(instruction: Any, types: Any) -> Any:
     )
 
 
-def _match_sdk_content_wire(content: dict[str, Any]) -> None:
-    """Match the SDK generation spelling of MIME type on native media parts.
-
-    Only rewrite fields with a known SDK disposition, never arbitrary tool
-    arguments or response JSON. The transport parity test includes real media.
-    """
-    for part in content.get("parts", []):
-        for field in ("inlineData", "fileData"):
-            media = part.get(field)
-            if isinstance(media, dict) and "mimeType" in media:
-                media["mime_type"] = media.pop("mimeType")
-
-
 def _match_sdk_generation_wire(serialized_config: dict[str, Any]) -> None:
     """Apply the two SDK 2.23.0 nested wire spellings to a typed config dump.
 
@@ -1998,8 +1985,10 @@ class GeminiProvider:
                 "Gemini request plan cannot be publicly serialized for countTokens"
             ) from exc
 
-        for content in contents:
-            _match_sdk_content_wire(content)
+        # Keep the documented REST mimeType alias from public typed content.
+        # SDK releases emit either mimeType or its protobuf name mime_type;
+        # both identify the same media. Do not tie native counting eligibility
+        # to one SDK's spelling or recursively rewrite tool arguments.
         _match_sdk_generation_wire(serialized_config)
         # REST CountTokensRequest's `generateContentRequest` variant carries a
         # nested GenerateContentRequest whose `model` field is REQUIRED
@@ -2034,8 +2023,6 @@ class GeminiProvider:
                         "Gemini system instruction cannot be publicly serialized "
                         "for countTokens"
                     ) from exc
-            if key == "systemInstruction" and isinstance(value, dict):
-                _match_sdk_content_wire(value)
             if key in _COUNT_TOP_LEVEL_CONFIG_FIELDS:
                 request[key] = value
             elif key in _COUNT_GENERATION_CONFIG_FIELDS:
