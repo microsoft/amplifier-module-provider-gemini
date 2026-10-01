@@ -701,6 +701,36 @@ async def test_streaming_assembles_valid_chat_response():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_output_limit_finish_reason_survives_terminal_empty_chunk(streaming):
+    from google.genai import types
+    provider, coordinator = _make_provider({"use_streaming": streaming})
+    full = _chunk([_part(text="Partial continuation note")], _make_usage())
+    full.candidates[0].finish_reason = types.FinishReason.MAX_TOKENS
+    provider._client.aio.models.generate_content = AsyncMock(return_value=full)
+    terminal = _chunk([], _make_usage())
+    terminal.candidates[0].finish_reason = types.FinishReason.MAX_TOKENS
+
+    async def stream():
+        yield _chunk([_part(text="Partial continuation note")])
+        yield terminal
+
+    provider._client.aio.models.generate_content_stream = AsyncMock(return_value=stream())
+    result = await provider.complete(ChatRequest(messages=[Message(role="user", content="Summarize")]))
+    assert result.finish_reason == "length"
+    assert result.metadata["gemini_finish_reason"] == "MAX_TOKENS"
+    assert result.usage.output_tokens == 20
+
+
+def test_output_limited_function_arguments_never_become_executable_work():
+    provider, coordinator = _make_provider()
+    limited = _chunk([_part(function_call=_fc("lookup", {"incomplete": True}))], _make_usage())
+    limited.candidates[0].finish_reason = "MAX_TOKENS"
+    with pytest.raises(ValueError, match="function call output reached"):
+        provider._convert_to_chat_response(limited)
+
+
+@pytest.mark.asyncio
 async def test_streaming_thinking_appears_in_content():
     """Thinking parts appear as ThinkingBlock in the assembled ChatResponse."""
     from amplifier_core.message_models import ThinkingBlock

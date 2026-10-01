@@ -1062,8 +1062,11 @@ class GeminiProvider:
             "temperature", self.config.get("temperature"), 0.7, float
         )
         self.timeout = _parse_config_number(
-            "timeout", self.config.get("timeout"), 600.0, float
+            "timeout", self.config.get("timeout"), None, float
         )
+        # Native token counting is a budgeting probe, not model generation.
+        # Preserve its existing transport bound independently of model waits.
+        self._count_timeout = 600.0 if self.timeout is None else self.timeout
         # Hard bound on session-teardown client close -- see close().
         self._close_timeout = _parse_config_number(
             "close_timeout",
@@ -1152,7 +1155,14 @@ class GeminiProvider:
             # environment change cannot make the fixed Developer counter
             # describe an already noncanonical generation client.
             route_is_canonical = _sdk_environment_uses_canonical_developer_route()
-            self._client = genai.Client(api_key=self._api_key)
+            # GenAI accepts milliseconds; None disables its model-work deadline.
+            # Keep this explicit so its transport cannot impose a shorter wait.
+            self._client = genai.Client(
+                api_key=self._api_key,
+                http_options=genai.types.HttpOptions(
+                    timeout=None if self.timeout is None else self.timeout * 1000
+                ),
+            )
             self._client_uses_canonical_developer_route = route_is_canonical
             self._count_route_client = self._client
         return self._client
@@ -1268,7 +1278,7 @@ class GeminiProvider:
                 "context_window": limits.context_window,
                 "max_output_tokens": limits.max_output_tokens,
                 "temperature": 0.7,
-                "timeout": 600.0,
+                "timeout": None,
             },
             config_fields=[
                 ConfigField(
@@ -1975,6 +1985,10 @@ class GeminiProvider:
                 "Gemini request plan cannot be publicly serialized for countTokens"
             ) from exc
 
+        # Keep the documented REST mimeType alias from public typed content.
+        # SDK releases emit either mimeType or its protobuf name mime_type;
+        # both identify the same media. Do not tie native counting eligibility
+        # to one SDK's spelling or recursively rewrite tool arguments.
         _match_sdk_generation_wire(serialized_config)
         # REST CountTokensRequest's `generateContentRequest` variant carries a
         # nested GenerateContentRequest whose `model` field is REQUIRED
@@ -2059,7 +2073,7 @@ class GeminiProvider:
             f"{quote(plan.model, safe='')}:countTokens"
         )
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self._count_timeout) as client:
                 response = await client.post(
                     endpoint,
                     headers={"x-goog-api-key": self._api_key},
@@ -2531,6 +2545,7 @@ class GeminiProvider:
             # Collected virtual parts for _convert_to_chat_response
             collected_parts: list = []
             final_usage_metadata = None
+            final_finish_reason = None
 
             def _flush_block() -> None:
                 """Merge text fragments into one part and append to collected_parts."""
@@ -2619,6 +2634,11 @@ class GeminiProvider:
                     _um = getattr(chunk, "usage_metadata", None)
                     if _um:
                         final_usage_metadata = _um
+                    candidates = getattr(chunk, "candidates", None) or []
+                    if candidates:
+                        reason = getattr(candidates[0], "finish_reason", None)
+                        if reason:
+                            final_finish_reason = reason
 
                     # Guard against heartbeat chunks
                     try:
@@ -2696,7 +2716,7 @@ class GeminiProvider:
                 # Assemble ChatResponse by reusing _convert_to_chat_response
                 # with a synthetic response built from collected virtual parts
                 _synth = _NS(
-                    candidates=[_NS(content=_NS(parts=collected_parts))],
+                    candidates=[_NS(content=_NS(parts=collected_parts), finish_reason=final_finish_reason)],
                     usage_metadata=final_usage_metadata,
                 )
                 return self._convert_to_chat_response(_synth, model=model)
@@ -3141,11 +3161,25 @@ class GeminiProvider:
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
+        reason = getattr(response.candidates[0], "finish_reason", None)
+        reason = getattr(reason, "value", reason)
+        finish_reason = None
+        if isinstance(reason, str) and reason != "FINISH_REASON_UNSPECIFIED":
+            metadata["gemini_finish_reason"] = reason
+            finish_reason = {"STOP": "tool_calls" if tool_calls else "stop",
+                             "MAX_TOKENS": "length"}.get(reason, reason.lower())
+        if finish_reason == "length" and tool_calls:
+            # A capped function call may contain structurally valid but partial
+            # arguments. It must not become executable work. Keep the measured
+            # usage above; do not fabricate missing arguments or auto-continue.
+            raise ValueError("Gemini function call output reached its output limit")
+
         return GeminiChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             metadata=metadata,
+            finish_reason=finish_reason,
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
         )

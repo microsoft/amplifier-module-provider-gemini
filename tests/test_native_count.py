@@ -146,8 +146,8 @@ async def test_count_projection_matches_the_real_sdk_generation_body(
     # anything the production projection computed, so a wrong prefix or a
     # dropped field cannot be self-confirming.
     assert count_body.pop("model") == "models/gemini-3.7-flash"
-    # Everything that remains after removing ONLY the count-only model field
-    # must equal the body the SDK itself puts on the wire for generation.
+    # Aside from protobuf's documented MIME-field alias, removing the
+    # count-only model field must leave exactly the SDK's generation body.
     expected = count_body
     assert "automaticFunctionCalling" not in expected
     assert expected["systemInstruction"]["parts"] == [{"text": "System instructions"}]
@@ -162,6 +162,15 @@ async def test_count_projection_matches_the_real_sdk_generation_body(
     provider._client = client
     try:
         await provider.complete(request)
+        assert expected["contents"][1]["parts"][1]["inlineData"]["mimeType"] == "image/png"
+        # google-genai 1.56 emits mimeType; 2.25 emits mime_type. Normalize only
+        # native media fields, never keys inside function arguments/results.
+        for content in sent[0]["contents"] + [sent[0]["systemInstruction"]]:
+            for part in content.get("parts", []):
+                for field in ("inlineData", "fileData"):
+                    media = part.get(field)
+                    if isinstance(media, dict) and "mime_type" in media:
+                        media["mimeType"] = media.pop("mime_type")
         assert sent == [expected]
     finally:
         await client.aio.aclose()
