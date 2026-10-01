@@ -2545,6 +2545,7 @@ class GeminiProvider:
             # Collected virtual parts for _convert_to_chat_response
             collected_parts: list = []
             final_usage_metadata = None
+            final_finish_reason = None
 
             def _flush_block() -> None:
                 """Merge text fragments into one part and append to collected_parts."""
@@ -2633,6 +2634,11 @@ class GeminiProvider:
                     _um = getattr(chunk, "usage_metadata", None)
                     if _um:
                         final_usage_metadata = _um
+                    candidates = getattr(chunk, "candidates", None) or []
+                    if candidates:
+                        reason = getattr(candidates[0], "finish_reason", None)
+                        if reason:
+                            final_finish_reason = reason
 
                     # Guard against heartbeat chunks
                     try:
@@ -2710,7 +2716,7 @@ class GeminiProvider:
                 # Assemble ChatResponse by reusing _convert_to_chat_response
                 # with a synthetic response built from collected virtual parts
                 _synth = _NS(
-                    candidates=[_NS(content=_NS(parts=collected_parts))],
+                    candidates=[_NS(content=_NS(parts=collected_parts), finish_reason=final_finish_reason)],
                     usage_metadata=final_usage_metadata,
                 )
                 return self._convert_to_chat_response(_synth, model=model)
@@ -3155,11 +3161,25 @@ class GeminiProvider:
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
+        reason = getattr(response.candidates[0], "finish_reason", None)
+        reason = getattr(reason, "value", reason)
+        finish_reason = None
+        if isinstance(reason, str) and reason != "FINISH_REASON_UNSPECIFIED":
+            metadata["gemini_finish_reason"] = reason
+            finish_reason = {"STOP": "tool_calls" if tool_calls else "stop",
+                             "MAX_TOKENS": "length"}.get(reason, reason.lower())
+        if finish_reason == "length" and tool_calls:
+            # A capped function call may contain structurally valid but partial
+            # arguments. It must not become executable work. Keep the measured
+            # usage above; do not fabricate missing arguments or auto-continue.
+            raise ValueError("Gemini function call output reached its output limit")
+
         return GeminiChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             metadata=metadata,
+            finish_reason=finish_reason,
             content_blocks=event_blocks if event_blocks else None,
             text=combined_text or None,
         )
