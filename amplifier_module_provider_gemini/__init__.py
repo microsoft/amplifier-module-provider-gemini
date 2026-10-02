@@ -561,6 +561,8 @@ _THINKING_LEVEL_TABLE: dict[str, tuple[str, ...] | None] = {
     # not supported for this model. Please retry with other thinking
     # level."). ai.google.dev documents its default (when omitted) as medium.
     "gemini-3.7-flash": ("low", "medium", "high"),
+    # 3.8 retains the same restriction; minimal is not a valid wire level.
+    "gemini-3.8-flash": ("low", "medium", "high"),
     # Gemini 3.5 family -- verified live: minimal accepted.
     "gemini-3.5-flash": ("minimal", "low", "medium", "high"),
     "gemini-3.5-flash-lite": ("minimal", "low", "medium", "high"),
@@ -1045,13 +1047,10 @@ class GeminiProvider:
         )
         self.config = config or {}
         self.coordinator = coordinator
-        # gemini-3.7-flash is the current flagship Flash model (verified
-        # live against this account's key on 2026-08-29: present in
-        # list_models(), 40 gemini-* models served). gemini-2.5-flash is two
-        # generations back; gemini-3.5-flash is documented as legacy.
+        # Current Flash family default. Explicit operator pins remain unchanged.
         _sweep_unknown_config_keys(self.config)
 
-        self.default_model = self.config.get("default_model", "gemini-3.7-flash")
+        self.default_model = self.config.get("default_model", "gemini-3.8-flash")
         self.max_tokens = _parse_config_number(
             "max_output_tokens",
             _read_renamed_config(self.config, "max_output_tokens", "max_tokens"),

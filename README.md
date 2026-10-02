@@ -61,7 +61,7 @@ For more control over configuration or to compose with other capabilities, use a
      - module: provider-gemini
        source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
        config:
-         default_model: gemini-3.7-flash
+         default_model: gemini-3.8-flash
          max_output_tokens: 65536  # Full 65K output capacity
          temperature: 0.7
          priority: 50  # Lower number = higher priority (beats default 100)
@@ -73,7 +73,7 @@ For more control over configuration or to compose with other capabilities, use a
 
    ## Available Models
 
-   - **Gemini 3.7 Flash** - `gemini-3.7-flash` - Current flagship Flash model, best price-performance (default)
+   - **Gemini 3.8 Flash** - `gemini-3.8-flash` - Default Flash model; explicit pins remain unchanged
    - **Gemini 3.5 Flash / Flash-Lite** - `gemini-3.5-flash` / `gemini-3.5-flash-lite` - Legacy Flash generation
    - **Gemini 2.5 Flash / Flash-Lite / Pro** - `gemini-2.5-flash` / `gemini-2.5-flash-lite` / `gemini-2.5-pro` - Two generations back; still served
    ```
@@ -84,6 +84,10 @@ For more control over configuration or to compose with other capabilities, use a
    ```
 
 ## Prerequisites
+
+Offline provider contracts run without real credentials: scoped fixtures mount
+with a nonfunctional key and mock only the SDK async model pager. Run
+`uv run pytest -q -m "not live"` for all offline checks.
 
 - **Python 3.11+**
 - **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
@@ -116,7 +120,8 @@ Model availability and naming change frequently -- this list reflects what was v
 
 ### Gemini 3.x (Current generation)
 
-- `gemini-3.7-flash` - **Current flagship Flash model** ("the latest and most capable" per ai.google.dev). **Default model for this provider.** Uses `thinking_level` (low/medium/high -- no `minimal`).
+- `gemini-3.8-flash` - **Default model for this provider.** Selected from the October 2026 catalog refresh; explicit pins remain unchanged. Supported thinking levels follow the provider's model-specific capability rules.
+- `gemini-3.7-flash` - Previous default. Uses `thinking_level` (low/medium/high -- no `minimal`, verified in August).
 - `gemini-3.5-flash` / `gemini-3.5-flash-lite` - Documented by Google as **legacy** relative to 3.7. Uses `thinking_level` (full minimal/low/medium/high range).
 - Other `gemini-3.*` preview/dated ids (e.g. `gemini-3.1-flash-lite-preview`, `gemini-3-pro-image-preview`) come and go -- this provider assumes any `gemini-3.*` id supports `thinking_level` with the full range unless proven otherwise by a live 400.
 
@@ -141,7 +146,7 @@ Shut down by Google -- no longer served. Do not configure `gemini-2.0-flash` / `
 module = "provider-gemini"
 name = "gemini"
 config = {
-    default_model = "gemini-3.7-flash",
+    default_model = "gemini-3.8-flash",
     max_output_tokens = 65536,
     temperature = 0.7,
 }
@@ -154,7 +159,7 @@ Every key below corresponds either to a real parameter in Google's `google.genai
 | Parameter | Type | Default | API param / origin | Description |
 |-----------|------|---------|---------------------|-------------|
 | `api_key` | string | env: `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Amplifier-only | Google AI API key. Env vars match the official SDK's own resolution (`GOOGLE_API_KEY` wins if both are set). |
-| `default_model` | string | `gemini-3.7-flash` | Amplifier-only | Default model to use when a request doesn't override it. |
+| `default_model` | string | `gemini-3.8-flash` | Amplifier-only | Default model to use when a request doesn't override it. |
 | `max_output_tokens` | int | model default (65,536 for every current model) | API: `max_output_tokens` | Maximum output tokens. **Renamed from `max_tokens`** to match Google's own parameter name -- `max_tokens` still works as a deprecated alias (one-shot warning; `max_output_tokens` always wins if both are set). |
 | `max_tokens` | int | -- | *(deprecated alias)* | Old name for `max_output_tokens`. Prefer the new name in new configs. |
 | `temperature` | float | 0.7 | API: `temperature` | Sampling temperature (0.0-2.0 per Google's docs; this provider does not clamp the range itself). |
@@ -182,7 +187,7 @@ Boolean and numeric values above tolerate string input (`"true"`/`"false"`, `"60
 providers:
   - module: provider-gemini
     config:
-      default_model: gemini-3.7-flash
+      default_model: gemini-3.8-flash
       extra_request_params:
         top_p: 0.95
         safety_settings:
@@ -218,7 +223,7 @@ Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
 # In amplifier configuration
 [provider]
 name = "gemini"
-default_model = "gemini-3.7-flash"
+default_model = "gemini-3.8-flash"
 ```
 
 ## Example Bundle Configurations
@@ -231,7 +236,7 @@ providers:
   - module: provider-gemini
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
-      default_model: gemini-3.7-flash
+      default_model: gemini-3.8-flash
       max_output_tokens: 65536  # Use full 65K output capacity
       temperature: 0.7
       priority: 50  # IMPORTANT: Lower number = higher priority (beats default 100)
@@ -243,7 +248,7 @@ providers:
   - module: provider-gemini
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
-      default_model: gemini-3.7-flash
+      default_model: gemini-3.8-flash
       max_output_tokens: 65536  # Full 65K output capacity
       priority: 50  # Lower number = higher priority
 ```
@@ -265,7 +270,7 @@ providers:
   - module: provider-gemini
     source: git+https://github.com/microsoft/amplifier-module-provider-gemini@main
     config:
-      default_model: gemini-3.7-flash
+      default_model: gemini-3.8-flash
       max_output_tokens: 65536  # Full 65K output capacity
       temperature: 1.0
       priority: 50  # Lower number = higher priority
