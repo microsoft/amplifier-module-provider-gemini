@@ -85,6 +85,10 @@ For more control over configuration or to compose with other capabilities, use a
 
 ## Prerequisites
 
+Offline provider contracts run without real credentials: scoped fixtures mount
+with a nonfunctional key and mock only the SDK async model pager. Run
+`uv run pytest -q -m "not live"` for all offline checks.
+
 - **Python 3.11+**
 - **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
 

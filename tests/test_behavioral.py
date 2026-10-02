@@ -4,6 +4,8 @@ Inherits authoritative tests from amplifier-core.
 """
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from amplifier_core.validation.behavioral import ProviderBehaviorTests
 
@@ -15,15 +17,11 @@ class TestGeminiProviderBehavior(ProviderBehaviorTests):
     Add module-specific tests below if needed.
     """
 
-    @pytest.mark.live
     @pytest.mark.asyncio
     async def test_list_models_returns_list(self, provider_module):
-        """Override to mark this inherited test 'live'.
-
-        ProviderBehaviorTests.test_list_models_returns_list calls
-        provider_module.list_models(), which makes a real call to
-        Google's models.list endpoint -- it cannot pass in CI without a
-        genuine GOOGLE_API_KEY/GEMINI_API_KEY. Deselected in CI via
-        `-m "not live"`; run locally with real credentials to validate.
-        """
+        """Exercise actual async-pager catalog mapping without a network call."""
+        async def models():
+            yield SimpleNamespace(name="models/gemini-3.8-flash", display_name="Flash",
+                                  input_token_limit=1_000_000, output_token_limit=65536)
+        provider_module.client.aio.models.list = AsyncMock(return_value=models())
         await super().test_list_models_returns_list(provider_module)
