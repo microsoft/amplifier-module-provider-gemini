@@ -390,7 +390,16 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             _totals["has_data"] = True
 
     provider = GeminiProvider(api_key, config, coordinator, add_cost=_add_cost)
-    await coordinator.mount("providers", provider, name="gemini")
+    from .images import register_image_backend
+
+    release_images = lambda: None
+    try:
+        release_images = register_image_backend(coordinator, provider, config)
+        await coordinator.mount("providers", provider, name="gemini")
+    except BaseException:
+        release_images()
+        await provider.close()
+        raise
     logger.info("Mounted GeminiProvider")
 
     # M2 compaction mitigation: intentionally NOT ported from provider-openai.
@@ -490,6 +499,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # the hard `close_timeout` bound -- this cleanup runs inside the finally
     # that precedes a CLI command's return, so it must never block forever.
     async def cleanup():
+        release_images()
         await provider.close()
 
     return cleanup
@@ -1289,6 +1299,16 @@ class GeminiProvider:
                 ),
             ],
         )
+
+    def get_image_generation_info(self) -> dict:
+        from .images import image_generation_info
+
+        return image_generation_info()
+
+    async def list_image_models(self) -> list[dict]:
+        from .images import list_image_models
+
+        return await list_image_models(self)
 
     async def list_models(self) -> list[ModelInfo]:
         """List available Gemini models via the live API.

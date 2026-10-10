@@ -20,6 +20,7 @@ dependencies = [
     # _THINKING_LEVEL_TABLE comment for the per-model support matrix.
     "google-genai>=1.56.0",
     "httpx>=0.28.1",
+    "Pillow>=11.0.0",
 ]
 
 [project.entry-points."amplifier.modules"]
