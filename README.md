@@ -573,3 +573,30 @@ Any use of third-party trademarks or logos are subject to those third-party's po
 ### Waiting for model work
 
 The default `timeout` is `null`: model work waits for completion, explicit cancellation, or a provider/transport error. Set a numeric `timeout` in seconds to opt into a deadline. Existing cleanup limits are unchanged.
+
+
+## Native image generation and editing
+
+The provider can supply an `image.backends` capability to a separately mounted
+image tool. It remains opt-in; chat model selection does not enable image calls.
+
+```yaml
+config:
+  image_generation:
+    enabled: true
+    id: images
+    model: auto
+```
+
+`auto` selects the maintained stable image default available in this account's
+model catalog. An explicit catalog model preserves a fixed choice. Catalog access
+does not establish generation entitlement. `get_image_generation_info()` and
+`list_image_models()` expose discovery without generating an image.
+
+The native backend supports generation and reference-image editing, with automatic
+size, quality and background. Unsupported explicit controls are rejected. It makes
+one SDK attempt, returns one PNG artifact (normalizing native JPEG/WebP output),
+and includes resolved model, request identity, usage and accompanying text. Thought
+images are excluded. Output is limited to 16 megapixels and 8 MiB. Failures do not
+trigger an automatic retry or a different paid backend. The optional `timeout`
+is positive finite seconds; the default leaves the provider request unbounded.
