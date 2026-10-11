@@ -3073,8 +3073,12 @@ class GeminiProvider:
                     )
                 )
 
-        # Build metadata with usage including thought tokens
-        metadata = {"raw_response": response}
+        # Metadata travels with the normalized message into JSON transcripts
+        # and context checkpoints. SDK objects (including the streaming
+        # SimpleNamespace response) are not serializable. Content, signatures,
+        # usage and finish reason are retained in their normalized fields;
+        # optional raw diagnostics stay in the existing logging path.
+        metadata = {}
         usage = None
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             # Gemini includes thoughtsTokenCount in usage metadata when thinking is used
