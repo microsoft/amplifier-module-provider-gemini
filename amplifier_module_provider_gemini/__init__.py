@@ -1310,6 +1310,21 @@ class GeminiProvider:
 
         return await list_image_models(self)
 
+    def get_image_generation_capabilities(self) -> dict:
+        from .image_operation import capabilities
+
+        return capabilities(self)
+
+    async def prepare_image_generation(self, request: dict) -> dict:
+        from .image_operation import prepare
+
+        return await prepare(self, request)
+
+    async def generate_image(self, request: dict, *, plan: dict) -> dict:
+        from .image_operation import generate
+
+        return await generate(self, request, plan=plan)
+
     async def list_models(self) -> list[ModelInfo]:
         """List available Gemini models via the live API.
 

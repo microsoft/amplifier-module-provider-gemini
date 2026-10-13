@@ -6,6 +6,66 @@ The [draft image-operation contract](contracts/image-generation.v1.md) describes
 optional native image execution and its qualification requirements. It is not a
 claim that the proposed Interactions adapter or capability methods are shipped.
 
+## Optional image-operation surface — source candidate
+
+The current source contains an experimental native image implementation in
+[`image_operation.py`](amplifier_module_provider_gemini/image_operation.py).
+It is separate from ordinary chat and from the explicit `image.backends`
+registration described below. The draft contract remains unfrozen; combined
+offline qualification is pending. This section records source behavior, not a
+shipped deployment, a general multimodal-chat claim or live account entitlement.
+
+The ordinary provider exposes three optional structural methods without a
+required Core Provider change:
+
+```python
+get_image_generation_capabilities() -> dict
+async prepare_image_generation(request: dict) -> dict
+async generate_image(request: dict, *, plan: dict) -> dict
+```
+
+Callers must require the complete surface and negotiate
+`protocol: amplifier.image-operation.v1`. Capability inspection is local and
+does not construct a client, list models or sign in. Preparation validates
+supported models, transport and controls without a catalogue or generation
+request; its single-use plan binds the exact request and provider connection.
+The caller owns permission, durable effect identity, files and reconciliation.
+
+The native image model is supplied by
+`selection.config.image_generation: {model, transport}`. Only those two keys are
+accepted in that nested operation override; credentials, endpoints, `enabled`,
+timeout and nested effort are not operation payload controls.
+`selection.model` remains separate conversational-role metadata; no unused
+controller is called. An absent provider-level image setting does not disable
+the optional surface, but an explicit `image_generation.enabled: false` does.
+Canonical Developer API connection provenance is required; Vertex, Enterprise,
+custom or unqualified injected connections do not inherit support.
+
+`interactions` is the default transport. Its private SDK seam is qualified
+against `google-genai` **2.30.1** and uses an isolated options view with
+`HttpRetryOptions(attempts=0)`: that SDK's Interactions builder maps `attempts=1`
+to two physical sends. Requests use `store: false`, non-streaming output and no
+automatic continuation. Older SDKs are not silently switched to another
+transport; newer versions still need the same wire-level qualification.
+
+Explicit `transport: generate_content` is the compatibility path. It uses
+`attempts=1`, one candidate, text/image modalities and disabled automatic function
+calling. A request-local client view is forced to borrow the provider's HTTPX
+transport, avoiding aiohttp's inner disconnect retry. Neither transport changes
+the shared chat client's retries or owns cleanup of the borrowed connection.
+Image timeout is the provider's image timeout when configured, otherwise the
+provider timeout; null leaves no elapsed deadline.
+
+The current operation accepts one final image, `auto` size/quality/background,
+and one to four edit inputs, except the Flash Lite image model accepts only one.
+Unsupported controls fail before dispatch. Final image/text outputs retain
+order; thought output is excluded, bounded JPEG/WebP images are normalized to
+PNG, and requested models, observed versions, IDs and native/normalized usage
+remain distinct. Missing evidence stays null and `continuation` is null.
+Failures, cancellation and uncertain sends never authorize a second transport,
+account or paid replay. This does not guarantee exactly-once service execution
+or establish that a catalogue-listed model is entitled on the account.
+
 ## Quick Start
 
 ### Option 1: Install as Module (Recommended)
