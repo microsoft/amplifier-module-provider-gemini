@@ -7,13 +7,15 @@ the selected provider's HTTP transport and authentication. Chat is not mutated.
 from __future__ import annotations
 
 import base64
-from copy import copy, deepcopy
 import hashlib
-from io import BytesIO
 import json
 import math
 import re
 import uuid
+from copy import copy, deepcopy
+from io import BytesIO
+
+import httpx
 
 from .images import _MODELS, _PREVIEW, normalize_image
 
@@ -23,6 +25,23 @@ MAX_OUTPUTS = 16
 MAX_TEXT = 32000
 MIME_TYPES = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
 MODELS = frozenset((*_MODELS, *_PREVIEW))
+
+class _BoundHTTP(httpx.AsyncClient):
+    """Request-local no-redirect view; the owning provider retains its client."""
+    def __init__(self, original):
+        super().__init__(follow_redirects=False, base_url=original.base_url)
+        self.original = original
+
+    def build_request(self, *args, **kwargs):
+        return self.original.build_request(*args, **kwargs)
+
+    async def request(self, *args, **kwargs):
+        kwargs["follow_redirects"] = False
+        return await self.original.request(*args, **kwargs)
+
+    async def send(self, request, **kwargs):
+        kwargs["follow_redirects"] = False
+        return await self.original.send(request, **kwargs)
 
 
 def _get(value, name, default=None):
@@ -60,6 +79,8 @@ def _connection_reason(provider):
         options = _get(api_client, "_http_options")
         endpoint = _get(options, "base_url")
         key = _get(api_client, "api_key")
+        if _get(_get(api_client, "_async_httpx_client"), "_auth") is not None:
+            return "unsupported_http_auth"
         if (
             _get(api_client, "vertexai") is True
             or _get(api_client, "enterprise") is True
@@ -97,6 +118,7 @@ def _compatibility_sdk_available():
 def _interactions_reason(client=None):
     try:
         from importlib.metadata import version
+
         from google.genai._gaos.google_genai import AsyncGeminiNextGenInteractions
         installed = tuple(int(part) for part in version("google-genai").split(".")[:3])
         if installed < (2, 30, 1) or not callable(AsyncGeminiNextGenInteractions.create):
@@ -108,7 +130,7 @@ def _interactions_reason(client=None):
     return None
 
 
-def _interaction_client(client, timeout):
+def _interaction_client(client, timeout, transport=None):
     """Use an isolated SDK options view, never alter a shared client's retries.
 
     Qualified with google-genai 2.30.1. Its generated Interactions builder maps
@@ -120,16 +142,20 @@ def _interaction_client(client, timeout):
     from google.genai import types
     from google.genai._gaos.google_genai import AsyncGeminiNextGenInteractions
     api = copy(client._api_client)
+    if transport is not None:
+        api._async_httpx_client = transport
     api._http_options = api._http_options.model_copy(update={
         "retry_options": types.HttpRetryOptions(attempts=0),
         "timeout": None if timeout is None else timeout * 1000,
     })
     return AsyncGeminiNextGenInteractions(api)
 
-def _compatibility_client(client):
+def _compatibility_client(client, transport=None):
     """Borrow the bound HTTPX transport; aiohttp has an inner disconnect retry."""
     from google.genai import models
     api = copy(client._api_client)
+    if transport is not None:
+        api._async_httpx_client = transport
     # This request-local view is never installed on the chat client or closed.
     # The generated model resource uses _use_aiohttp to select its request path.
     api._use_aiohttp = lambda: False
@@ -199,7 +225,7 @@ def raster(data, mime_type):
         # verify() alone does not decode every format's pixels.
         with Image.open(BytesIO(data)) as image:
             image.load()
-    except Exception:
+    except (ValueError, OSError, Image.DecompressionBombError):
         raise ValueError("Invalid image bytes, format or dimensions.") from None
     return data
 
@@ -268,9 +294,14 @@ def binding(provider):
     client = provider.client
     api_client = _get(client, "_api_client")
     http_options = _get(api_client, "_http_options")
+    http = _get(api_client, "_async_httpx_client")
     return (
         client,
         api_client,
+        http,
+        deepcopy(dict(_get(http, "headers") or {})),
+        _get(http, "_auth"),
+        _get(http, "_transport"),
         provider._api_key,
         _get(api_client, "api_key"),
         _get(api_client, "vertexai"),
@@ -379,7 +410,7 @@ async def prepare(provider, request):
         private_binding = binding(provider)
         if transport == "interactions":
             _interaction_client(private_binding[0], plan["timeout"])
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional SDK preparation refuses safely
         return unavailable("unsupported_sdk_or_binding")
     reason = _connection_reason(provider) or _transport_reason(provider, transport)
     if reason:
@@ -533,11 +564,12 @@ async def generate(provider, request, *, plan):
         "dispatch_state": "unknown",
     }
     try:
-        if plan["transport"] == "interactions":
-            response = await _interaction_client(client, plan["timeout"]).create(**params, timeout=plan["timeout"])
-        else:
-            response = await _compatibility_client(client).generate_content(**params)
-    except Exception:
+        async with _BoundHTTP(client._api_client._async_httpx_client) as transport:
+            if plan["transport"] == "interactions":
+                response = await _interaction_client(client, plan["timeout"], transport).create(**params, timeout=plan["timeout"])
+            else:
+                response = await _compatibility_client(client, transport).generate_content(**params)
+    except Exception:  # noqa: BLE001 - unknown paid outcome, never retry
         # Raw SDK errors may contain bodies, URLs or credentials. Cancellation
         # is a BaseException and propagates; either outcome leaves the plan spent.
         result["reason_code"] = "generation_outcome_unknown"
@@ -573,7 +605,7 @@ async def generate(provider, request, *, plan):
         result["status"] = state
         if reason:
             result["reason_code"] = reason
-    except Exception:
+    except Exception:  # noqa: BLE001 - preserve bounded evidence on invalid output
         # Keep previously validated bounded outputs as evidence, not success.
         result["status"] = "failed"
         result["reason_code"] = "invalid_response"

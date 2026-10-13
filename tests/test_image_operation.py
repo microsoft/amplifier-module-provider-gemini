@@ -9,19 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from copy import deepcopy
 import hashlib
-from io import BytesIO
 import json
+from copy import deepcopy
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from google.genai import types
-from PIL import Image
 import pytest
-
 from amplifier_module_provider_gemini import GeminiProvider
 from amplifier_module_provider_gemini import image_operation as operation
+from google.genai import types
+from PIL import Image
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +111,16 @@ def mounted(monkeypatch):
     )
     factory = Mock(return_value=client)
     monkeypatch.setattr("google.genai.Client", factory)
-    monkeypatch.setattr(operation, "_compatibility_client", lambda value: value.aio.models)
+    monkeypatch.setattr(operation, "_compatibility_client", lambda value, transport=None: value.aio.models)
+    class BoundHTTP:
+        def __init__(self, _original):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+    client._api_client._async_httpx_client = object()
+    monkeypatch.setattr(operation, "_BoundHTTP", BoundHTTP)
     provider = GeminiProvider(
         api_key="synthetic-credential",
         config={"default_model": "gemini-3.8-flash", "max_retries": 99},
@@ -346,7 +354,7 @@ async def test_plan_is_bounded_opaque_random_and_credential_free(mounted):
     assert len(provider._prepared_image_operations) == 64
     private = provider._prepared_image_operations[plans[0]["id"]]
     assert private[1][0] is client
-    assert private[1][2] == "synthetic-credential"
+    assert "synthetic-credential" in private[1]
     client.aio.models.generate_content.assert_not_called()
 
 

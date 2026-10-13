@@ -1,17 +1,16 @@
 """Qualify generated SDK retry control at the actual HTTP boundary, offline."""
 import asyncio
 import base64
-from io import BytesIO
 import json
+from io import BytesIO
 
-from google import genai
-from google.genai import types
 import httpx
-from PIL import Image
 import pytest
-
 from amplifier_module_provider_gemini import GeminiProvider
 from amplifier_module_provider_gemini.image_operation import PROTOCOL
+from google import genai
+from google.genai import types
+from PIL import Image
 
 
 def png():
@@ -72,6 +71,48 @@ async def test_interactions_final_order_storage_and_single_send():
 
 
 @pytest.mark.asyncio
+async def test_prepared_binding_rejects_http_header_change_without_send():
+    sent = []
+    provider, client, http = fixture(lambda req: sent.append(req))
+    try:
+        item = request()
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        http.headers["authorization"] = "fixture-changed"
+        with pytest.raises(ValueError):
+            await provider.generate_image(item, plan=plan)
+        assert not sent
+    finally:
+        await http.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["server", "disconnect", "redirect"])
+async def test_legacy_generate_content_also_sends_once(failure):
+    from amplifier_module_provider_gemini.images import GeminiImageBackend
+    sent = []
+    def respond(req):
+        sent.append(req)
+        if failure == "disconnect":
+            raise httpx.RemoteProtocolError("fixture disconnected after possible send")
+        if failure == "redirect":
+            return httpx.Response(307, headers={"location": "https://other.example.invalid/generate"})
+        return httpx.Response(500, json={"error": {"code": 500, "message": "fixture", "status": "INTERNAL"}})
+    provider, client, http = fixture(respond)
+    http.follow_redirects = True
+    try:
+        backend = GeminiImageBackend(provider, {"model": "gemini-nano-banana-2.1"})
+        with pytest.raises(Exception):
+            await asyncio.wait_for(backend.generate(action="generate", prompt="fixture",
+                images=[], size="auto", quality="auto", background="auto"), 3)
+        assert len(sent) == 1 and "generateContent" in sent[0].url.path
+        assert http.follow_redirects is True and not http.is_closed
+    finally:
+        await http.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
 async def test_interactions_server_error_does_not_retry_or_use_generate_content():
     sent = []
     def respond(req):
@@ -110,6 +151,27 @@ async def test_generate_content_uses_httpx_once_despite_aiohttp_availability(fai
         assert result["status"] == "unknown"
         assert len(sent) == 1 and "generateContent" in sent[0].url.path
         assert client._api_client._use_aiohttp == original
+    finally:
+        await http.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["interactions", "generate_content"])
+async def test_redirect_does_not_replay_or_move_to_another_endpoint(transport):
+    sent = []
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(307, headers={"location": "https://other.example.invalid/generate"})
+    provider, client, http = fixture(respond)
+    http.follow_redirects = True
+    try:
+        item = request()
+        item["selection"]["config"]["image_generation"]["transport"] = transport
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] in {"unknown", "failed"} and len(sent) == 1
+        assert http.follow_redirects is True and not http.is_closed
     finally:
         await http.aclose()
         client.close()
