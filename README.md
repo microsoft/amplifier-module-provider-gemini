@@ -2,6 +2,10 @@
 
 Google Gemini model integration for Amplifier via Google AI API.
 
+The [draft image-operation contract](contracts/image-generation.v1.md) describes
+optional native image execution and its qualification requirements. It is not a
+claim that the proposed Interactions adapter or capability methods are shipped.
+
 ## Quick Start
 
 ### Option 1: Install as Module (Recommended)
