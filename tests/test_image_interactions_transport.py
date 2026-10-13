@@ -6,11 +6,12 @@ from io import BytesIO
 
 import httpx
 import pytest
+from google import genai
+from google.genai import errors, types
+from PIL import Image
+
 from amplifier_module_provider_gemini import GeminiProvider
 from amplifier_module_provider_gemini.image_operation import PROTOCOL
-from google import genai
-from google.genai import types
-from PIL import Image
 
 
 def png():
@@ -102,7 +103,7 @@ async def test_legacy_generate_content_also_sends_once(failure):
     http.follow_redirects = True
     try:
         backend = GeminiImageBackend(provider, {"model": "gemini-nano-banana-2.1"})
-        with pytest.raises(Exception):
+        with pytest.raises((errors.APIError, httpx.HTTPError)):
             await asyncio.wait_for(backend.generate(action="generate", prompt="fixture",
                 images=[], size="auto", quality="auto", background="auto"), 3)
         assert len(sent) == 1 and "generateContent" in sent[0].url.path

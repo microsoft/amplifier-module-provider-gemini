@@ -134,10 +134,10 @@ class GeminiImageBackend:
             )
         from .image_operation import _BoundHTTP, _compatibility_client
         client = self.provider.client
-        params = dict(
-            model=model,
-            contents=[types.Content(role="user", parts=parts)],
-            config=types.GenerateContentConfig(
+        params = {
+            "model": model,
+            "contents": [types.Content(role="user", parts=parts)],
+            "config": types.GenerateContentConfig(
                 response_modalities=["TEXT", "IMAGE"],
                 candidate_count=1,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -146,7 +146,7 @@ class GeminiImageBackend:
                     retry_options=types.HttpRetryOptions(attempts=1),
                 ),
             ),
-        )
+        }
         if hasattr(client, "_api_client"):
             async with _BoundHTTP(client._api_client._async_httpx_client) as transport:
                 response = await _compatibility_client(client, transport).generate_content(**params)
