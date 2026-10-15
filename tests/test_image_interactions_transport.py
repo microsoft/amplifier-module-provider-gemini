@@ -72,6 +72,47 @@ async def test_interactions_final_order_storage_and_single_send():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["interactions", "generate_content"])
+@pytest.mark.parametrize("bad_position", ["before", "after"])
+async def test_malformed_text_keeps_independent_image_evidence_once(transport, bad_position):
+    encoded = base64.b64encode(png()).decode()
+    if transport == "interactions":
+        image = {"type": "image", "mime_type": "image/png", "data": encoded}
+        bad = {"type": "text", "text": "x" * 32001}
+        parts = [bad, image] if bad_position == "before" else [image, bad]
+        payload = {"id": "interaction-fixture", "status": "completed",
+                   "model": "gemini-nano-banana-2.1",
+                   "steps": [{"type": "model_output", "content": parts}]}
+    else:
+        image = {"inlineData": {"mimeType": "image/png", "data": encoded}}
+        bad = {"text": "x" * 32001}
+        parts = [bad, image] if bad_position == "before" else [image, bad]
+        payload = {"candidates": [{"content": {"role": "model", "parts": parts},
+                                   "finishReason": "STOP"}]}
+    sent = []
+
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(200, json=payload)
+
+    provider, client, http = fixture(respond)
+    try:
+        item = request()
+        item["selection"]["config"]["image_generation"]["transport"] = transport
+        plan = (await provider.prepare_image_generation(item))["plan"]
+        result = await provider.generate_image(item, plan=plan)
+        assert result["status"] == "failed" and result["reason_code"] == "invalid_response"
+        assert result["outputs"] == [{"kind": "image", "mime_type": "image/png", "data": png()}]
+        assert result["dispatch_state"] == "response_received"
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
+    finally:
+        await http.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
 async def test_prepared_binding_rejects_http_header_change_without_send():
     sent = []
     provider, client, http = fixture(lambda req: sent.append(req))
