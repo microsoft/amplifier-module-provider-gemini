@@ -11,9 +11,10 @@ claim that the proposed Interactions adapter or capability methods are shipped.
 The current source contains an experimental native image implementation in
 [`image_operation.py`](amplifier_module_provider_gemini/image_operation.py).
 It is separate from ordinary chat and from the explicit `image.backends`
-registration described below. The draft contract remains unfrozen; combined
-offline qualification is pending. This section records source behavior, not a
-shipped deployment, a general multimodal-chat claim or live account entitlement.
+registration described below. The draft contract remains unfrozen. Offline SDK
+transport tests cover preparation, single-send execution and bounded evidence
+recovery. This is not a shipped host deployment, a general multimodal-chat claim
+or live account entitlement.
 
 The ordinary provider exposes three optional structural methods without a
 required Core Provider change:
@@ -62,6 +63,8 @@ Unsupported controls fail before dispatch. Final image/text outputs retain
 order; thought output is excluded, bounded JPEG/WebP images are normalized to
 PNG, and requested models, observed versions, IDs and native/normalized usage
 remain distinct. Missing evidence stays null and `continuation` is null.
+Malformed final parts mark the operation unsuccessful while bounded independent
+image parts remain recoverable evidence, even when the malformed part came first.
 Failures, cancellation and uncertain sends never authorize a second transport,
 account or paid replay. This does not guarantee exactly-once service execution
 or establish that a catalogue-listed model is entitled on the account.
@@ -526,11 +529,10 @@ the SDK's private normalization.
 
 This adapter is not Vertex AI support and does not use
 `client.models.count_tokens`: that Python helper cannot send a full Gemini
-Developer `generateContentRequest`. The request-projection wire regression is
-written against `google-genai` 2.23.0, the retained DTU version; no other SDK
-version is covered by this exact generation/count wire check. The checked-in
-`uv.lock` still pins 1.46.0 despite this package's pre-existing `>=1.56.0`
-floor; this baseline lock discrepancy is intentionally not upgraded here.
+Developer `generateContentRequest`. The request-projection wire regression was
+originally written against `google-genai` 2.23.0. The current dependency floor and
+lock are 2.30.1 for the optional image-operation SDK boundary; the existing
+generation/count tests remain part of the offline suite.
 
 Counting is unavailable when the SDK would route generation away from the
 canonical Gemini Developer endpoint: a nonempty `GOOGLE_GEMINI_BASE_URL`, or
@@ -545,7 +547,7 @@ an SDK client, authenticates, or performs I/O.
 
 ## Dependencies
 
-- `google-genai>=1.56.0` - Official Google AI Python SDK. 1.56.0 is the floor because it's the first release whose `ThinkingConfig` exposes the full `thinking_level` enum (`minimal`/`low`/`medium`/`high`) this provider needs -- verified by probing the SDK's own installed types directly: 1.46.0 has no `thinking_level` field at all; 1.51.0 adds it with only `LOW`/`HIGH`; 1.56.0 completes the four-level enum.
+- `google-genai>=2.30.1,<3` - Official Google AI Python SDK; 2.30.1 supplies the qualified Interactions image-operation boundary. It also retains the full thinking-level enum required by ordinary chat. New SDK versions require the same transport regressions.
 - `httpx>=0.28.1` - Async transport for the documented Developer
   `countTokens` REST endpoint.
 

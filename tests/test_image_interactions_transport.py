@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import struct
 from io import BytesIO
 
 import httpx
@@ -74,18 +75,29 @@ async def test_interactions_final_order_storage_and_single_send():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["interactions", "generate_content"])
 @pytest.mark.parametrize("bad_position", ["before", "after"])
-async def test_malformed_text_keeps_independent_image_evidence_once(transport, bad_position):
+@pytest.mark.parametrize("malformed", ["oversized_text", "image_crc"])
+async def test_malformed_text_keeps_independent_image_evidence_once(transport, bad_position, malformed):
     encoded = base64.b64encode(png()).decode()
+    corrupt = bytearray(png())
+    idat = corrupt.index(b"IDAT")
+    length = struct.unpack(">I", corrupt[idat - 4:idat])[0]
+    corrupt[idat + 4 + length] ^= 1
+    if malformed == "image_crc":
+        with Image.open(BytesIO(corrupt)) as image, pytest.raises(SyntaxError):
+            image.verify()
+    bad_image = base64.b64encode(corrupt).decode()
     if transport == "interactions":
         image = {"type": "image", "mime_type": "image/png", "data": encoded}
-        bad = {"type": "text", "text": "x" * 32001}
+        bad = ({"type": "text", "text": "x" * 32001} if malformed == "oversized_text" else
+               {"type": "image", "mime_type": "image/png", "data": bad_image})
         parts = [bad, image] if bad_position == "before" else [image, bad]
         payload = {"id": "interaction-fixture", "status": "completed",
                    "model": "gemini-nano-banana-2.1",
                    "steps": [{"type": "model_output", "content": parts}]}
     else:
         image = {"inlineData": {"mimeType": "image/png", "data": encoded}}
-        bad = {"text": "x" * 32001}
+        bad = ({"text": "x" * 32001} if malformed == "oversized_text" else
+               {"inlineData": {"mimeType": "image/png", "data": bad_image}})
         parts = [bad, image] if bad_position == "before" else [image, bad]
         payload = {"candidates": [{"content": {"role": "model", "parts": parts},
                                    "finishReason": "STOP"}]}

@@ -225,7 +225,7 @@ def raster(data, mime_type):
         # verify() alone does not decode every format's pixels.
         with Image.open(BytesIO(data)) as image:
             image.load()
-    except (ValueError, OSError, Image.DecompressionBombError):
+    except (ValueError, OSError, SyntaxError, Image.DecompressionBombError):
         raise ValueError("Invalid image bytes, format or dimensions.") from None
     return data
 
@@ -448,25 +448,38 @@ def _parts(value):
 
 def _parse_interactions(response, outputs, warnings):
     """Walk ordered final steps, never output_image/output_text conveniences."""
+    invalid = False
     for step in _parts(_get(response, "steps")):
         if _get(step, "type") != "model_output":
             continue
-        for part in _parts(_get(step, "content")):
-            if _get(part, "thought") is True or _get(part, "type") == "thought":
-                continue
-            if _get(part, "type") == "text":
-                text = _get(part, "text")
-                if not isinstance(text, str):
-                    raise ValueError("Invalid final text.")
-                _append(outputs, {"kind": "text", "text": text})
-            elif _get(part, "type") == "image":
-                data = _get(part, "data")
-                if not isinstance(data, str) or len(data) > 4 * ((MAX_BYTES + 2) // 3):
-                    raise ValueError("Missing or oversized inline image data.")
-                # No URI fetch, output convenience property or signature replay.
-                _append_image(outputs, base64.b64decode(data, validate=True), _get(part, "mime_type"), warnings)
-            else:
-                raise ValueError("Unsupported final content type.")
+        try:
+            parts = _parts(_get(step, "content"))
+        except ValueError:
+            invalid = True
+            continue
+        for part in parts:
+            try:
+                if _get(part, "thought") is True or _get(part, "type") == "thought":
+                    continue
+                if _get(part, "type") == "text":
+                    text = _get(part, "text")
+                    if not isinstance(text, str):
+                        raise ValueError("Invalid final text.")
+                    _append(outputs, {"kind": "text", "text": text})
+                elif _get(part, "type") == "image":
+                    data = _get(part, "data")
+                    if not isinstance(data, str) or len(data) > 4 * ((MAX_BYTES + 2) // 3):
+                        raise ValueError("Missing or oversized inline image data.")
+                    # No URI fetch, output convenience property or signature replay.
+                    _append_image(outputs, base64.b64decode(data, validate=True), _get(part, "mime_type"), warnings)
+                else:
+                    raise ValueError("Unsupported final content type.")
+            except (ValueError, TypeError, OSError):
+                # Keep scanning bounded independent final parts. A malformed
+                # part cannot hide an otherwise recoverable paid image.
+                invalid = True
+    if invalid:
+        raise ValueError("Invalid final content; bounded evidence retained.")
     state = _get(response, "status")
     if state == "completed":
         return "completed", None
@@ -482,6 +495,7 @@ def _parse_compatibility(response, outputs, warnings):
         return "blocked", "provider_blocked"
     candidates = _parts(_get(response, "candidates"))
     state, reason = "completed", None
+    invalid = False
     for candidate in candidates:
         finish = _get(candidate, "finish_reason")
         finish = _get(finish, "value", finish)
@@ -489,21 +503,31 @@ def _parse_compatibility(response, outputs, warnings):
             state, reason = "blocked", "provider_blocked"
         elif finish != "STOP" and state != "blocked":
             state, reason = "failed", "incomplete_response"
-        for part in _parts(_get(_get(candidate, "content"), "parts")):
-            if _get(part, "thought") is True:
-                continue
-            blob = _get(part, "inline_data")
-            text = _get(part, "text")
-            if blob is not None:
-                if text:
-                    raise ValueError("Ambiguous final content.")
-                _append_image(outputs, _get(blob, "data"), _get(blob, "mime_type"), warnings)
-            elif text is not None:
-                if not isinstance(text, str):
-                    raise ValueError("Invalid final text.")
-                _append(outputs, {"kind": "text", "text": text})
-            else:
-                raise ValueError("Unsupported final content type.")
+        try:
+            parts = _parts(_get(_get(candidate, "content"), "parts"))
+        except ValueError:
+            invalid = True
+            continue
+        for part in parts:
+            try:
+                if _get(part, "thought") is True:
+                    continue
+                blob = _get(part, "inline_data")
+                text = _get(part, "text")
+                if blob is not None:
+                    if text:
+                        raise ValueError("Ambiguous final content.")
+                    _append_image(outputs, _get(blob, "data"), _get(blob, "mime_type"), warnings)
+                elif text is not None:
+                    if not isinstance(text, str):
+                        raise ValueError("Invalid final text.")
+                    _append(outputs, {"kind": "text", "text": text})
+                else:
+                    raise ValueError("Unsupported final content type.")
+            except (ValueError, TypeError, OSError):
+                invalid = True
+    if invalid:
+        raise ValueError("Invalid final content; bounded evidence retained.")
     if len(candidates) != 1 and state == "completed":
         state, reason = "failed", "unexpected_candidate_count"
     return state, reason

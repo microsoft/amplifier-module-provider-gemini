@@ -1,8 +1,9 @@
 """Offline optional-exchange checks; not transport or paid-call qualification.
 
 The SDK's real generateContent types are used with a local dummy client factory.
-Interactions fixtures exercise the draft request/parser only: production dispatch
-is deliberately blocked until its retry control has independent wire evidence.
+These fixtures exercise the optional request/parser with a dummy client.
+Actual Interactions and generateContent transport qualification lives separately
+in test_image_interactions_transport.py.
 """
 
 from __future__ import annotations
