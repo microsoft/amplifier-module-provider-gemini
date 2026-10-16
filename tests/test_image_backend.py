@@ -36,7 +36,7 @@ def provider(response=None):
 
 def response(parts):
     return types.GenerateContentResponse(
-        candidates=[types.Candidate(content=types.Content(parts=parts))],
+        candidates=[types.Candidate(content=types.Content(parts=parts), finish_reason="STOP")],
         model_version="gemini-3.1-flash-image",
         response_id="receipt-test",
         usage_metadata=types.GenerateContentResponseUsageMetadata(prompt_token_count=7),
@@ -78,6 +78,18 @@ async def test_actual_sdk_request_and_mixed_response():
     assert config.http_options.retry_options.attempts == 1
     assert config.response_modalities == ["TEXT", "IMAGE"]
     assert result["usage"]["prompt_token_count"] == 7
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["MAX_TOKENS", "SAFETY", None])
+async def test_incomplete_output_is_retained_but_never_completed(finish):
+    result = response([types.Part(inline_data=types.Blob(data=picture(), mime_type="image/png"))])
+    result.candidates[0].finish_reason = finish
+    p = provider(result)
+    actual = await generate(GeminiImageBackend(p, {"model": "gemini-3.1-flash-image"}))
+    assert actual["status"] == "failed" and actual["data"] == picture()
+    assert p.client.aio.models.generate_content.await_count == 1
 
 
 @pytest.mark.asyncio

@@ -132,20 +132,33 @@ class GeminiImageBackend:
             parts.append(
                 types.Part.from_bytes(data=image["data"], mime_type=image["mimeType"])
             )
-        response = await self.provider.client.aio.models.generate_content(
-            model=model,
-            contents=[types.Content(role="user", parts=parts)],
-            config=types.GenerateContentConfig(
+        from .image_operation import _BoundHTTP, _compatibility_client
+        client = self.provider.client
+        params = {
+            "model": model,
+            "contents": [types.Content(role="user", parts=parts)],
+            "config": types.GenerateContentConfig(
                 response_modalities=["TEXT", "IMAGE"],
                 candidate_count=1,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 http_options=types.HttpOptions(
                     timeout=None if self.timeout is None else self.timeout * 1000,
                     retry_options=types.HttpRetryOptions(attempts=1),
                 ),
             ),
-        )
+        }
+        if hasattr(client, "_api_client"):
+            async with _BoundHTTP(client._api_client._async_httpx_client) as transport:
+                response = await _compatibility_client(client, transport).generate_content(**params)
+        else:
+            # Explicit non-SDK backends retain their declared transport contract.
+            response = await client.aio.models.generate_content(**params)
         outputs, text = [], []
+        complete = len(response.candidates or []) == 1 and not (
+            response.prompt_feedback and response.prompt_feedback.block_reason
+        )
         for candidate in response.candidates or []:
+            complete = complete and candidate.finish_reason == types.FinishReason.STOP
             for part in (candidate.content.parts if candidate.content else []) or []:
                 if part.thought:
                     continue
@@ -169,6 +182,8 @@ class GeminiImageBackend:
                 "Gemini did not return exactly one final image; no automatic retry was made."
             )
         return {
+            "status": "completed" if complete else "failed",
+            **({"reason": "incomplete_image_result"} if not complete else {}),
             "data": outputs[0],
             "model": response.model_version or model,
             "request_id": response.response_id,
