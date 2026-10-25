@@ -73,6 +73,86 @@ async def test_interactions_final_order_storage_and_single_send():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("finish,expected", [
+    pytest.param("omitted", "unknown", id="omitted"),
+    pytest.param(None, "unknown", id="null"),
+    pytest.param("FINISH_REASON_UNSPECIFIED", "unknown", id="unspecified"),
+    pytest.param("FUTURE_FINISH_REASON", "unknown", id="unfamiliar"),
+    pytest.param("OTHER", "failed", id="other"),
+    pytest.param("MAX_TOKENS", "failed", id="max-tokens"),
+    pytest.param("SAFETY", "blocked", id="safety"),
+    pytest.param("STOP", "completed", id="stop"),
+])
+async def test_generate_content_wire_finish_reason_policy(finish, expected):
+    original = png()
+    candidate = {"content": {"role": "model", "parts": [
+        {"text": "first"},
+        {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(original).decode()}},
+        {"text": "last"},
+    ]}}
+    if finish != "omitted":
+        candidate["finishReason"] = finish
+    sent = []
+
+    def respond(req):
+        sent.append(req)
+        return httpx.Response(200, json={
+            "candidates": [candidate], "responseId": "wire-response",
+            "modelVersion": "reported-image-version",
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20,
+                              "totalTokenCount": 30, "thoughtsTokenCount": 7},
+        })
+
+    provider, client, http = fixture(respond)
+    try:
+        item = request()
+        item["selection"]["config"]["image_generation"]["transport"] = "generate_content"
+        preparation = await provider.prepare_image_generation(item)
+        assert preparation["supported"] is True, preparation
+        plan = preparation["plan"]
+        assert not sent
+        result = await provider.generate_image(item, plan=plan)
+        with pytest.raises(ValueError, match="consumed"):
+            await provider.generate_image(item, plan=plan)
+        assert len(sent) == 1
+        assert sent[0].method == "POST"
+        assert str(sent[0].url) == (
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-nano-banana-2.1:generateContent"
+        )  # One physical generateContent send, never Interactions or fallback.
+        assert result["dispatch_state"] == "response_received"
+        assert result["continuation"] is None
+        assert result["outputs"] == [
+            {"kind": "text", "text": "first"},
+            {"kind": "image", "mime_type": "image/png", "data": original},
+            {"kind": "text", "text": "last"},
+        ]
+        assert result["models"] == [
+            {"purpose": "image", "requested": plan["model"], "resolved": "reported-image-version"},
+        ]
+        assert result["upstream"] == {
+            "request_id": None, "response_id": "wire-response", "image_call_id": None,
+        }
+        assert result["usage"]["normalized"] == {
+            "input_tokens": 10, "output_tokens": 20, "total_tokens": 30, "reasoning_tokens": 7,
+        }
+        native = result["usage"]["provider"]
+        assert {name: native[name] for name in (
+            "prompt_token_count", "candidates_token_count", "total_token_count", "thoughts_token_count",
+        )} == {
+            "prompt_token_count": 10, "candidates_token_count": 20,
+            "total_token_count": 30, "thoughts_token_count": 7,
+        }
+        assert client._api_client._http_options.retry_options.attempts == 5
+        assert result["status"] == expected
+        reason = {"completed": None, "blocked": "provider_blocked"}.get(expected, "incomplete_response")
+        assert result.get("reason_code") == reason
+    finally:
+        await http.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["interactions", "generate_content"])
 @pytest.mark.parametrize("bad_position", ["before", "after"])
 @pytest.mark.parametrize("malformed", ["oversized_text", "image_crc"])
