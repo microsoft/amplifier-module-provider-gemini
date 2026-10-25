@@ -57,6 +57,14 @@ the shared chat client's retries or owns cleanup of the borrowed connection.
 Image timeout is the provider's image timeout when configured, otherwise the
 provider timeout; null leaves no elapsed deadline.
 
+For the optional `generate_content` path, absent, null, empty, unspecified or
+unrecognized [candidate stopping evidence](https://ai.google.dev/api/generate-content#v1beta.Candidate)
+means `unknown`; recognized unsuccessful reasons mean `failed`, while existing
+policy-block reasons remain `blocked`. This is adapter policy, not a Google
+mandate, a pollable background operation or authorization to retry. A received
+response is evidence, not success; bounded image/text outputs and available
+provenance remain recoverable.
+
 The current operation accepts one final image, `auto` size/quality/background,
 and one to four edit inputs, except the Flash Lite image model accepts only one.
 Unsupported controls fail before dispatch. Final image/text outputs retain

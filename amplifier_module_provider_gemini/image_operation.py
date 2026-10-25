@@ -501,8 +501,32 @@ def _parse_compatibility(response, outputs, warnings):
         finish = _get(finish, "value", finish)
         if finish in ("SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "SPII", "RECITATION"):
             state, reason = "blocked", "provider_blocked"
-        elif finish != "STOP" and state != "blocked":
+        elif (
+            finish
+            in (
+                "MAX_TOKENS",
+                "LANGUAGE",
+                "OTHER",
+                "MALFORMED_FUNCTION_CALL",
+                "UNEXPECTED_TOOL_CALL",
+                "TOO_MANY_TOOL_CALLS",
+                "IMAGE_OTHER",
+                "NO_IMAGE",
+                "IMAGE_RECITATION",
+                "CONTINUATION",
+                "MISSING_THOUGHT_SIGNATURE",
+                "MALFORMED_RESPONSE",
+                "ESCALATION",
+                "PUP_LIMITED_DISABLED",
+            )
+            and state != "blocked"
+        ):
+            # OTHER is a recognized unsuccessful reason, not an unfamiliar token.
             state, reason = "failed", "incomplete_response"
+        elif finish != "STOP" and state == "completed":
+            # Missing, unspecified or unfamiliar stopping evidence is unknown.
+            # Do not erase an earlier failed/blocked state or skip paid evidence.
+            state, reason = "unknown", "incomplete_response"
         try:
             parts = _parts(_get(_get(candidate, "content"), "parts"))
         except ValueError:

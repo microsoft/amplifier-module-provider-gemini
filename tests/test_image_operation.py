@@ -469,7 +469,7 @@ async def test_invalid_cardinality_and_raster_are_not_success(mounted, parts, ex
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("finish,expected", [("SAFETY", "blocked"), ("MAX_TOKENS", "failed"), (None, "failed")])
+@pytest.mark.parametrize("finish,expected", [("SAFETY", "blocked"), ("MAX_TOKENS", "failed"), (None, "unknown")])
 async def test_blocked_or_incomplete_response_cannot_complete(mounted, finish, expected):
     provider, client, _ = mounted
     client.aio.models.generate_content.return_value = response(finish_reason=finish)
@@ -477,6 +477,105 @@ async def test_blocked_or_incomplete_response_cannot_complete(mounted, finish, e
     result = await provider.generate_image(intent, plan=await prepared(provider, intent))
     assert result["status"] == expected
     client.aio.models.generate_content.assert_awaited_once()
+
+
+async def assert_finish_exchange(mounted, reply, expected):
+    provider, client, _ = mounted
+    reply.model_version = "reported-image-version"
+    reply.usage_metadata = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=10, candidates_token_count=20, total_token_count=30,
+        thoughts_token_count=7,
+    )
+    client.aio.models.generate_content.return_value = reply
+    intent = request()
+    plan = await prepared(provider, intent)
+    client.aio.models.generate_content.assert_not_called()
+    result = await provider.generate_image(intent, plan=plan)
+    with pytest.raises(ValueError, match="consumed"):
+        await provider.generate_image(intent, plan=plan)
+    client.aio.models.generate_content.assert_awaited_once()
+    client.aio.interactions.create.assert_not_called()
+    client.aio.models.list.assert_not_called()
+    provider.complete.assert_not_called()
+    assert result["dispatch_state"] == "response_received"
+    assert result["continuation"] is None  # Unknown is not a pollable/resumable job.
+    assert result["outputs"] == [
+        {"kind": "text", "text": "Before"},
+        {"kind": "image", "mime_type": "image/png", "data": picture()},
+        {"kind": "text", "text": "After"},
+    ]
+    assert result["models"] == [
+        {"purpose": "image", "requested": plan["model"], "resolved": "reported-image-version"},
+    ]
+    assert result["upstream"] == {
+        "request_id": None, "response_id": "offline-response-id", "image_call_id": None,
+    }
+    assert result["usage"]["provider"] == reply.usage_metadata.model_dump(mode="json")
+    assert result["usage"]["normalized"] == {
+        "input_tokens": 10, "output_tokens": 20, "total_tokens": 30, "reasoning_tokens": 7,
+    }
+    assert result["status"] == expected
+    reason = {"completed": None, "blocked": "provider_blocked"}.get(expected, "incomplete_response")
+    assert result.get("reason_code") == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("representation", ["string", "sdk"])
+@pytest.mark.parametrize("finish,expected", [
+    pytest.param(None, "unknown", id="null"),
+    pytest.param("", "unknown", id="empty"),
+    pytest.param("omitted", "unknown", id="omitted"),
+    *[
+        pytest.param(finish, expected, id=finish)
+        for expected, names in [
+            ("completed", "STOP"),
+            ("unknown", "FINISH_REASON_UNSPECIFIED FUTURE_FINISH_REASON"),
+            ("blocked", "SAFETY BLOCKLIST PROHIBITED_CONTENT IMAGE_SAFETY "
+             "IMAGE_PROHIBITED_CONTENT SPII RECITATION"),
+            ("failed", "MAX_TOKENS LANGUAGE OTHER MALFORMED_FUNCTION_CALL "
+             "UNEXPECTED_TOOL_CALL TOO_MANY_TOOL_CALLS IMAGE_OTHER NO_IMAGE "
+             "IMAGE_RECITATION CONTINUATION MISSING_THOUGHT_SIGNATURE "
+             "MALFORMED_RESPONSE ESCALATION PUP_LIMITED_DISABLED"),
+        ]
+        for finish in names.split()
+    ],
+])
+async def test_generate_content_finish_reason_policy(mounted, finish, expected, representation):
+    content = types.Content(role="model", parts=[
+        types.Part(text="Before"), image_part(), types.Part(text="After"),
+    ])
+    if finish == "omitted":
+        candidate = types.Candidate(content=content)
+        assert "finish_reason" not in candidate.model_fields_set
+    else:
+        # The SDK accepts strings and creates pseudo-members for unfamiliar values.
+        value = types.FinishReason(finish) if representation == "sdk" and finish is not None else finish
+        candidate = types.Candidate(content=content, finish_reason=value)
+        if representation == "sdk" and finish is not None:
+            assert isinstance(value, str) and value.value == finish
+    reply = response()
+    reply.candidates = [candidate]
+    await assert_finish_exchange(mounted, reply, expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+@pytest.mark.parametrize("left,right,expected", [
+    pytest.param("STOP", None, "unknown", id="completed-unknown"),
+    pytest.param("STOP", "OTHER", "failed", id="completed-failed"),
+    pytest.param("STOP", "SAFETY", "blocked", id="completed-blocked"),
+    pytest.param(None, "OTHER", "failed", id="unknown-failed"),
+    pytest.param(None, "SAFETY", "blocked", id="unknown-blocked"),
+    pytest.param("OTHER", "SAFETY", "blocked", id="failed-blocked"),
+])
+async def test_generate_content_candidate_finish_dominance(mounted, left, right, expected, reverse):
+    first, second = (right, left) if reverse else (left, right)
+    reply = response([types.Part(text="Before"), image_part()], finish_reason=first)
+    reply.candidates.append(types.Candidate(
+        content=types.Content(role="model", parts=[types.Part(text="After")]),
+        finish_reason=second,
+    ))
+    await assert_finish_exchange(mounted, reply, expected)
 
 
 @pytest.mark.asyncio
