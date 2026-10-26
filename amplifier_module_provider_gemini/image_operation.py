@@ -12,7 +12,7 @@ import json
 import math
 import re
 import uuid
-from copy import copy, deepcopy
+from copy import deepcopy
 from io import BytesIO
 
 import httpx
@@ -130,20 +130,52 @@ def _interactions_reason(client=None):
     return None
 
 
+def _borrow_api_client(owner, transport=None):
+    """Borrow only the qualified SDK base, without inheriting cleanup ownership."""
+    from google.genai._api_client import BaseApiClient
+
+    api = owner._api_client
+    state = getattr(api, "__dict__", None)
+    if (
+        type(api) is not BaseApiClient
+        or not isinstance(state, dict)
+        or not {"_http_options", "_httpx_client", "_async_httpx_client"} <= state.keys()
+        or not callable(getattr(state["_http_options"], "model_copy", None))
+    ):
+        raise TypeError("Unsupported SDK API client state for image operations.")
+
+    class _BorrowedApiClient(BaseApiClient):
+        # No constructor, transport allocation, ownership flags or async finalizer.
+        # Generated request methods bind to this view and its isolated options.
+        def __del__(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def aclose(self):
+            pass
+
+    view = object.__new__(_BorrowedApiClient)
+    view.__dict__ = state.copy()
+    view._borrowed_owner = owner
+    if transport is not None:
+        view._async_httpx_client = transport
+    return view
+
+
 def _interaction_client(client, timeout, transport=None):
     """Use an isolated SDK options view, never alter a shared client's retries.
 
     Qualified with google-genai 2.30.1. Its generated Interactions builder maps
     attempts=1 to TWO physical sends; attempts=0 is required here, unlike
     generateContent's attempts=1. The borrowed
-    HTTP transport stays owned by the original provider; this view is not closed.
+    HTTP transport stays owned by the original provider; view cleanup is a no-op.
     Physical one-request tests guard this private SDK seam.
     """
     from google.genai import types
     from google.genai._gaos.google_genai import AsyncGeminiNextGenInteractions
-    api = copy(client._api_client)
-    if transport is not None:
-        api._async_httpx_client = transport
+    api = _borrow_api_client(client, transport)
     api._http_options = api._http_options.model_copy(update={
         "retry_options": types.HttpRetryOptions(attempts=0),
         "timeout": None if timeout is None else timeout * 1000,
@@ -153,10 +185,8 @@ def _interaction_client(client, timeout, transport=None):
 def _compatibility_client(client, transport=None):
     """Borrow the bound HTTPX transport; aiohttp has an inner disconnect retry."""
     from google.genai import models
-    api = copy(client._api_client)
-    if transport is not None:
-        api._async_httpx_client = transport
-    # This request-local view is never installed on the chat client or closed.
+    api = _borrow_api_client(client, transport)
+    # This request-local view is never installed on the chat client.
     # The generated model resource uses _use_aiohttp to select its request path.
     api._use_aiohttp = lambda: False
     return models.AsyncModels(api)
@@ -165,13 +195,31 @@ def _compatibility_client(client, transport=None):
 def _transport_reason(provider, transport):
     client = provider._client
     if transport == "interactions":
-        return _interactions_reason(client)
-    if transport != "generate_content" or not _compatibility_sdk_available():
-        return "unsupported_sdk"
-    if client is not None and not callable(
-        _get(_get(_get(client, "aio"), "models"), "generate_content")
+        reason = _interactions_reason(client)
+        if reason is not None:
+            return reason
+    elif (
+        transport != "generate_content"
+        or not _compatibility_sdk_available()
+        or (
+            client is not None
+            and not callable(
+                _get(_get(_get(client, "aio"), "models"), "generate_content")
+            )
+        )
     ):
         return "unsupported_sdk"
+    if client is not None:
+        try:
+            # These local factories validate the borrowed base/state without
+            # constructing transports or sending. Keep the same adapter seam
+            # for capability checks, preparation and execution.
+            if transport == "interactions":
+                _interaction_client(client, None)
+            else:
+                _compatibility_client(client)
+        except (ImportError, AttributeError, TypeError):
+            return "unsupported_sdk"
     return None
 
 
@@ -408,6 +456,9 @@ async def prepare(provider, request):
         if transport == "generate_content":
             _compatibility_request(request, plan)
         private_binding = binding(provider)
+        reason = _transport_reason(provider, transport)
+        if reason:
+            return unavailable(reason)
         if transport == "interactions":
             _interaction_client(private_binding[0], plan["timeout"])
     except Exception:  # noqa: BLE001 - optional SDK preparation refuses safely

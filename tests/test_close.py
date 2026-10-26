@@ -81,6 +81,85 @@ async def test_close_actually_closes_a_real_genai_clients_transports():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["aio", "aclose", "close"])
+async def test_close_discovery_failure_does_not_skip_sibling(surface, caplog):
+    """Discovery itself can raise before gather schedules either close."""
+    provider = GeminiProvider(api_key="k")
+    sync_close = MagicMock()
+    async_closed = asyncio.Event()
+    created_coroutines = []
+
+    async def _aclose():
+        async_closed.set()
+
+    def _make_aclose():
+        coroutine = _aclose()
+        created_coroutines.append(coroutine)
+        return coroutine
+
+    class _AsyncClient:
+        @property
+        def aclose(self):
+            if surface == "aclose":
+                raise RuntimeError("aclose discovery failed")
+            return _make_aclose
+
+    class _Client:
+        @property
+        def aio(self):
+            if surface == "aio":
+                raise RuntimeError("aio discovery failed")
+            return _AsyncClient()
+
+        @property
+        def close(self):
+            if surface == "close":
+                raise RuntimeError("close discovery failed")
+            return sync_close
+
+    provider._client = _Client()
+    try:
+        with caplog.at_level(logging.WARNING):
+            await provider.close()
+        assert provider._client is None
+        if surface == "close":
+            assert async_closed.is_set()
+        else:
+            sync_close.assert_called_once()
+        assert any(
+            f"{surface} discovery failed" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        # Baseline creates but never schedules this coroutine when discovery
+        # of client.close fails. Do not let that test artifact emit a warning.
+        for coroutine in created_coroutines:
+            coroutine.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_aclose_factory_failure_does_not_skip_sync_close(error_type, caplog):
+    """A callable can raise while returning its awaitable, not while awaited."""
+    provider = GeminiProvider(api_key="k")
+    client = _fake_client(
+        aclose=MagicMock(side_effect=error_type("aclose invocation failed"))
+    )
+    provider._client = client
+
+    with caplog.at_level(logging.WARNING):
+        await provider.close()
+
+    client.close.assert_called_once()
+    assert provider._client is None
+    if error_type is RuntimeError:
+        assert any(
+            "aclose invocation failed" in record.getMessage()
+            for record in caplog.records
+        )
+
+
+@pytest.mark.asyncio
 async def test_close_calls_both_close_surfaces():
     """Both the async aclose and the sync close are invoked, exactly once."""
     provider = GeminiProvider(api_key="k")
@@ -268,6 +347,35 @@ async def test_close_timeout_config_key_is_recognized(caplog):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        0,
+        -1,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        "0",
+        "-1",
+        "inf",
+        "-inf",
+        "nan",
+    ],
+)
+async def test_close_timeout_rejects_nonpositive_or_nonfinite_values(timeout, caplog):
+    """A cleanup deadline must remain positive and finite after coercion."""
+    with caplog.at_level(logging.WARNING):
+        provider = GeminiProvider(api_key="k", config={"close_timeout": timeout})
+
+    assert provider._close_timeout == _DEFAULT_CLOSE_TIMEOUT
+    assert any(
+        "close_timeout" in record.getMessage()
+        and record.levelno >= logging.WARNING
+        for record in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # Never-built, idempotency, and the CancelledError path.
 # ---------------------------------------------------------------------------
@@ -316,9 +424,9 @@ async def test_close_resets_client_so_the_provider_can_be_reused():
 
 @pytest.mark.asyncio
 async def test_close_swallows_errors_raised_by_the_client(caplog):
-    """A close that raises is logged, never propagated into teardown."""
+    """Both failures are reported without exposing their exception payloads."""
     provider = GeminiProvider(api_key="k")
-    provider._client = _fake_client(
+    client = provider._client = _fake_client(
         aclose=AsyncMock(side_effect=RuntimeError("transport already gone")),
         close=MagicMock(side_effect=OSError("bad fd")),
     )
@@ -327,8 +435,19 @@ async def test_close_swallows_errors_raised_by_the_client(caplog):
         await provider.close()  # must not raise
 
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("transport already gone" in m for m in messages)
-    assert any("bad fd" in m for m in messages)
+    assert len(messages) == 2
+    for label, error_type, reason in (
+        ("async transport (client.aio.aclose)", "RuntimeError", "aclose invocation failed"),
+        ("sync transport (client.close)", "OSError", "close invocation failed"),
+    ):
+        assert sum(
+            label in message and error_type in message and reason in message
+            for message in messages
+        ) == 1
+    assert "transport already gone" not in caplog.text
+    assert "bad fd" not in caplog.text
+    client.aio.aclose.assert_awaited_once()
+    client.close.assert_called_once()
     assert provider._client is None
 
 
@@ -372,3 +491,132 @@ async def test_cancelling_the_caller_leaves_the_shielded_close_running():
     # The shielded close keeps going and completes on its own.
     await asyncio.wait_for(finished.wait(), timeout=5.0)
     assert provider._client is None
+
+
+def test_close_timeout_overflow_warns_and_defaults_locally(caplog):
+    with caplog.at_level(logging.WARNING):
+        provider = GeminiProvider(api_key="k", config={"close_timeout": 10**1000})
+
+    assert provider._close_timeout == _DEFAULT_CLOSE_TIMEOUT
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "close_timeout" in warnings[0] and "positive finite" in warnings[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["neither", "async", "sync"])
+async def test_close_missing_surfaces_are_not_failures(surface, caplog):
+    from types import SimpleNamespace
+
+    async_close = AsyncMock()
+    sync_close = MagicMock()
+    client = SimpleNamespace()
+    if surface == "async":
+        client.aio = SimpleNamespace(aclose=async_close)
+    elif surface == "sync":
+        client.close = sync_close
+    provider = GeminiProvider(api_key="k")
+    provider._client = client
+
+    with caplog.at_level(logging.WARNING):
+        await provider.close()
+
+    assert async_close.await_count == (surface == "async")
+    assert sync_close.call_count == (surface == "sync")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert bool(warnings) == (surface == "neither")
+    if warnings:
+        assert "exposes neither" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_close_discovery_runs_off_the_event_loop():
+    from types import SimpleNamespace
+
+    entered = threading.Event()
+    release = threading.Event()
+    async_close = AsyncMock()
+    sync_close = MagicMock()
+    loop_thread = threading.get_ident()
+    discovery_threads = []
+
+    class Client:
+        aio = SimpleNamespace(aclose=async_close)
+
+        @property
+        def close(self):
+            discovery_threads.append(threading.get_ident())
+            entered.set()
+            release.wait(5)
+            return sync_close
+
+    provider = GeminiProvider(api_key="k", config={"close_timeout": 10.0})
+    provider._client = Client()
+    task = asyncio.create_task(provider.close())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 1.0), 2.0)
+        assert len(discovery_threads) == 1
+        assert discovery_threads[0] != loop_thread
+        async_close.assert_awaited_once()
+        assert not task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 2.0)
+    sync_close.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["aio", "aclose", "async_factory", "async_await", "close", "sync_call"]
+)
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_close_failure_logs_never_include_exception_payload(
+    stage, error_type, caplog
+):
+    canary = "synthetic-cleanup-secret?key=do-not-log"
+    error = error_type(canary)
+    async_close = AsyncMock(side_effect=error if stage == "async_await" else None)
+    sync_close = MagicMock(side_effect=error if stage == "sync_call" else None)
+
+    def make_aclose():
+        if stage == "async_factory":
+            raise error
+        return async_close()
+
+    class Client:
+        @property
+        def aio(self):
+            if stage == "aio":
+                raise error
+            return self
+
+        @property
+        def aclose(self):
+            if stage == "aclose":
+                raise error
+            return make_aclose
+
+        @property
+        def close(self):
+            if stage == "close":
+                raise error
+            return sync_close
+
+    provider = GeminiProvider(api_key="k")
+    provider._client = Client()
+    with caplog.at_level(logging.WARNING):
+        await provider.close()
+
+    assert provider._client is None
+    if stage in ("close", "sync_call"):
+        async_close.assert_awaited_once()
+    else:
+        sync_close.assert_called_once()
+    assert canary not in caplog.text
+    if error_type is RuntimeError:
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "RuntimeError" in warnings[0].getMessage()
+        assert "failed" in warnings[0].getMessage()
+        assert warnings[0].exc_info is None
+        assert all(not isinstance(arg, BaseException) for arg in warnings[0].args)

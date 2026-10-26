@@ -1077,12 +1077,27 @@ class GeminiProvider:
         # Preserve its existing transport bound independently of model waits.
         self._count_timeout = 600.0 if self.timeout is None else self.timeout
         # Hard bound on session-teardown client close -- see close().
-        self._close_timeout = _parse_config_number(
-            "close_timeout",
-            self.config.get("close_timeout"),
-            _DEFAULT_CLOSE_TIMEOUT,
-            float,
-        )
+        try:
+            close_timeout = _parse_config_number(
+                "close_timeout",
+                self.config.get("close_timeout"),
+                _DEFAULT_CLOSE_TIMEOUT,
+                float,
+            )
+        except OverflowError:
+            close_timeout = None
+        if (
+            close_timeout is None
+            or not math.isfinite(close_timeout)
+            or close_timeout <= 0
+        ):
+            logger.warning(
+                "[PROVIDER] Gemini: invalid config 'close_timeout' "
+                "(expected positive finite seconds) -- using default %s",
+                _DEFAULT_CLOSE_TIMEOUT,
+            )
+            close_timeout = _DEFAULT_CLOSE_TIMEOUT
+        self._close_timeout = close_timeout
         self.priority = _parse_config_number(
             "priority", self.config.get("priority"), 100, int
         )
@@ -3557,46 +3572,61 @@ class GeminiProvider:
         that fails is logged, never propagated into session teardown.
 
         Both closes are feature-detected. Every supported google-genai
-        release (>=1.56.0, this module's floor) has both, but an SDK that
+        release (>=2.30.1, this module's floor) has both, but an SDK that
         dropped or renamed one must degrade to "close what exists" rather
         than raise AttributeError out of cleanup.
         """
-        coros = []
-        labels = []
+        labels = (
+            "async transport (client.aio.aclose)",
+            "sync transport (client.close)",
+        )
+        reasons = ["aio discovery failed", "close discovery failed"]
 
-        aio = getattr(client, "aio", None)
-        aclose = getattr(aio, "aclose", None)
-        if callable(aclose):
-            coros.append(aclose())
-            labels.append("async transport (client.aio.aclose)")
+        async def close_async() -> bool:
+            aio = getattr(client, "aio", None)
+            reasons[0] = "aclose discovery failed"
+            aclose = getattr(aio, "aclose", None)
+            if not callable(aclose):
+                return False
+            reasons[0] = "aclose invocation failed"
+            await aclose()
+            return True
 
-        sync_close = getattr(client, "close", None)
-        if callable(sync_close):
-            coros.append(asyncio.to_thread(sync_close))
-            labels.append("sync transport (client.close)")
+        async def close_sync() -> bool:
+            def discover_and_close() -> bool:
+                sync_close = getattr(client, "close", None)
+                if not callable(sync_close):
+                    return False
+                reasons[1] = "close invocation failed"
+                sync_close()
+                return True
 
-        if not coros:
+            return await asyncio.to_thread(discover_and_close)
+
+        # Discovery and awaitable creation belong inside each scheduled worker:
+        # a descriptor or factory failure must not skip its sibling or leak a coro.
+        results = await asyncio.gather(
+            close_async(), close_sync(), return_exceptions=True
+        )
+        if results == [False, False]:
             logger.warning(
                 "[PROVIDER] Gemini: client object %s exposes neither "
                 "aio.aclose() nor close() -- nothing to close, its transport "
                 "is left to garbage collection.",
                 type(client).__name__,
             )
-            return
-
-        results = await asyncio.gather(*coros, return_exceptions=True)
-        for label, result in zip(labels, results):
+        for label, reason, result in zip(labels, reasons, results):
             if isinstance(result, asyncio.CancelledError):
-                # Abandonment path (timeout) or caller cancellation -- the
-                # caller already logs it; don't double-report.
+                # A transport can cancel itself. Preserve quiet cancellation;
+                # the outer timeout path already reports abandonment.
                 continue
-            if isinstance(result, BaseException):
+            if isinstance(result, Exception):
                 logger.warning(
-                    "[PROVIDER] Gemini: closing the %s raised %s: %s -- "
+                    "[PROVIDER] Gemini: closing the %s raised %s (%s) -- "
                     "continuing teardown.",
                     label,
                     type(result).__name__,
-                    result,
+                    reason,
                 )
 
     async def close(self) -> None:

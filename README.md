@@ -54,6 +54,9 @@ Explicit `transport: generate_content` is the compatibility path. It uses
 calling. A request-local client view is forced to borrow the provider's HTTPX
 transport, avoiding aiohttp's inner disconnect retry. Neither transport changes
 the shared chat client's retries or owns cleanup of the borrowed connection.
+Each view retains the owning SDK client; explicit view cleanup and garbage
+collection leave its shared HTTPX clients and aiohttp sessions open. Only the
+owner closes SDK-owned resources; caller-supplied HTTPX clients stay caller-owned.
 Image timeout is the provider's image timeout when configured, otherwise the
 provider timeout; null leaves no elapsed deadline.
 
@@ -239,7 +242,7 @@ Every key below corresponds either to a real parameter in Google's `google.genai
 | `max_tokens` | int | -- | *(deprecated alias)* | Old name for `max_output_tokens`. Prefer the new name in new configs. |
 | `temperature` | float | 0.7 | API: `temperature` | Sampling temperature (0.0-2.0 per Google's docs; this provider does not clamp the range itself). |
 | `timeout` | float or null | null | Provider and SDK | Optional API call / stream idle timeout in seconds; default waits for completion. |
-| `close_timeout` | float | 5.0 | Amplifier-only | Hard bound on closing the genai client at session teardown, seconds. Both of the SDK client's httpx transports are closed (`client.aio.aclose()` for the async one this provider actually uses, and the synchronous `client.close()`, offloaded to a worker thread so it never blocks the event loop); neither has a deadline of its own and either can block forever on a half-closed (CLOSE-WAIT) connection. On timeout the client is abandoned with a WARNING and the sockets are reclaimed at process exit. |
+| `close_timeout` | float | 5.0 | Amplifier-only | Positive finite bound on closing the genai client at session teardown, seconds; invalid values warn and fall back to 5.0. Both of the SDK client's httpx transports are closed (`client.aio.aclose()` for the async one this provider actually uses, and the synchronous `client.close()`, with discovery and invocation offloaded to a worker thread so neither blocks the event loop); neither has a deadline of its own and either can block forever on a half-closed (CLOSE-WAIT) connection. On timeout the client is abandoned with a WARNING and the sockets are reclaimed at process exit. |
 | `priority` | int | 100 | Amplifier-only | Provider selection priority (lower = preferred). Read by the orchestrator's provider-selection logic, not by this module's own request-building code. |
 | `raw` | bool | false | Amplifier-only | Enable raw API request/response capture on the `llm:request` / `llm:response` events (non-streaming path only). |
 | `use_streaming` | bool | true | Amplifier-only | Use `generate_content_stream` instead of a single blocking `generate_content` call. Per-request override: `request.metadata["stream"] = False`. |
@@ -249,6 +252,9 @@ Every key below corresponds either to a real parameter in Google's `google.genai
 | `retry_jitter` | bool | true | Amplifier-only | Add random jitter to retry backoff delays. |
 | `max_concurrent_requests` | int | 5 | Amplifier-only | Process-wide concurrency limit shared across all provider instances (parent + delegated sessions). `0` disables the limit. |
 | `extra_request_params` | dict | `{}` | *(passthrough)* | Settings-only escape hatch -- see [extra_request_params](#extra_request_params-advanced) below. Never an interactive config field; owner-beware. |
+
+Client-close failure warnings identify the transport, exception type and a fixed
+reason. They omit exception payloads, which can contain credentials or request data.
 
 Boolean and numeric values above tolerate string input (`"true"`/`"false"`, `"600"`, etc. -- as written by the app-cli wizard or hand-edited YAML) and warn-and-default rather than crash on anything unparseable. Unrecognized config keys log a warning at mount time (with a "did you mean" suggestion for likely typos); they never silently do nothing without a signal.
 
