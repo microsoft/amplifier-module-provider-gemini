@@ -9,7 +9,27 @@ The amplifier-core pytest plugin provides fixtures automatically:
 - provider_module, tool_module, etc.: Mounted module instances
 """
 
+import asyncio
+import sys
+
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def event_loop_policy(event_loop_policy):
+    """Own pytest-asyncio's policy without changing the caller's loop slot."""
+    previous = event_loop_policy
+    if sys.version_info >= (3, 14):
+        yield previous
+        return
+    policy = asyncio.DefaultEventLoopPolicy()
+    policy.set_event_loop(None)
+    # The plugin reads the current policy before installing its fixture value.
+    asyncio.set_event_loop_policy(policy)
+    try:
+        yield policy
+    finally:
+        asyncio.set_event_loop_policy(previous)
 
 
 @pytest.fixture(autouse=True)
