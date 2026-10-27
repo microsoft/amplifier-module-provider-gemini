@@ -498,7 +498,10 @@ async def test_complete_preserves_thinking_fields_in_actual_sdk_http_body(
             warnings.simplefilter("always")
             await provider.complete(request)
             await provider.complete(request)
-        assert not caught
+        assert not caught, [
+            (w.category.__name__, str(w.message)[:500], w.filename.split("/")[-1], w.lineno)
+            for w in caught
+        ]
         assert len(sent) == 2
         for body in sent:
             # SDK versions differ in nested JSON key spelling. Check the same
