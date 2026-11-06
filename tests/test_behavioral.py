@@ -4,10 +4,10 @@ Inherits authoritative tests from amplifier-core.
 """
 
 import pytest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+import httpx
 
 from amplifier_core.validation.behavioral import ProviderBehaviorTests
+from tests.test_model_discovery import provider_at
 
 
 class TestGeminiProviderBehavior(ProviderBehaviorTests):
@@ -19,9 +19,15 @@ class TestGeminiProviderBehavior(ProviderBehaviorTests):
 
     @pytest.mark.asyncio
     async def test_list_models_returns_list(self, provider_module):
-        """Exercise actual async-pager catalog mapping without a network call."""
-        async def models():
-            yield SimpleNamespace(name="models/gemini-3.8-flash", display_name="Flash",
-                                  input_token_limit=1_000_000, output_token_limit=65536)
-        provider_module.client.aio.models.list = AsyncMock(return_value=models())
-        await super().test_list_models_returns_list(provider_module)
+        """Exercise the real SDK HTTP boundary, never a live list request."""
+        original = provider_module._client
+        async with provider_at(lambda _: httpx.Response(200, json={"models": [{
+            "name": "models/gemini-3.8-flash", "displayName": "Flash",
+            "inputTokenLimit": 1_000_000, "outputTokenLimit": 65536,
+        }]})) as (offline, sent):
+            provider_module._client = offline._client
+            try:
+                await super().test_list_models_returns_list(provider_module)
+                assert len(sent) == 1
+            finally:
+                provider_module._client = original
