@@ -192,6 +192,30 @@ Provides access to Google's Gemini models as an LLM provider for Amplifier with 
 
 ## Supported Models
 
+### Fresh API discovery
+
+`await provider.discover_models()` returns
+`{"version": 1, "source": "provider-api", "models": [...]}`. Each JSON-compatible
+record contains an API-returned `id` and only metadata supplied by that response.
+It fetches every base-model page through the provider's configured SDK connection
+on every call, including empty intermediate pages. Developer API `models/`
+prefixes are removed to match selectable IDs; other resource scopes are retained.
+No family, age or generation-method filter is applied, so the inventory can include
+non-chat models. Listing is not proof of generation entitlement.
+
+Selection settings do not change this inventory. There are no default models,
+synthetic variants, cached results or inference calls. An empty API collection
+can be an explicit array or an omitted repeated field, as permitted by
+[ProtoJSON](https://protobuf.dev/programming-guides/json/#presence-and-default-values).
+For both Developer `models` and Vertex `publisherModels`, omission is accepted
+only in `{}` or a page containing only `nextPageToken`; a continuation token is
+still followed. A complete empty inventory returns `models: []`. Explicit `null`
+or wrong-type collections, unrelated objects, malformed pages and API failures
+raise kernel errors rather than returning empty or partial success. Discovery
+shares existing retry/error translation but validates raw pages before the SDK
+pager's empty-list normalization. Legacy `list_models()` retains its existing
+filters and metadata.
+
 **Current support**: Text generation, tool calling, and thinking. Multimodal capabilities (images, video, audio) are not yet implemented.
 
 Model availability and naming change frequently -- this list reflects what was verified live against `list_models()` on 2026-08-29. Always prefer `amplifier provider models gemini` (or your account's actual `list_models()` result) over this table for what your key can currently use.

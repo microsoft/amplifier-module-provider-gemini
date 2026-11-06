@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import uuid
 from contextlib import suppress
 from typing import Any
@@ -1340,8 +1340,107 @@ class GeminiProvider:
 
         return await generate(self, request, plan=plan)
 
-    async def list_models(self) -> list[ModelInfo]:
-        """List available Gemini models via the live API.
+    async def discover_models(self) -> dict[str, Any]:
+        """Return fresh API inventory, independent of model selection.
+
+        Unlike the legacy list_models(), this optional v1 surface does not
+        filter model families or invent metadata. Listing is not a generation
+        entitlement check. No generation request is made.
+        """
+        models = await self._list_models_from_api(strict=True)
+        return {"version": 1, "source": "provider-api", "models": models}
+
+    async def _fetch_discovery_models(self) -> list[dict[str, Any]]:
+        """Read every raw page through the configured SDK account and route.
+
+        google-genai's public pager normalizes missing/invalid collections to
+        [] and its iterator mishandles empty intermediate pages. Use the same
+        SDK transport as models.list(), before that lossy normalization. This
+        private SDK seam is covered by offline HTTP-boundary tests.
+        """
+        if self._client is None and not self._api_key:
+            raise AuthenticationError(
+                "api_key must be provided for model discovery", provider="gemini"
+            )
+        client = self.client
+        # These are the SDK's default base-model list routes. SDK request
+        # construction retains the client's endpoint, API version and auth.
+        vertex = client.vertexai
+        path = "publishers/google/models" if vertex else "models"
+        collection = "publisherModels" if vertex else "models"
+        models: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        page_token: str | None = None
+
+        def malformed() -> LLMError:
+            # Do not include response bodies, credentials or endpoint values.
+            return LLMError(
+                "Malformed Gemini model discovery response",
+                provider="gemini",
+                retryable=False,
+            )
+
+        while True:
+            page_path = path
+            if page_token:
+                page_path += "?" + urlencode({"pageToken": page_token})
+            response = await client._api_client.async_request("get", page_path, {})
+            try:
+                payload = json.loads(response.body)
+            except (TypeError, ValueError) as exc:
+                raise malformed() from exc
+            if not isinstance(payload, dict) or "error" in payload:
+                raise malformed()
+            # ProtoJSON omits empty repeated fields. Only an empty object or
+            # token-only page can stand for an omitted collection; unrelated
+            # objects must not become a successful empty inventory.
+            if collection not in payload and payload.keys() - {"nextPageToken"}:
+                raise malformed()
+            page_models = payload.get(collection, [])
+            if not isinstance(page_models, list):
+                raise malformed()
+            for model in page_models:
+                if not isinstance(model, dict):
+                    raise malformed()
+                name = model.get("name")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or name != name.strip()
+                    or any(char.isspace() for char in name)
+                ):
+                    raise malformed()
+                # Developer API models/<id> and the short ID are equivalent
+                # selectable names (the SDK's t_model adds this prefix).
+                # Preserve other resource names; do not discard their scope.
+                model_id = name.removeprefix("models/") if not vertex else name
+                if not model_id or model_id.endswith("/"):
+                    raise malformed()
+                item: dict[str, Any] = {"id": model_id}
+                if "displayName" in model:
+                    if not isinstance(model["displayName"], str):
+                        raise malformed()
+                    item["display_name"] = model["displayName"]
+                for source, target in (
+                    ("inputTokenLimit", "context_window"),
+                    ("outputTokenLimit", "max_output_tokens"),
+                ):
+                    if source in model:
+                        value = model[source]
+                        if type(value) is not int or value < 0:
+                            raise malformed()
+                        item[target] = value
+                models.append(item)
+            next_token = payload.get("nextPageToken")
+            if next_token is None or next_token == "":
+                return models
+            if not isinstance(next_token, str) or next_token in seen_tokens:
+                raise malformed()
+            seen_tokens.add(next_token)
+            page_token = next_token
+
+    async def _list_models_from_api(self, *, strict: bool = False) -> list[Any]:
+        """Fetch a complete inventory with shared SDK error translation.
 
         The query is retried with the same shared retry_with_backoff()/
         _retry_config machinery used by complete() on transient failures
@@ -1376,6 +1475,8 @@ class GeminiProvider:
             result.
             """
             try:
+                if strict:
+                    return await self._fetch_discovery_models()
                 page = await self.client.aio.models.list()
                 return [model async for model in page]
             except LLMError:
@@ -1534,12 +1635,15 @@ class GeminiProvider:
                     },
                 )
 
-        raw_models = await retry_with_backoff(
+        return await retry_with_backoff(
             _do_list_models,
             self._retry_config,
             on_retry=_on_retry,
         )
 
+    async def list_models(self) -> list[ModelInfo]:
+        """List Gemini models with the legacy family filters and metadata."""
+        raw_models = await self._list_models_from_api()
         models: list[ModelInfo] = []
         for model in raw_models:
             model_name = getattr(model, "name", "")
