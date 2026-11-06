@@ -13,6 +13,7 @@ sibling fixes in provider-openai (PR #61) and provider-anthropic
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -61,39 +62,15 @@ def _make_provider(
     return provider
 
 
-class _FakeAsyncPager:
-    """Minimal async-iterable stand-in for google.genai's AsyncPager.
-
-    ``list_models()`` does ``page = await self.client.aio.models.list()``
-    then ``[model async for model in page]`` -- this fakes the paginated
-    async-iteration shape without depending on the real SDK's pager
-    implementation.
-    """
-
-    def __init__(self, models: list):
-        self._models = models
-
-    def __aiter__(self):
-        return self._agen()
-
-    async def _agen(self):
-        for m in self._models:
-            yield m
-
-
-def _fake_model(model_id_suffix: str) -> SimpleNamespace:
-    """Create a fake google.genai Model object."""
-    return SimpleNamespace(
-        name=f"models/{model_id_suffix}",
-        display_name=model_id_suffix,
-        input_token_limit=1048576,
-        output_token_limit=8192,
-        thinking=False,
-    )
-
-
-def _fake_models_page(model_id_suffixes: list[str]) -> _FakeAsyncPager:
-    return _FakeAsyncPager([_fake_model(mid) for mid in model_id_suffixes])
+def _fake_models_page(model_id_suffixes: list[str], token=None) -> SimpleNamespace:
+    payload = {"models": [
+        {"name": f"models/{mid}", "displayName": mid,
+         "inputTokenLimit": 1048576, "outputTokenLimit": 8192}
+        for mid in model_id_suffixes
+    ]}
+    if token:
+        payload["nextPageToken"] = token
+    return SimpleNamespace(body=json.dumps(payload))
 
 
 def _make_server_error(
@@ -119,7 +96,8 @@ def test_list_models_succeeds_first_try():
     """No transient failure: exactly one API call, result unchanged."""
     provider = _make_provider()
     mock_client = MagicMock()
-    mock_client.aio.models.list = AsyncMock(
+    mock_client.vertexai = False
+    mock_client._api_client.async_request = AsyncMock(
         return_value=_fake_models_page(["gemini-2.5-flash"])
     )
     provider._client = mock_client
@@ -129,7 +107,7 @@ def test_list_models_succeeds_first_try():
         mp.setattr(asyncio, "sleep", mock_sleep)
         models = asyncio.run(provider.list_models())
 
-        assert mock_client.aio.models.list.await_count == 1
+        assert mock_client._api_client.async_request.await_count == 1
         mock_sleep.assert_not_awaited()
 
     assert len(models) == 1
@@ -142,7 +120,8 @@ def test_list_models_recovers_from_transient_500():
     fake_coordinator = cast(FakeCoordinator, provider.coordinator)
     exc = _make_server_error(500, "Temporarily down")
     mock_client = MagicMock()
-    mock_client.aio.models.list = AsyncMock(
+    mock_client.vertexai = False
+    mock_client._api_client.async_request = AsyncMock(
         side_effect=[exc, _fake_models_page(["gemini-2.5-flash"])]
     )
     provider._client = mock_client
@@ -151,7 +130,7 @@ def test_list_models_recovers_from_transient_500():
         mp.setattr(asyncio, "sleep", AsyncMock())
         models = asyncio.run(provider.list_models())
 
-    assert mock_client.aio.models.list.await_count == 2
+    assert mock_client._api_client.async_request.await_count == 2
     assert len(models) == 1
     assert models[0].id == "gemini-2.5-flash"
 
@@ -169,7 +148,8 @@ def test_list_models_raises_after_retries_exhausted():
     provider = _make_provider(max_retries=2)
     exc = _make_server_error(503, "Still down")
     mock_client = MagicMock()
-    mock_client.aio.models.list = AsyncMock(side_effect=exc)
+    mock_client.vertexai = False
+    mock_client._api_client.async_request = AsyncMock(side_effect=exc)
     provider._client = mock_client
 
     with pytest.MonkeyPatch.context() as mp:
@@ -178,7 +158,7 @@ def test_list_models_raises_after_retries_exhausted():
             asyncio.run(provider.list_models())
 
     # 1 initial + 2 retries = 3 total attempts
-    assert mock_client.aio.models.list.await_count == 3
+    assert mock_client._api_client.async_request.await_count == 3
 
 
 def test_list_models_non_retryable_error_raised_immediately():
@@ -186,7 +166,8 @@ def test_list_models_non_retryable_error_raised_immediately():
     provider = _make_provider()
     exc = _make_client_error(401, "Bad key")
     mock_client = MagicMock()
-    mock_client.aio.models.list = AsyncMock(side_effect=exc)
+    mock_client.vertexai = False
+    mock_client._api_client.async_request = AsyncMock(side_effect=exc)
     provider._client = mock_client
 
     with pytest.MonkeyPatch.context() as mp:
@@ -195,7 +176,7 @@ def test_list_models_non_retryable_error_raised_immediately():
         with pytest.raises(AuthenticationError):
             asyncio.run(provider.list_models())
 
-        assert mock_client.aio.models.list.await_count == 1
+        assert mock_client._api_client.async_request.await_count == 1
         mock_sleep.assert_not_awaited()
 
 
@@ -208,26 +189,15 @@ def test_list_models_mid_pagination_failure_retries_whole_listing():
     and re-iterated from scratch on retry.
     """
 
-    class _FlakyPager:
-        """First iteration dies partway through; second succeeds fully."""
-
-        def __init__(self):
-            self.attempts = 0
-
-        def __aiter__(self):
-            self.attempts += 1
-            return self._agen(self.attempts)
-
-        async def _agen(self, attempt: int):
-            yield _fake_model("gemini-2.5-flash")
-            if attempt == 1:
-                raise _make_server_error(500, "Mid-pagination failure")
-            yield _fake_model("gemini-2.5-pro")
-
     provider = _make_provider()
-    flaky_pager = _FlakyPager()
     mock_client = MagicMock()
-    mock_client.aio.models.list = AsyncMock(return_value=flaky_pager)
+    mock_client.vertexai = False
+    mock_client._api_client.async_request = AsyncMock(side_effect=[
+        _fake_models_page(["gemini-2.5-flash"], "next"),
+        _make_server_error(500, "Mid-pagination failure"),
+        _fake_models_page(["gemini-2.5-flash"], "next"),
+        _fake_models_page(["gemini-2.5-pro"]),
+    ])
     provider._client = mock_client
 
     with pytest.MonkeyPatch.context() as mp:
@@ -238,13 +208,17 @@ def test_list_models_mid_pagination_failure_retries_whole_listing():
     # both models from the successful second attempt are present.
     ids = {m.id for m in models}
     assert ids == {"gemini-2.5-flash", "gemini-2.5-pro"}
+    assert [call.args[1] for call in mock_client._api_client.async_request.await_args_list] == [
+        "models", "models?pageToken=next", "models", "models?pageToken=next",
+    ]
 
 
-def test_list_models_filters_experimental_and_versioned_models():
-    """Existing model filtering (exp/001/002 exclusions) is preserved."""
+def test_list_models_uses_latest_tiers_not_blanket_snapshot_exclusion():
+    """An older sole Pro snapshot remains the newest actually returned Pro."""
     provider = _make_provider()
     mock_client = MagicMock()
-    mock_client.aio.models.list = AsyncMock(
+    mock_client.vertexai = False
+    mock_client._api_client.async_request = AsyncMock(
         return_value=_fake_models_page(
             [
                 "gemini-2.5-flash",
@@ -261,4 +235,4 @@ def test_list_models_filters_experimental_and_versioned_models():
         models = asyncio.run(provider.list_models())
 
     ids = {m.id for m in models}
-    assert ids == {"gemini-2.5-flash"}
+    assert ids == {"gemini-2.5-flash", "gemini-1.5-pro-002"}

@@ -26,7 +26,7 @@ per model rather than collapsed to a constant, because that uniformity is an
 observation about this moment, not a property of the API, and the next model
 that breaks it should break one row rather than the rule.
 
-`list_models()` remains the live source of truth and is not replaced by this
+`list_models(filters={})` remains the live source of truth and is not replaced by this
 table: it reports whatever the API says for every model on the account,
 including ones released after this file was last verified. This table answers
 only the synchronous question `get_info()` has to answer without a network
@@ -56,8 +56,8 @@ class ModelLimits:
 
 #: What an unrecognized model id gets.
 #:
-#: Matches the values `list_models()` already falls back to when the API omits
-#: a limit, and matches every current model. An unknown id is far more likely
+#: Inference-only fallback; model listing uses zero for unknown API limits.
+#: Matches every current model. An unknown id is far more likely
 #: to be a model released after this file was verified -- which would share
 #: these limits -- than a smaller legacy one, and the failure direction is
 #: benign either way: an over-large context window surfaces as a loud API

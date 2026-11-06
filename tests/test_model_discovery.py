@@ -15,6 +15,7 @@ import pytest
 from google import genai
 from google.genai import types
 
+from amplifier_core import ModelInfo
 from amplifier_core.llm_errors import (
     AccessDeniedError,
     AuthenticationError,
@@ -88,11 +89,11 @@ def model(name, **extra):
 
 
 def envelope(ids):
-    return {
-        "version": 1,
-        "source": "provider-api",
-        "models": [{"id": name} for name in ids],
-    }
+    return [
+        ModelInfo(id=name, display_name=name, context_window=0,
+                  max_output_tokens=0, capabilities=[], defaults={})
+        for name in sorted(ids)
+    ]
 
 
 @pytest.mark.asyncio
@@ -114,9 +115,9 @@ async def test_exact_api_ids_without_family_age_or_capability_inference():
         provider,
         sent,
     ):
-        result = await provider.discover_models()
+        result = await provider.list_models(filters={})
         assert result == envelope([name.removeprefix("models/") for name in names])
-        assert json.loads(json.dumps(result)) == result
+        assert all(isinstance(item, ModelInfo) for item in result)
         assert len(sent) == 1
         assert not sent[0].url.params
 
@@ -134,17 +135,11 @@ async def test_preserves_only_response_metadata():
         provider,
         _,
     ):
-        result = await provider.discover_models()
-    assert result == {
-        "version": 1,
-        "source": "provider-api",
-        "models": [{
-            "id": "novel-model",
-            "display_name": "Account model",
-            "context_window": 12345,
-            "max_output_tokens": 678,
-        }],
-    }
+        result = await provider.list_models(filters={})
+    assert result == [ModelInfo(
+        id="novel-model", display_name="Account model", context_window=12345,
+        max_output_tokens=678, capabilities=["thinking"], defaults={},
+    )]
 
 
 @pytest.mark.asyncio
@@ -167,10 +162,10 @@ async def test_genuine_empty_page_is_success_without_defaults(
         return httpx.Response(200, json=terminal)
 
     async with provider_at(respond, vertex=vertex) as (provider, sent):
-        result = await provider.discover_models()
+        result = await provider.list_models(filters={})
         expected_ids = [name if vertex else "first"] if later_page else []
         assert result == envelope(expected_ids)
-        assert json.loads(json.dumps(result)) == result
+        assert all(isinstance(item, ModelInfo) for item in result)
         assert [request.url.params.get("pageToken") for request in sent] == (
             [None, "last"] if later_page else [None]
         )
@@ -200,10 +195,10 @@ async def test_pagination_including_empty_intermediate_pages_and_opaque_token(
         return httpx.Response(200, json={collection: [model(prefix + "last")]})
 
     async with provider_at(respond, vertex=vertex) as (provider, sent):
-        result = await provider.discover_models()
+        result = await provider.list_models(filters={})
         expected_ids = [prefix + name if vertex else name for name in ["first", "last"]]
         assert result == envelope(expected_ids)
-        assert json.loads(json.dumps(result)) == result
+        assert all(isinstance(item, ModelInfo) for item in result)
         assert [request.url.params.get("pageToken") for request in sent] == [
             None, token, "last",
         ]
@@ -220,30 +215,195 @@ async def test_every_call_refetches_and_returns_fresh_results():
         provider,
         sent,
     ):
-        first = await provider.discover_models()
-        first["models"].append({"id": "caller-injected"})
-        assert await provider.discover_models() == envelope(["second"])
-        assert await provider.discover_models() == envelope([])
+        first = await provider.list_models(filters={})
+        first[0].capabilities.append("caller-injected")
+        first.append(envelope(["caller-injected"])[0])
+        assert await provider.list_models(filters={}) == envelope(["second"])
+        assert await provider.list_models(filters={}) == envelope([])
         assert len(sent) == 3
 
 
 @pytest.mark.asyncio
-async def test_model_effort_priority_and_legacy_listing_do_not_select_inventory():
+async def test_defaults_custom_unfiltered_and_empty_through_real_sdk():
+    names = [
+        "gemini-2.5-pro", "gemini-3.7-flash", "gemini-3.8-flash",
+        "gemini-3.8-flash-001", "gemini-3.9-flash-preview",
+        "gemini-3.5-flash-lite", "gemini-3-pro-image-preview", "text-embedding-004",
+    ]
+    records = [model("models/" + name, supportedGenerationMethods=["generateContent"])
+               for name in names]
+    records[-1]["supportedGenerationMethods"] = ["embedContent"]
+    async with provider_at(lambda _: httpx.Response(200, json={"models": records})) as (
+        provider, sent,
+    ):
+        assert [m.id for m in await provider.list_models()] == [
+            "gemini-2.5-pro", "gemini-3.5-flash-lite", "gemini-3.8-flash",
+            "gemini-3.9-flash-preview",
+        ]
+        assert await provider.list_models(filters=None) == await provider.list_models()
+        assert [m.id for m in await provider.list_models(filters={})] == sorted(names)
+        assert [m.id for m in await provider.list_models(filters={"include": ["*-IMAGE-*"]})] == [
+            "gemini-3-pro-image-preview",
+        ]
+        assert await provider.list_models(filters={"include": []}) == []
+        assert all(not request.url.params for request in sent)
+        assert len(sent) == 6
+
+
+@pytest.mark.asyncio
+async def test_explicit_filter_snapshot_before_await_and_concurrent_independence():
+    filters = {"include": ["gemini-2.5-pro"]}
+    async with provider_at(lambda _: httpx.Response(200, json={"models": [
+        model("models/gemini-2.5-pro"), model("models/gemini-3.8-flash"),
+    ]})) as (provider, _):
+        fetch = provider._fetch_discovery_models
+
+        async def mutate_then_fetch():
+            filters["include"].clear()
+            return await fetch()
+
+        provider._fetch_discovery_models = mutate_then_fetch
+        custom, ordinary = await asyncio.gather(
+            provider.list_models(filters=filters), provider.list_models(),
+        )
+        assert [m.id for m in custom] == ["gemini-2.5-pro"]
+        assert [m.id for m in ordinary] == ["gemini-2.5-pro", "gemini-3.8-flash"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_filters_fail_before_transport_and_empty_does_not_hide_errors():
+    async with provider_at(lambda _: httpx.Response(200, json={"unrelated": []})) as (
+        provider, sent,
+    ):
+        with pytest.raises(ValueError):
+            await provider.list_models(filters={"include": "not-an-array"})
+        assert not sent
+        with pytest.raises(LLMError):
+            await provider.list_models(filters={"include": []})
+        assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [
+    {"supportedGenerationMethods": None}, {"supportedGenerationMethods": "generateContent"},
+    {"supportedGenerationMethods": [True]}, {"thinking": "true"},
+])
+async def test_malformed_capability_metadata_is_not_invented(metadata):
+    async with provider_at(lambda _: httpx.Response(200, json={"models": [
+        model("models/gemini-3.8-flash", **metadata),
+    ]})) as (provider, _):
+        with pytest.raises(LLMError, match="Malformed Gemini"):
+            await provider.list_models()
+
+
+@pytest.mark.asyncio
+async def test_reported_capabilities_only_no_name_guesses():
+    records = [
+        model("models/gemini-3.8-flash"),
+        model("models/custom", thinking=True, supportedGenerationMethods=["streamGenerateContent"]),
+        model("models/gemini-3-pro-image-preview", thinking=False),
+    ]
+    async with provider_at(lambda _: httpx.Response(200, json={"models": records})) as (provider, _):
+        found = {m.id: m for m in await provider.list_models(filters={})}
+        assert found["custom"].capabilities == ["streaming", "thinking"]
+        assert found["gemini-3.8-flash"].capabilities == []
+        assert found["gemini-3-pro-image-preview"].capabilities == []
+        assert all(m.context_window == m.max_output_tokens == 0 for m in found.values())
+        assert all(m.defaults == {} for m in found.values())
+
+
+@pytest.mark.asyncio
+async def test_failure_messages_and_retry_events_are_sanitized(monkeypatch):
+    import traceback
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    secret = "credential-and-private-endpoint-must-not-escape"
+    async with provider_at(lambda _: httpx.Response(503, json={"error": {"message": secret}}),
+                           config={"max_retries": 1}) as (provider, _):
+        provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=AsyncMock()))
+        with pytest.raises(ProviderUnavailableError) as caught:
+            await provider.list_models()
+        assert secret not in str(caught.value)
+        assert secret not in "".join(traceback.format_exception(caught.value))
+        assert secret not in repr(provider.coordinator.hooks.emit.call_args_list)
+        assert caught.value.status_code == 503
+        assert caught.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_hidden_exact_model_inference_wire_is_unchanged():
+    """Real SDK generateContent, no live network; listing is not an allow-list."""
+    from amplifier_core.message_models import ChatRequest, Message
+    from types import SimpleNamespace
+
+    sent = []
+
+    def respond(request):
+        sent.append(request)
+        assert request.headers["x-goog-api-key"] == "fixture-exact"
+        if request.method == "GET":
+            return httpx.Response(200, json={"models": [
+                model("models/gemini-3.8-flash"), model("models/gemini-2.5-flash"),
+            ]})
+        assert request.method == "POST"
+        assert request.url.path == "/v1beta/models/gemini-2.5-flash:generateContent"
+        body = json.loads(request.content)
+        assert body["generationConfig"]["maxOutputTokens"] == 123
+        assert body["generationConfig"]["temperature"] == 0.2
+        assert body["generationConfig"]["topP"] == 0.9
+        return httpx.Response(200, json={
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "offline"}]},
+                            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+        })
+
+    transport = httpx.MockTransport(respond)
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as http:
+        with httpx.Client(transport=transport, trust_env=False) as sync:
+            client = genai.Client(api_key="fixture-exact", http_options=types.HttpOptions(
+                base_url="https://exact.invalid", api_version="v1beta",
+                httpx_client=sync, httpx_async_client=http,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ))
+            provider = GeminiProvider(api_key="fixture-exact", config={
+                "default_model": "gemini-2.5-flash", "use_streaming": False,
+                "max_retries": 0, "max_output_tokens": 123, "temperature": 0.2,
+                "extra_request_params": {"top_p": 0.9},
+            })
+            provider._client = client
+            provider.coordinator = SimpleNamespace(hooks=SimpleNamespace(emit=AsyncMock()))
+            request = ChatRequest(messages=[Message(role="user", content="fixture")],
+                                  model="gemini-2.5-flash", reasoning_effort="none")
+            try:
+                await provider.complete(request)
+                assert [m.id for m in await provider.list_models()] == ["gemini-3.8-flash"]
+                assert await provider.list_models(filters={"include": []}) == []
+                await provider.complete(request)
+                posts = [r for r in sent if r.method == "POST"]
+                assert len(posts) == 2
+                assert posts[0].content == posts[1].content
+                assert provider.default_model == "gemini-2.5-flash"
+            finally:
+                await client.aio.aclose()
+                client.close()
+
+
+@pytest.mark.asyncio
+async def test_model_effort_priority_do_not_select_inventory():
     async with provider_at(
         lambda _: httpx.Response(200, json={"models": [model("models/api-only")]}),
     ) as (provider, sent):
-        # Strict discovery must not call the legacy filtered surface.
-        provider.list_models = AsyncMock(side_effect=AssertionError("legacy listing"))
-        before = await provider.discover_models()
+        before = await provider.list_models(filters={})
         provider.config.update({
             "model": "not-in-inventory", "default_model": "another-selection",
             "reasoning_effort": "high", "priority": -100,
         })
         provider.default_model = "another-selection"
         provider.priority = -100
-        after = await provider.discover_models()
+        after = await provider.list_models(filters={})
         assert before == after == envelope(["api-only"])
-        provider.list_models.assert_not_awaited()
+        assert not hasattr(provider, "discover_models")
         assert len(sent) == 2
         assert sent[0].url == sent[1].url
         assert sent[0].content == sent[1].content
@@ -258,8 +418,8 @@ async def test_each_account_and_endpoint_uses_its_own_inventory():
             lambda _: httpx.Response(200, json={"models": [model("models/red-only")]}),
             key="fixture-red", host="red.invalid",
         ) as (red, red_sent):
-            assert await blue.discover_models() == envelope(["blue-only"])
-            assert await red.discover_models() == envelope(["red-only"])
+            assert await blue.list_models(filters={}) == envelope(["blue-only"])
+            assert await red.list_models(filters={}) == envelope(["red-only"])
             assert len(blue_sent) == len(red_sent) == 1
 
 
@@ -323,7 +483,7 @@ async def test_vertex_publisher_discovery_preserves_route_auth_and_pagination(
             provider._client = client
             try:
                 assert client.vertexai is True
-                assert await provider.discover_models() == envelope(names)
+                assert await provider.list_models(filters={}) == envelope(names)
                 assert len(sent) == 2
                 adc.assert_not_called()
             finally:
@@ -354,7 +514,7 @@ async def test_api_errors_never_become_empty_or_partial_success(status, error, l
 
     async with provider_at(respond) as (provider, sent):
         with pytest.raises(error) as caught:
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert caught.value.provider == "gemini"
         assert caught.value.status_code == status
         assert len(sent) == (2 if later_page else 1)
@@ -378,7 +538,7 @@ async def test_later_transient_failure_retries_entire_inventory(monkeypatch):
         return httpx.Response(200, json={"models": [model("models/final")]})
 
     async with provider_at(respond, config={"max_retries": 1}) as (provider, sent):
-        assert await provider.discover_models() == envelope(["attempt-2", "final"])
+        assert await provider.list_models(filters={}) == envelope(["attempt-2", "final"])
         assert len(sent) == 4
         assert [request.url.params.get("pageToken") for request in sent] == [
             None, "next", None, "next",
@@ -393,7 +553,7 @@ async def test_transient_failure_exhausts_existing_retry_policy(monkeypatch):
         config={"max_retries": 2},
     ) as (provider, sent):
         with pytest.raises(ProviderUnavailableError):
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert len(sent) == 3
 
 
@@ -405,7 +565,7 @@ async def test_transport_failure_is_kernel_error(exception):
 
     async with provider_at(respond) as (provider, sent):
         with pytest.raises(LLMError) as caught:
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert caught.value.provider == "gemini"
         assert caught.value.retryable is True
         assert len(sent) == 1
@@ -454,7 +614,7 @@ async def test_malformed_response_is_nonretryable_kernel_error(payload, later_pa
         provider, sent,
     ):
         with pytest.raises(LLMError, match="Malformed Gemini") as caught:
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert caught.value.retryable is False
         assert len(sent) == (2 if later_page else 1)
 
@@ -467,7 +627,7 @@ async def test_invalid_json_is_not_an_empty_inventory(content):
         sent,
     ):
         with pytest.raises(LLMError, match="Malformed Gemini"):
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert len(sent) == 1
 
 
@@ -484,7 +644,7 @@ async def test_repeated_pagination_token_fails_without_partial_result(
         **page, "nextPageToken": "cycle",
     }), vertex=vertex) as (provider, sent):
         with pytest.raises(LLMError, match="Malformed Gemini") as caught:
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert caught.value.retryable is False
         assert len(sent) == 2
 
@@ -495,7 +655,7 @@ async def test_missing_key_fails_before_sdk_construction(monkeypatch):
     monkeypatch.setattr(genai, "Client", constructor)
     provider = GeminiProvider(api_key=None, config={"max_retries": 0})
     with pytest.raises(AuthenticationError):
-        await provider.discover_models()
+        await provider.list_models(filters={})
     constructor.assert_not_called()
 
 
@@ -506,12 +666,12 @@ async def test_cancellation_propagates_without_success_or_retry():
 
     async with provider_at(respond) as (provider, sent):
         with pytest.raises(asyncio.CancelledError):
-            await provider.discover_models()
+            await provider.list_models(filters={})
         assert len(sent) == 1
 
 
 @pytest.mark.asyncio
-async def test_legacy_projection_remains_unchanged_and_independent():
+async def test_default_projection_is_conservative_and_explicit_list_is_unfiltered():
     records = [
         model(name, displayName=name, inputTokenLimit=1000, outputTokenLimit=200)
         for name in [
@@ -523,21 +683,17 @@ async def test_legacy_projection_remains_unchanged_and_independent():
         provider,
         sent,
     ):
-        legacy_before = await provider.list_models()
-        discovered = await provider.discover_models()
-        legacy_after = await provider.list_models()
-        assert legacy_before == legacy_after
-        assert len(legacy_before) == 1
-        legacy = legacy_before[0]
-        assert legacy.id == "gemini-2.5-flash"
-        assert legacy.display_name == "models/gemini-2.5-flash"
-        assert legacy.context_window == 1000
-        assert legacy.max_output_tokens == 200
-        assert legacy.capabilities == [
-            "streaming", "json_mode", "thinking", "tools", "fast", "vision",
-        ]
-        assert legacy.defaults == {"temperature": 0.7, "max_tokens": 200}
-        assert [item["id"] for item in discovered["models"]] == [
+        before = await provider.list_models()
+        discovered = await provider.list_models(filters={})
+        after = await provider.list_models()
+        assert before == after
+        assert [item.id for item in before] == ["gemini-1.5-pro-001", "gemini-2.5-flash"]
+        assert before[1].display_name == "models/gemini-2.5-flash"
+        assert before[1].context_window == 1000
+        assert before[1].max_output_tokens == 200
+        assert before[1].capabilities == []
+        assert before[1].defaults == {}
+        assert [item.id for item in discovered] == sorted([
             record["name"].removeprefix("models/") for record in records
-        ]
+        ])
         assert len(sent) == 3
