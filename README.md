@@ -192,6 +192,89 @@ Provides access to Google's Gemini models as an LLM provider for Amplifier with 
 
 ## Supported Models
 
+### Fresh model listing and recommendations
+
+`await provider.list_models(*, filters=None)` returns the framework's
+`list[ModelInfo]`. It fetches every base-model page through the bound SDK
+connection on each call, including empty intermediate pages. Developer API
+`models/` prefixes are removed to match selectable IDs; other resource scopes
+and ID spelling are retained. Listing is not proof of generation entitlement.
+The candidate-only `discover_models()` method is superseded by this canonical
+method.
+
+No argument or `None` uses an immutable snapshot of `config.model_filters`.
+When not configured, the defaults are:
+
+```python
+{"include": ["*"], "exclude": [], "hide_dated": True,
+ "chat_only": True, "latest_per_tier": True}
+```
+
+- `include` / `exclude`: case-insensitive, OS-independent glob matching against
+  selectable IDs. `include=[]` includes none; exclusion wins.
+- `hide_dated`: hide a `YYYY-MM-DD` snapshot only when its selected alias exists.
+- `chat_only`: use reported generation methods when supplied. When absent
+  (including Vertex publisher records), recognize ordinary numeric Gemini
+  Pro/Flash/Flash-Lite names conservatively. Image/video/audio/TTS/embedding
+  names are omitted. Name recognition is recommendation policy, not capability
+  evidence.
+- `latest_per_tier`: select the latest numeric version of each recognized tier
+  within each resource scope, plus a preview/experimental version only when
+  strictly newer than that tier's stable version (or when no stable exists).
+  Prefer an alias within the same version/channel, otherwise the newest dated
+  or numbered snapshot. Do not rank tiers against each other. Unknown families,
+  suffixes and unversioned `latest` aliases are omitted by this policy.
+
+Every explicit mapping **replaces**, rather than merges, the defaults:
+
+```python
+recommended = await provider.list_models()
+all_models = await provider.list_models(filters={})  # truly unfiltered
+older = await provider.list_models(filters={"include": ["gemini-2.5-*"]})
+none = await provider.list_models(filters={"include": []})
+```
+
+`{}` includes unknown families and media-only models. An explicitly selected
+inference model remains usable even when omitted from recommendations; listing
+never rewrites its ID, effort or request parameters. Image generation uses its
+separate selection interface. Invalid selectors fail before API I/O, and caller
+mutation cannot change an in-flight selector.
+
+`get_model_list_info()` performs no API I/O and returns fresh v1 metadata:
+`source: "provider-api"`, `filters_keyword: "filters"`, `filters_schema`,
+`default_filters`, `unfiltered: {}`, `override: "replace"`.
+
+Limits come only from API metadata. Core requires integer limits, so **zero means
+unknown in this listing**, not an inference token budget. Missing capabilities
+are not guessed: `thinking: true` supplies `thinking`, and a reported
+`streamGenerateContent` method supplies `streaming`. `generateContent` alone
+does not establish tools, vision or JSON mode. Listing `defaults` is empty.
+There is no fabricated Pro ID or static fallback.
+
+All filtering is local, after complete validation. The locked `google-genai`
+2.30.1 SDK exposes a filter string, but neither a common Developer/Vertex filter
+grammar nor an equivalent latest-tier/alias/glob policy is established. No
+unsupported native query is sent; only required pagination tokens are added.
+The SDK's own transport retains API keys, custom endpoints and Vertex routing.
+
+An empty API collection
+can be an explicit array or an omitted repeated field, as permitted by
+[ProtoJSON](https://protobuf.dev/programming-guides/json/#presence-and-default-values).
+For both Developer `models` and Vertex `publisherModels`, omission is accepted
+only in `{}` or a page containing only `nextPageToken`; a continuation token is
+still followed. A complete empty inventory returns `[]`. Explicit `null`
+or wrong-type collections, unrelated objects, malformed pages and API failures
+raise typed kernel errors rather than returning empty or partial success.
+Listing shares existing retry/error translation, with sanitized error messages,
+and validates raw pages before the SDK pager's empty-list normalization. An
+empty selector still validates the inventory; it does not mask an outage.
+
+Controlled fixture example (not an account entitlement claim): when the API
+returns `gemini-2.5-pro`, Flash 3.7/3.8, `gemini-3.5-flash-lite`,
+`gemini-3.9-flash-preview`, and an image preview, defaults retain the returned
+Pro, Flash 3.8, Flash-Lite 3.5 and Flash 3.9 preview. If no Pro is returned,
+none is added.
+
 **Current support**: Text generation, tool calling, and thinking. Multimodal capabilities (images, video, audio) are not yet implemented.
 
 Model availability and naming change frequently -- this list reflects what was verified live against `list_models()` on 2026-08-29. Always prefer `amplifier provider models gemini` (or your account's actual `list_models()` result) over this table for what your key can currently use.
@@ -238,6 +321,7 @@ Every key below corresponds either to a real parameter in Google's `google.genai
 |-----------|------|---------|---------------------|-------------|
 | `api_key` | string | env: `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Amplifier-only | Google AI API key. Env vars match the official SDK's own resolution (`GOOGLE_API_KEY` wins if both are set). |
 | `default_model` | string | `gemini-3.8-flash` | Amplifier-only | Default model to use when a request doesn't override it. |
+| `model_filters` | mapping | See [model listing](#fresh-model-listing-and-recommendations) | Amplifier-only | Frozen recommendation policy; explicit `list_models(filters=...)` replaces it. `{}` means unfiltered. Does not restrict inference. |
 | `max_output_tokens` | int | model default (65,536 for every current model) | API: `max_output_tokens` | Maximum output tokens. **Renamed from `max_tokens`** to match Google's own parameter name -- `max_tokens` still works as a deprecated alias (one-shot warning; `max_output_tokens` always wins if both are set). |
 | `max_tokens` | int | -- | *(deprecated alias)* | Old name for `max_output_tokens`. Prefer the new name in new configs. |
 | `temperature` | float | 0.7 | API: `temperature` | Sampling temperature (0.0-2.0 per Google's docs; this provider does not clamp the range itself). |

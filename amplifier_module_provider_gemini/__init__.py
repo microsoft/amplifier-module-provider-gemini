@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import uuid
 from contextlib import suppress
 from typing import Any
@@ -52,6 +52,7 @@ from ._capabilities import get_limits
 from ._capabilities import has_exact_model_limits
 from ._capabilities import has_known_limits
 from ._cost import compute_cost
+from ._model_listing import DEFAULT_FILTERS, ModelFilters, selector_schema
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
@@ -810,6 +811,7 @@ _CONSUMED_CONFIG_KEYS: frozenset[str] = frozenset(
         "retry_jitter",
         "max_concurrent_requests",
         "extra_request_params",
+        "model_filters",
     }
 )
 
@@ -1056,6 +1058,11 @@ class GeminiProvider:
             add_cost if add_cost is not None else lambda cost, model=None: None
         )
         self.config = config or {}
+        self._model_filters = (
+            ModelFilters.parse(self.config["model_filters"])
+            if "model_filters" in self.config
+            else DEFAULT_FILTERS
+        )
         self.coordinator = coordinator
         # Current Flash family default. Explicit operator pins remain unchanged.
         _sweep_unknown_config_keys(self.config)
@@ -1340,8 +1347,122 @@ class GeminiProvider:
 
         return await generate(self, request, plan=plan)
 
-    async def list_models(self) -> list[ModelInfo]:
-        """List available Gemini models via the live API.
+    def get_model_list_info(self) -> dict[str, Any]:
+        """Describe the optional selector extension without API I/O."""
+        return {
+            "version": 1,
+            "source": "provider-api",
+            "filters_keyword": "filters",
+            "filters_schema": selector_schema(),
+            "default_filters": self._model_filters.as_dict(),
+            "unfiltered": {},
+            "override": "replace",
+        }
+
+    async def _fetch_discovery_models(self) -> list[dict[str, Any]]:
+        """Read every raw page through the configured SDK account and route.
+
+        google-genai's public pager normalizes missing/invalid collections to
+        [] and its iterator mishandles empty intermediate pages. Use the same
+        SDK transport as models.list(), before that lossy normalization. This
+        private SDK seam is covered by offline HTTP-boundary tests.
+        """
+        if self._client is None and not self._api_key:
+            raise AuthenticationError(
+                "api_key must be provided for model discovery", provider="gemini"
+            )
+        client = self.client
+        # These are the SDK's default base-model list routes. SDK request
+        # construction retains the client's endpoint, API version and auth.
+        vertex = client.vertexai
+        path = "publishers/google/models" if vertex else "models"
+        collection = "publisherModels" if vertex else "models"
+        models: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        page_token: str | None = None
+
+        def malformed() -> LLMError:
+            # Do not include response bodies, credentials or endpoint values.
+            return LLMError(
+                "Malformed Gemini model discovery response",
+                provider="gemini",
+                retryable=False,
+            )
+
+        while True:
+            page_path = path
+            if page_token:
+                page_path += "?" + urlencode({"pageToken": page_token})
+            response = await client._api_client.async_request("get", page_path, {})
+            try:
+                payload = json.loads(response.body)
+            except (TypeError, ValueError) as exc:
+                raise malformed() from exc
+            if not isinstance(payload, dict) or "error" in payload:
+                raise malformed()
+            # ProtoJSON omits empty repeated fields. Only an empty object or
+            # token-only page can stand for an omitted collection; unrelated
+            # objects must not become a successful empty inventory.
+            if collection not in payload and payload.keys() - {"nextPageToken"}:
+                raise malformed()
+            page_models = payload.get(collection, [])
+            if not isinstance(page_models, list):
+                raise malformed()
+            for model in page_models:
+                if not isinstance(model, dict):
+                    raise malformed()
+                name = model.get("name")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or name != name.strip()
+                    or any(char.isspace() for char in name)
+                ):
+                    raise malformed()
+                # Developer API models/<id> and the short ID are equivalent
+                # selectable names (the SDK's t_model adds this prefix).
+                # Preserve other resource names; do not discard their scope.
+                model_id = name.removeprefix("models/") if not vertex else name
+                if not model_id or model_id.endswith("/"):
+                    raise malformed()
+                item: dict[str, Any] = {"id": model_id}
+                if "displayName" in model:
+                    if not isinstance(model["displayName"], str):
+                        raise malformed()
+                    item["display_name"] = model["displayName"]
+                for source, target in (
+                    ("inputTokenLimit", "context_window"),
+                    ("outputTokenLimit", "max_output_tokens"),
+                ):
+                    if source in model:
+                        value = model[source]
+                        if type(value) is not int or value < 0:
+                            raise malformed()
+                        item[target] = value
+                # Preserve only actual metadata. Absent fields are unknown,
+                # not evidence of tools, vision, JSON mode or streaming.
+                if "supportedGenerationMethods" in model:
+                    methods = model["supportedGenerationMethods"]
+                    if not isinstance(methods, list) or any(
+                        not isinstance(method, str) or not method for method in methods
+                    ):
+                        raise malformed()
+                    item["generation_methods"] = methods
+                if "thinking" in model:
+                    if not isinstance(model["thinking"], bool):
+                        raise malformed()
+                    item["thinking"] = model["thinking"]
+                models.append(item)
+            next_token = payload.get("nextPageToken")
+            if next_token is None or next_token == "":
+                return models
+            if not isinstance(next_token, str) or next_token in seen_tokens:
+                raise malformed()
+            seen_tokens.add(next_token)
+            page_token = next_token
+
+    async def _list_models_from_api(self) -> list[dict[str, Any]]:
+        """Fetch a complete inventory with shared SDK error translation.
 
         The query is retried with the same shared retry_with_backoff()/
         _retry_config machinery used by complete() on transient failures
@@ -1376,8 +1497,7 @@ class GeminiProvider:
             result.
             """
             try:
-                page = await self.client.aio.models.list()
-                return [model async for model in page]
+                return await self._fetch_discovery_models()
             except LLMError:
                 raise  # Already translated, don't double-wrap
             except Exception as e:
@@ -1385,10 +1505,7 @@ class GeminiProvider:
                 if genai_errors is not None:
                     if isinstance(e, genai_errors.ClientError):
                         code = getattr(e, "code", None)
-                        details = getattr(e, "details", None)
-                        error_msg = (
-                            json.dumps(details) if details is not None else str(e)
-                        )
+                        error_msg = "Gemini model listing failed"
                         if code == 429:
                             # Try to extract Retry-After from httpx response headers.
                             retry_after_val = self._extract_retry_after(e)
@@ -1434,10 +1551,7 @@ class GeminiProvider:
                         ) from e
                     if isinstance(e, genai_errors.ServerError):
                         code = getattr(e, "code", None)
-                        details = getattr(e, "details", None)
-                        error_msg = (
-                            json.dumps(details) if details is not None else str(e)
-                        )
+                        error_msg = "Gemini model listing failed"
                         retry_after_val = self._extract_retry_after(e)
                         raise ProviderUnavailableError(
                             error_msg,
@@ -1458,7 +1572,7 @@ class GeminiProvider:
                         ):
                             retryable = False
                         raise RateLimitError(
-                            str(e),
+                            "Gemini model listing failed",
                             provider="gemini",
                             status_code=429,
                             retryable=retryable,
@@ -1466,7 +1580,7 @@ class GeminiProvider:
                         ) from e
                     if isinstance(e, google_exceptions.Unauthenticated):
                         raise AuthenticationError(
-                            str(e), provider="gemini", status_code=401
+                            "Gemini model listing failed", provider="gemini", status_code=401
                         ) from e
                     if isinstance(e, google_exceptions.PermissionDenied):
                         # Falsy check (not just `is None`) is intentional:
@@ -1482,39 +1596,33 @@ class GeminiProvider:
                                 retryable=True,
                             ) from e
                         raise AccessDeniedError(
-                            str(e), provider="gemini", status_code=403
+                            "Gemini model listing failed", provider="gemini", status_code=403
                         ) from e
                     if isinstance(e, google_exceptions.NotFound):
                         raise NotFoundError(
-                            str(e), provider="gemini", status_code=404
+                            "Gemini model listing failed", provider="gemini", status_code=404
                         ) from e
                     if isinstance(e, google_exceptions.InvalidArgument):
                         raise InvalidRequestError(
-                            str(e), provider="gemini", status_code=400
+                            "Gemini model listing failed", provider="gemini", status_code=400
                         ) from e
                     if isinstance(e, google_exceptions.ServiceUnavailable):
                         raise ProviderUnavailableError(
-                            str(e),
+                            "Gemini model listing failed",
                             provider="gemini",
                             status_code=503,
                             retryable=True,
                         ) from e
                     if isinstance(e, google_exceptions.DeadlineExceeded):
                         raise LLMTimeoutError(
-                            str(e),
+                            "Gemini model listing failed",
                             provider="gemini",
                             retryable=True,
                         ) from e
 
                 # Unknown errors default to retryable per design doc
-                details = getattr(e, "details", None)
-                error_msg = (
-                    json.dumps(details)
-                    if details is not None
-                    else (str(e) or f"{type(e).__name__}: (no message)")
-                )
                 raise LLMError(
-                    error_msg,
+                    "Gemini model listing failed",
                     provider="gemini",
                     retryable=True,
                 ) from e
@@ -1534,59 +1642,45 @@ class GeminiProvider:
                     },
                 )
 
-        raw_models = await retry_with_backoff(
+        return await retry_with_backoff(
             _do_list_models,
             self._retry_config,
             on_retry=_on_retry,
         )
 
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """Return a fresh complete API catalog with explicit local selectors.
+
+        None uses frozen configured defaults; any mapping replaces them.
+        {} is unfiltered. Selection never changes inference configuration.
+        All pages are validated before filtering, even for include=[].
+        """
+        selector = self._model_filters if filters is None else ModelFilters.parse(filters)
+        try:
+            raw_models = await self._list_models_from_api()
+        except LLMError as error:
+            # SDK exception chains may contain bodies, endpoint URLs or keys.
+            # Keep the typed/status/retry contract, not the transport payload.
+            raise error from None
         models: list[ModelInfo] = []
-        for model in raw_models:
-            model_name = getattr(model, "name", "")
-            # Filter to gemini models only (exclude tuned models, etc.)
-            if not model_name or "gemini" not in model_name.lower():
-                continue
-
-            # Extract model ID from name (format: models/gemini-2.5-flash)
-            model_id = model_name.split("/")[-1] if "/" in model_name else model_name
-
-            # Skip experimental/deprecated models
-            if "exp" in model_id or "001" in model_id or "002" in model_id:
-                continue
-
-            display_name = getattr(model, "display_name", model_id)
-            input_limit = getattr(
-                model, "input_token_limit", DEFAULT_LIMITS.context_window
-            )
-            output_limit = getattr(
-                model, "output_token_limit", DEFAULT_LIMITS.max_output_tokens
-            )
-            supports_thinking = getattr(model, "thinking", False)
-
-            # Determine capabilities based on model
-            capabilities = ["streaming", "json_mode"]
-            if supports_thinking or "2.5" in model_id or "3" in model_id:
+        for model in selector.select(raw_models):
+            capabilities = []
+            if "streamGenerateContent" in model.get("generation_methods", []):
+                capabilities.append("streaming")
+            if model.get("thinking") is True:
                 capabilities.append("thinking")
-            # All gemini models except 2.0-flash-lite support tools
-            if "2.0-flash-lite" not in model_id:
-                capabilities.append("tools")
-            if "flash" in model_id.lower():
-                capabilities.append("fast")
-            # All Gemini 2.x+ models support vision (image input)
-            if "2." in model_id or "3" in model_id:
-                capabilities.append("vision")
-
             models.append(
                 ModelInfo(
-                    id=model_id,
-                    display_name=display_name,
-                    context_window=input_limit,
-                    max_output_tokens=output_limit,
+                    id=model["id"],
+                    display_name=model.get("display_name", model["id"]),
+                    # Core requires integers: zero means unknown here, never
+                    # an inference limit. Do not borrow another model's limits.
+                    context_window=model.get("context_window", 0),
+                    max_output_tokens=model.get("max_output_tokens", 0),
                     capabilities=capabilities,
-                    defaults={
-                        "temperature": 0.7,
-                        "max_tokens": output_limit,
-                    },
+                    defaults={},
                 )
             )
 
