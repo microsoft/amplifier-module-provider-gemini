@@ -72,11 +72,16 @@ def _request() -> ChatRequest:
             Message(
                 role="assistant",
                 content=[
-                    ThinkingBlock(thinking="reasoning", signature=signature),
+                    ThinkingBlock(
+                        thinking="reasoning",
+                        signature=signature,
+                        thinking_provenance={"version": 1, "provider": "gemini"},
+                    ),
                     ToolCallBlock(
                         id="call-1",
                         name="lookup",
                         input={"query": "native count"},
+                        thinking_provenance={"version": 1, "provider": "gemini"},
                     ),
                 ],
                 tool_calls=[
@@ -85,6 +90,7 @@ def _request() -> ChatRequest:
                         "name": "lookup",
                         "arguments": {"query": "native count"},
                         "signature": signature,
+                        "thinking_provenance": {"version": 1, "provider": "gemini"},
                     }
                 ],
             ),
@@ -152,6 +158,9 @@ async def test_count_projection_matches_the_real_sdk_generation_body(
     assert "automaticFunctionCalling" not in expected
     assert expected["systemInstruction"]["parts"] == [{"text": "System instructions"}]
     assert expected["tools"][0]["functionDeclarations"][0]["name"] == "lookup"
+    assert [
+        part.get("thoughtSignature") for part in expected["contents"][2]["parts"]
+    ] == [base64.b64encode(b"thought-signature").decode("ascii")] * 2
     client = genai.Client(
         api_key="test-key",
         http_options=types.HttpOptions(
