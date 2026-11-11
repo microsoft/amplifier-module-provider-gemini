@@ -520,7 +520,12 @@ step retains its own signature. Streaming never assigns a new part's signature
 to the preceding block or merges signed parts with other parts. If a legacy
 loop drops `tool_calls` extras, recovery requires exactly one same-message
 Gemini-tagged content block matching the nonempty call ID, name and arguments.
-Content blocks alone do not authorize reconstructing function calls.
+When the duplicate `tool_calls` field is absent, valid Core `ToolCallBlock`
+content is the call representation: it is serialized in content order, with
+tool-result names recovered by call ID. An explicitly present `tool_calls`
+field (including `[]` or `null`) remains authoritative and suppresses or
+overrides conflicting content calls. This serializes history; it does not
+execute tools.
 
 **Compatibility policy:** untagged history is imported history, not presumed
 native just because Gemini is now selected, the model name looks native, or
@@ -539,7 +544,10 @@ requires the first function call of **each step** in the current turn to retain
 its signature on Gemini 3/4. For a foreign/untagged imported step on those model
 families, this adapter uses Google's documented
 `skip_thought_signature_validator` import sentinel on the first function call
-only (base64 on the SDK/REST byte field). This is an explicit import escape
+only (base64 on the SDK/REST byte field). Shorthand, `models/`, Vertex Google
+publisher names and full project/location Google publisher resources use the
+same model-family compatibility rule; resource names never establish history
+provenance. This is an explicit import escape
 hatch, **not** native reasoning continuity or a fabricated cryptographic
 signature. Gemini 2.x imports receive no sentinel. Known-native missing
 signatures are not repaired with a sentinel; required native state must be

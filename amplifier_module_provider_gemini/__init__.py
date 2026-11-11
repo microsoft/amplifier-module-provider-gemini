@@ -19,6 +19,7 @@ from decimal import Decimal
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import quote, urlencode
 import uuid
@@ -556,6 +557,40 @@ def _native_signature(block: dict[str, Any]) -> str | None:
 _IMPORTED_CALL_SIGNATURE = base64.b64encode(
     b"skip_thought_signature_validator"
 ).decode("ascii")
+
+
+def _requires_function_call_signatures(model: str) -> bool:
+    """Recognize API model resources, not the origin of conversation state.
+
+    Developer API names and both Vertex publisher resource forms address the
+    same model family. Do not extract an arbitrary final path component: other
+    publishers, tuned models and unknown resource shapes have no such contract.
+    """
+    return re.fullmatch(
+        r"(?:models/|(?:projects/[^/]+/locations/[^/]+/)?publishers/google/models/)?"
+        r"gemini-[34](?:[.-][^/]+)?",
+        model,
+    ) is not None
+
+
+def _message_tool_calls(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Select the authoritative representation without altering stored history.
+
+    An explicit duplicate field (including [] or None) wins. When it is absent,
+    Core's ToolCallBlock is itself a valid call representation, not just a
+    signature backup. Preserve its provider extras while mapping input to the
+    duplicate call shape consumed by replay and result-name lookup.
+    """
+    if "tool_calls" in msg:
+        return msg["tool_calls"] or []
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        dict(block, arguments=block.get("input", {}))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_call"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3417,8 +3452,10 @@ class GeminiProvider:
     def _assistant_parts(
         self, msg: dict[str, Any], *, import_signatures: bool
     ) -> list[dict[str, Any]]:
-        """Replay native part order; canonical tool_calls remain call authority.
+        """Replay native part order using the authoritative call representation.
 
+        An explicit tool_calls field wins; otherwise Core content blocks supply
+        calls. This only serializes history and never executes/reissues tools.
         The legacy loop may drop tool-call extras but retain content blocks.
         Recover only from one same-message block with the same nonempty ID,
         name AND arguments. Explicit foreign/invalid provenance never inherits
@@ -3430,7 +3467,7 @@ class GeminiProvider:
             if isinstance(content, list)
             else []
         )
-        calls = msg.get("tool_calls") or []
+        calls = _message_tool_calls(msg)
         call_blocks = [block for block in blocks if block.get("type") == "tool_call"]
 
         def matches(block: dict[str, Any], call: dict[str, Any]) -> bool:
@@ -3555,11 +3592,7 @@ class GeminiProvider:
         gemini_contents = []
         tool_names: dict[str, str] = {}
         # This selects an API compatibility rule, never history provenance.
-        import_signatures = (
-            (model or self.default_model)
-            .removeprefix("models/")
-            .startswith(("gemini-3", "gemini-4"))
-        )
+        import_signatures = _requires_function_call_signatures(model or self.default_model)
 
         for msg in messages:
             role = msg.get("role")
@@ -3574,7 +3607,7 @@ class GeminiProvider:
             if role == "assistant":
                 parts = self._assistant_parts(msg, import_signatures=import_signatures)
                 gemini_contents.append({"role": "model", "parts": parts})
-                for call in msg.get("tool_calls") or []:
+                for call in _message_tool_calls(msg):
                     if call.get("id"):
                         tool_names[call["id"]] = call.get("name") or call.get("tool", "")
 

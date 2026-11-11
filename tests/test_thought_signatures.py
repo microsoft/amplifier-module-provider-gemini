@@ -22,6 +22,7 @@ import pytest
 import httpx
 from amplifier_core import ModuleCoordinator
 from amplifier_core.message_models import ChatRequest, Message, ThinkingBlock
+from google.oauth2.credentials import Credentials
 from google import genai
 from google.genai import types
 
@@ -644,8 +645,8 @@ def test_legacy_sequential_calls_do_not_recover_across_assistant_messages():
     assert "thought_signature" not in function_parts[1]
 
 
-def test_tool_call_content_alone_does_not_reconstruct_a_function_call():
-    """Content remains provenance-only; tool_calls still control emitted calls."""
+def test_explicit_empty_tool_calls_suppresses_content_function_calls():
+    """An explicit canonical list wins over the duplicate content blocks."""
     messages = [
         {
             "role": "assistant",
@@ -872,7 +873,15 @@ async def test_stream_signatures_stay_on_original_parts_including_empty_seals():
     assert [p.get("text") for p in parts] == ["think", "answer", None, None, "tail", ""]
 
 
-@pytest.mark.parametrize("model", ["gemini-3.8-flash", "models/gemini-4-pro"])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-3.8-flash",
+        "models/gemini-4-pro",
+        "publishers/google/models/gemini-3.8-flash",
+        "projects/offline-project/locations/us-central1/publishers/google/models/gemini-4-pro",
+    ],
+)
 def test_known_native_missing_signature_is_not_fabricated(model):
     provider = _make_provider()
     message = {
@@ -1016,8 +1025,24 @@ async def test_stream_signature_only_seals_are_not_lost_or_moved(thought):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["gemini-3.8-flash", "gemini-4-pro"])
-async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(model):
+@pytest.mark.parametrize(
+    ("model", "vertex"),
+    [
+        ("gemini-3.8-flash", False),
+        ("gemini-4-pro", False),
+        ("models/gemini-3.8-flash", False),
+        ("gemini-3.8-flash", True),
+        ("publishers/google/models/gemini-3.8-flash", True),
+        ("gemini-4-pro", True),
+        (
+            "projects/offline-project/locations/us-central1/publishers/google/models/gemini-4-pro",
+            True,
+        ),
+    ],
+)
+async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(
+    model, vertex
+):
     """One offline SDK send, with native signatures and import sentinel distinct."""
     provider = _make_provider()
     first = _persist_response(
@@ -1075,9 +1100,11 @@ async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(model)
     request = ChatRequest(messages=messages, metadata={"stream": False})
     original = request.model_dump_json()
     sent = []
+    paths = []
 
     def receive(http_request):
         sent.append(json.loads(http_request.content))
+        paths.append(http_request.url.path)
         return httpx.Response(
             200,
             json={
@@ -1090,8 +1117,18 @@ async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(model)
             },
         )
 
+    connection = (
+        {
+            "vertexai": True,
+            "project": "offline-project",
+            "location": "us-central1",
+            "credentials": Credentials(token="synthetic-offline-token"),
+        }
+        if vertex
+        else {"api_key": "synthetic-key"}
+    )
     client = genai.Client(
-        api_key="synthetic-key",
+        **connection,
         http_options=types.HttpOptions(
             base_url="https://unit.test/",
             async_client_args={"transport": httpx.MockTransport(receive)},
@@ -1102,6 +1139,16 @@ async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(model)
         await provider.complete(request, model=model)
         assert request.model_dump_json() == original
         assert len(sent) == 1
+        leaf = model.rsplit("/", 1)[-1]
+        assert paths == [
+            (
+                "/v1beta1/projects/offline-project/locations/us-central1/publishers/google/models/"
+                if vertex
+                else "/v1beta/models/"
+            )
+            + leaf
+            + ":generateContent"
+        ]
         wire = sent[0]["contents"]
         calls = [p for c in wire for p in c["parts"] if "functionCall" in p]
         assert [p["functionCall"] for p in calls] == [
@@ -1143,6 +1190,185 @@ async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(model)
     finally:
         await client.aio.aclose()
         client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+async def test_sdk_wire_preserves_content_only_core_calls_and_result_names(native):
+    """Core's valid content-only representation crosses JSON and the SDK wire."""
+    blocks = [
+        {"type": "text", "text": "before"},
+        {
+            "type": "tool_call",
+            "id": "one",
+            "name": "first",
+            "input": {"x": 1},
+            "signature": base64.b64encode(b"\xffnative").decode("ascii")
+            if native
+            else "FOREIGN",
+            "thinking_provenance": NATIVE_PROVENANCE
+            if native
+            else {"version": 1, "provider": "anthropic"},
+        },
+        {"type": "text", "text": "between"},
+        {
+            "type": "tool_call",
+            "id": "two",
+            "name": "second",
+            "input": {"x": 2},
+            "thinking_provenance": NATIVE_PROVENANCE
+            if native
+            else {"version": 1, "provider": "github-copilot"},
+        },
+        {"type": "text", "text": "after"},
+    ]
+    assistant = Message.model_validate_json(
+        Message(role="assistant", content=blocks).model_dump_json()
+    )
+    assert "tool_calls" not in assistant.model_dump()
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="go"),
+            assistant,
+            Message(role="tool", tool_call_id="two", content="second-result"),
+            Message(role="tool", tool_call_id="one", content="first-result"),
+        ],
+        metadata={"stream": False},
+    )
+    original = request.model_dump_json()
+    sent = []
+
+    def receive(http_request):
+        sent.append(json.loads(http_request.content))
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "done"}]},
+                        "finishReason": "STOP",
+                    }
+                ]
+            },
+        )
+
+    client = genai.Client(
+        api_key="synthetic-key",
+        http_options=types.HttpOptions(
+            base_url="https://unit.test/",
+            async_client_args={"transport": httpx.MockTransport(receive)},
+        ),
+    )
+    provider = _make_provider()
+    provider._client = client
+    try:
+        await provider.complete(request)
+        assert request.model_dump_json() == original
+        assert len(sent) == 1
+        parts = sent[0]["contents"][1]["parts"]
+        assert len(parts) == 5
+        assert [p.get("text") for p in parts] == [
+            "before",
+            None,
+            "between",
+            None,
+            "after",
+        ]
+        assert parts[1]["functionCall"] == {"name": "first", "args": {"x": 1}}
+        assert parts[3]["functionCall"] == {"name": "second", "args": {"x": 2}}
+        assert base64.urlsafe_b64decode(parts[1]["thoughtSignature"]) == (
+            b"\xffnative" if native else b"skip_thought_signature_validator"
+        )
+        assert "thoughtSignature" not in parts[3]
+        results = [
+            p["functionResponse"]
+            for c in sent[0]["contents"]
+            for p in c["parts"]
+            if "functionResponse" in p
+        ]
+        assert results == [
+            {"name": "second", "response": {"result": "second-result"}},
+            {"name": "first", "response": {"result": "first-result"}},
+        ]
+        assert "FOREIGN" not in json.dumps(sent)
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "canonical",
+    [
+        [],
+        None,
+        [
+            {
+                "id": "one",
+                "name": "canonical",
+                "arguments": {"x": 2},
+                "thinking_provenance": NATIVE_PROVENANCE,
+            }
+        ],
+    ],
+)
+def test_explicit_core_tool_calls_override_content_call_disagreement(canonical):
+    assistant = Message.model_validate_json(
+        Message(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_call",
+                    "id": "one",
+                    "name": "content",
+                    "input": {"x": 1},
+                    "thinking_provenance": NATIVE_PROVENANCE,
+                }
+            ],
+            tool_calls=canonical,
+        ).model_dump_json()
+    )
+    assert "tool_calls" in assistant.model_dump()
+    provider = _make_provider()
+    _, contents = provider._convert_messages([assistant.model_dump()])
+    assert _function_call_parts(contents) == (
+        [{"function_call": {"name": "canonical", "args": {"x": 2}}}]
+        if canonical
+        else []
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "publishers/google/models/gemini-2.5-pro",
+        "projects/offline-project/locations/us-central1/publishers/google/models/gemini-2.5-pro",
+        "publishers/other/models/gemini-4-pro",
+        "projects/offline-project/locations/us-central1/models/gemini-4-pro",
+        "unrecognized/path/gemini-4-pro",
+        "gemini-30-pro",
+    ],
+)
+def test_import_sentinel_does_not_guess_unqualified_resource_or_generation(model):
+    assistant = Message(
+        role="assistant",
+        content=[
+            {
+                "type": "tool_call",
+                "id": "one",
+                "name": "first",
+                "input": {"x": 1},
+                "signature": "FOREIGN",
+                "thinking_provenance": {"version": 1, "provider": "anthropic"},
+            }
+        ],
+    )
+    _, contents = _make_provider()._convert_messages(
+        [assistant.model_dump()],
+        model=model,
+    )
+    assert _function_call_parts(contents) == [
+        {"function_call": {"name": "first", "args": {"x": 1}}}
+    ]
 
 
 @pytest.mark.asyncio
