@@ -505,7 +505,54 @@ session:
 
 **Note**: The provider captures thinking from the API automatically (`include_thoughts` defaults to `true`). The orchestrator's `extended_thinking: true` config controls whether it's *displayed*. Without this config, thinking still happens but isn't shown to the user.
 
-**Thought signatures**: Gemini 2.5+ models attach an opaque `thought_signature` to parts that follow a thinking burst. Because this provider is **stateless full-resend** (the entire conversation is rebuilt from stored history and resent on every turn, with no server-side session), these signatures must be captured and replayed unmodified or the API returns `FinishReason MISSING_THOUGHT_SIGNATURE`. This provider captures and echoes signatures on text, thinking, and tool-call parts alike, encoded as base64 so the value survives any JSON serialization the conversation history passes through (e.g. session persistence, event logging).
+**Thought signatures and history provenance**: This provider is **stateless
+full-resend**. Gemini response text, thinking and tool-call blocks (and the
+duplicate `tool_calls` entries) carry
+`thinking_provenance: {"version": 1, "provider": "gemini"}`. Opaque signatures
+are stored as base64 strings so Core Message dump/load and transcript JSON
+preserve the exact binary value. The marker routes provider-owned state; it is
+not cryptographic authentication of user-supplied history.
+
+Native replay preserves content part order and signature association, including
+unsigned siblings and empty-text signature seals. The first parallel function
+call keeps its signature; unsigned siblings do not borrow it. Every sequential
+step retains its own signature. Streaming never assigns a new part's signature
+to the preceding block or merges signed parts with other parts. If a legacy
+loop drops `tool_calls` extras, recovery requires exactly one same-message
+Gemini-tagged content block matching the nonempty call ID, name and arguments.
+When the duplicate `tool_calls` field is absent, valid Core `ToolCallBlock`
+content is the call representation: it is serialized in content order, with
+tool-result names recovered by call ID. An explicitly present `tool_calls`
+field (including `[]` or `null`) remains authoritative and suppresses or
+overrides conflicting content calls. This serializes history; it does not
+execute tools.
+
+**Compatibility policy:** untagged history is imported history, not presumed
+native just because Gemini is now selected, the model name looks native, or
+the signature looks like base64. Foreign, untagged, invalid-version and
+unknown-provider opaque state is never sent as a native Gemini signature.
+Available thinking summaries become ordinary assistant text; visible text,
+canonical tool calls/arguments and tool results remain available. Explicit
+foreign provenance on a tool call cannot recover a native signature from a
+duplicate content block. There is no automatic legacy provenance migration:
+older untagged Gemini signatures are treated the same way as other imports.
+Only an owner with independent origin evidence should tag historical native
+blocks; do not tag a mixed transcript wholesale.
+
+Google's [GenerateContent thought-signature contract](https://aistudio.google.com/docs/thought-signatures?generate-content=true)
+requires the first function call of **each step** in the current turn to retain
+its signature on Gemini 3/4. For a foreign/untagged imported step on those model
+families, this adapter uses Google's documented
+`skip_thought_signature_validator` import sentinel on the first function call
+only (base64 on the SDK/REST byte field). Shorthand, `models/`, Vertex Google
+publisher names and full project/location Google publisher resources use the
+same model-family compatibility rule; resource names never establish history
+provenance. This is an explicit import escape
+hatch, **not** native reasoning continuity or a fabricated cryptographic
+signature. Gemini 2.x imports receive no sentinel. Known-native missing
+signatures are not repaired with a sentinel; required native state must be
+preserved by the history owner. The provider does not auto-retry a rejected
+history with altered signatures.
 
 ### Tool Calling
 

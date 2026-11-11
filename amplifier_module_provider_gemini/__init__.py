@@ -19,6 +19,7 @@ from decimal import Decimal
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import quote, urlencode
 import uuid
@@ -525,6 +526,71 @@ def _encode_sig(sig: bytes | str | None) -> str | None:
     if isinstance(sig, bytes):
         return base64.b64encode(sig).decode("ascii")
     return sig  # assume already base64-encoded str
+
+
+def _gemini_provenance() -> dict[str, Any]:
+    """Provider-owned routing metadata, not authentication of imported history."""
+    return {"version": 1, "provider": "gemini"}
+
+
+def _is_gemini_block(block: dict[str, Any]) -> bool:
+    provenance = block.get("thinking_provenance")
+    return (
+        isinstance(provenance, dict)
+        and type(provenance.get("version")) is int
+        and provenance["version"] == 1
+        and provenance.get("provider") == "gemini"
+    )
+
+
+def _native_signature(block: dict[str, Any]) -> str | None:
+    """Never infer opaque-state ownership from the selected provider or model."""
+    signature = block.get("signature")
+    if _is_gemini_block(block) and isinstance(signature, (bytes, str)):
+        return _encode_sig(signature)
+    return None
+
+
+# Google's documented history-import escape hatch, NOT a generated signature.
+# Store/transport as base64 because google-genai Part.thought_signature is bytes.
+# https://aistudio.google.com/docs/thought-signatures?generate-content=true#faqs
+_IMPORTED_CALL_SIGNATURE = base64.b64encode(
+    b"skip_thought_signature_validator"
+).decode("ascii")
+
+
+def _requires_function_call_signatures(model: str) -> bool:
+    """Recognize API model resources, not the origin of conversation state.
+
+    Developer API names and both Vertex publisher resource forms address the
+    same model family. Do not extract an arbitrary final path component: other
+    publishers, tuned models and unknown resource shapes have no such contract.
+    """
+    return re.fullmatch(
+        r"(?:models/|(?:projects/[^/]+/locations/[^/]+/)?publishers/google/models/)?"
+        r"gemini-[34](?:[.-][^/]+)?",
+        model,
+    ) is not None
+
+
+def _message_tool_calls(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Select the authoritative representation without altering stored history.
+
+    An explicit duplicate field (including [] or None) wins. When it is absent,
+    Core's ToolCallBlock is itself a valid call representation, not just a
+    signature backup. Preserve its provider extras while mapping input to the
+    duplicate call shape consumed by replay and result-name lookup.
+    """
+    if "tool_calls" in msg:
+        return msg["tool_calls"] or []
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        dict(block, arguments=block.get("input", {}))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_call"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2033,10 +2099,10 @@ class GeminiProvider:
                     ],
                 }
             )
-        _, conversation_messages = self._convert_messages(
-            [message.model_dump() for message in conversation]
-        )
         model = kwargs.get("model", self.default_model)
+        _, conversation_messages = self._convert_messages(
+            [message.model_dump() for message in conversation], model=model
+        )
         temperature = request.temperature or kwargs.get("temperature", self.temperature)
         max_tokens = request.max_output_tokens or kwargs.get(
             "max_tokens", self.max_tokens
@@ -2792,19 +2858,25 @@ class GeminiProvider:
                         continue
 
                     for part in parts:
-                        # Always capture any thought_signature (seal fragments)
                         _sig = getattr(part, "thought_signature", None)
-                        if _sig is not None:
-                            current_sig = _sig
-
                         _has_text = hasattr(part, "text") and bool(
                             getattr(part, "text", None)
                         )
                         _has_fc = getattr(part, "function_call", None) is not None
                         _is_thought = getattr(part, "thought", False) is True
 
-                        # Seal-only part (signature but no text/fc) — already captured
+                        # A seal-only part is a real signed part, not a signature
+                        # to move onto the preceding text or function call.
                         if not _has_text and not _has_fc:
+                            if _sig:
+                                await _close_block()
+                                collected_parts.append(
+                                    _NS(
+                                        text="",
+                                        thought=_is_thought,
+                                        thought_signature=_sig,
+                                    )
+                                )
                             continue
 
                         # Determine part type
@@ -2831,9 +2903,17 @@ class GeminiProvider:
                         # ---- text / thinking: type-transition state machine ----
                         text = part.text  # already confirmed truthy via _has_text
 
-                        if part_type != current_block_type:
+                        # Never merge a signed part with another part, even of
+                        # the same type. Assign its signature AFTER closing the
+                        # old block; otherwise a transition steals the new seal.
+                        if (
+                            part_type != current_block_type
+                            or current_sig is not None
+                            or _sig is not None
+                        ):
                             await _close_block()
                             await _open_block(part_type)
+                        current_sig = _sig
 
                         # Emit delta — ONE event for all block content (contract: guard with if text:)
                         # block_type sourced from current_block_type (equals part_type after _open_block)
@@ -3088,7 +3168,14 @@ class GeminiProvider:
         text_accumulator: list[str] = []
 
         for part in response.candidates[0].content.parts:
-            if hasattr(part, "text") and part.text:
+            part_text = getattr(part, "text", None)
+            if (
+                part_text is None
+                and getattr(part, "thought_signature", None)
+                and getattr(part, "function_call", None) is None
+            ):
+                part_text = ""
+            if part_text is not None:
                 # Check if this is thinking content
                 # According to Gemini API docs: parts with thought=True are thinking/reasoning
                 # Parts with thought_signature (but NOT thought=True) are the final answer
@@ -3098,23 +3185,25 @@ class GeminiProvider:
                     # encode to base64 before storing.
                     content_blocks.append(
                         ThinkingBlock(
-                            thinking=part.text,
+                            thinking=part_text,
                             signature=_encode_sig(
                                 getattr(part, "thought_signature", None)
                             ),
                             visibility="internal",
+                            thinking_provenance=_gemini_provenance(),
                         )
                     )
-                    event_blocks.append(ThinkingContent(text=part.text))
+                    event_blocks.append(ThinkingContent(text=part_text))
                     # NOTE: Do NOT add thinking to text_accumulator - it's internal process, not response content
 
                     # Emit thinking:final event (fire-and-forget, safe if no loop)
                     if self.coordinator and hasattr(self.coordinator, "hooks"):
                         # Skip event emission if no event loop running (sync context)
                         with suppress(RuntimeError):
-                            asyncio.create_task(
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(
                                 self.coordinator.hooks.emit(
-                                    "thinking:final", {"text": part.text}
+                                    "thinking:final", {"text": part_text}
                                 )
                             )
                 else:
@@ -3141,15 +3230,22 @@ class GeminiProvider:
                     _text_kwargs: dict = (
                         {"signature": _text_sig} if _text_sig is not None else {}
                     )
-                    content_blocks.append(TextBlock(text=part.text, **_text_kwargs))
+                    content_blocks.append(
+                        TextBlock(
+                            text=part_text,
+                            thinking_provenance=_gemini_provenance(),
+                            **_text_kwargs,
+                        )
+                    )
                     if _text_sig is not None:
                         logger.debug(
                             "[PROVIDER] Gemini: captured thought_signature on text part (%d chars, base64)",
                             len(_text_sig),
                         )
-                    text_accumulator.append(part.text)
-                    event_blocks.append(TextContent(text=part.text))
-            elif hasattr(part, "function_call"):
+                    if part_text:
+                        text_accumulator.append(part_text)
+                        event_blocks.append(TextContent(text=part_text))
+            elif getattr(part, "function_call", None) is not None:
                 # Extract tool call
                 fc = part.function_call
                 tool_call_id = self._generate_tool_call_id()
@@ -3161,7 +3257,11 @@ class GeminiProvider:
                 # signature fails model_dump(mode="json") for non-UTF-8 byte
                 # sequences (the normal case for an opaque signature).
                 _fc_sig = _encode_sig(getattr(part, "thought_signature", None))
-                _fc_kwargs: dict = {"signature": _fc_sig} if _fc_sig is not None else {}
+                _fc_kwargs: dict = {
+                    "thinking_provenance": _gemini_provenance(),
+                }
+                if _fc_sig is not None:
+                    _fc_kwargs["signature"] = _fc_sig
                 if _fc_sig is not None:
                     logger.debug(
                         "[PROVIDER] Gemini: captured thought_signature on function_call "
@@ -3349,8 +3449,129 @@ class GeminiProvider:
 
         return response.tool_calls
 
+    def _assistant_parts(
+        self, msg: dict[str, Any], *, import_signatures: bool
+    ) -> list[dict[str, Any]]:
+        """Replay native part order using the authoritative call representation.
+
+        An explicit tool_calls field wins; otherwise Core content blocks supply
+        calls. This only serializes history and never executes/reissues tools.
+        The legacy loop may drop tool-call extras but retain content blocks.
+        Recover only from one same-message block with the same nonempty ID,
+        name AND arguments. Explicit foreign/invalid provenance never inherits
+        a native signature from a duplicate representation.
+        """
+        content = msg.get("content", "")
+        blocks = (
+            [block for block in content if isinstance(block, dict)]
+            if isinstance(content, list)
+            else []
+        )
+        calls = _message_tool_calls(msg)
+        call_blocks = [block for block in blocks if block.get("type") == "tool_call"]
+
+        def matches(block: dict[str, Any], call: dict[str, Any]) -> bool:
+            return bool(call.get("id")) and (
+                block.get("id") == call["id"]
+                and block.get("name") == (call.get("name") or call.get("tool", ""))
+                and block.get("input") == call.get("arguments", {})
+            )
+
+        call_parts: list[dict[str, Any]] = []
+        imported: set[int] = set()
+        positions: dict[int, int] = {}
+        for index, call in enumerate(calls):
+            matching_blocks = [block for block in call_blocks if matches(block, call)]
+            matching_calls = [
+                other
+                for other in calls
+                if matching_blocks and matches(matching_blocks[0], other)
+            ]
+            block = (
+                matching_blocks[0]
+                if len(matching_blocks) == 1 and len(matching_calls) == 1
+                else None
+            )
+            if block is not None:
+                positions[id(block)] = index
+            source = call
+            if (
+                ("thinking_provenance" not in call or _is_gemini_block(call))
+                and block is not None
+                and _is_gemini_block(block)
+                and (
+                    call.get("signature") is None
+                    or (
+                        "thinking_provenance" not in call
+                        and bool(call.get("signature"))
+                        and call.get("signature") == block.get("signature")
+                    )
+                )
+            ):
+                # Legacy host adapters may copy only the signature into the
+                # compatibility call. Its identical native content block still
+                # supplies origin evidence; a different/empty seal never does.
+                source = block
+            part: dict[str, Any] = {
+                "function_call": {
+                    "name": call.get("name") or call.get("tool", ""),
+                    "args": call.get("arguments", {}),
+                }
+            }
+            if signature := _native_signature(source):
+                part["thought_signature"] = signature
+            if not _is_gemini_block(source):
+                imported.add(index)
+            call_parts.append(part)
+
+        parts: list[dict[str, Any]] = []
+        emitted: set[int] = set()
+        first_call = True
+
+        def append_call(index: int) -> None:
+            nonlocal first_call
+            part = call_parts[index]
+            # Only the first call of each imported step needs the documented
+            # sentinel. Never use it to repair a known-native missing signature.
+            if first_call and import_signatures and index in imported:
+                part["thought_signature"] = _IMPORTED_CALL_SIGNATURE
+            parts.append(part)
+            first_call = False
+            emitted.add(index)
+
+        if isinstance(content, str) and content:
+            parts.append({"text": content})
+        for block in blocks:
+            block_type = block.get("type")
+            if block_type == "tool_call":
+                index = positions.get(id(block))
+                if index is not None and index not in emitted:
+                    append_call(index)
+                continue
+            if block_type not in ("text", "thinking"):
+                continue
+            text = (
+                block.get("thinking", "")
+                if block_type == "thinking"
+                else block.get("text", "")
+            )
+            part = {"text": text}
+            if block_type == "thinking":
+                if _is_gemini_block(block):
+                    part["thought"] = True
+                elif not text:
+                    # No foreign opaque content (redactions/encrypted state).
+                    continue
+            if signature := _native_signature(block):
+                part["thought_signature"] = signature
+            parts.append(part)
+        for index in range(len(calls)):
+            if index not in emitted:
+                append_call(index)
+        return parts
+
     def _convert_messages(
-        self, messages: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], *, model: str | None = None
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """
         Convert Amplifier messages to Gemini format.
@@ -3377,6 +3598,9 @@ class GeminiProvider:
         """
         system_messages = []
         gemini_contents = []
+        tool_names: dict[str, str] = {}
+        # This selects an API compatibility rule, never history provenance.
+        import_signatures = _requires_function_call_signatures(model or self.default_model)
 
         for msg in messages:
             role = msg.get("role")
@@ -3389,96 +3613,11 @@ class GeminiProvider:
 
             # Convert assistant → model role with potential tool calls
             if role == "assistant":
-                gemini_role = "model"
-                parts = []
-                content_tool_call_blocks: list[dict[str, Any]] = []
-
-                # Add text content if present
-                if content:
-                    if isinstance(content, list):
-                        # Content is a list of blocks - extract text blocks only
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text_part: dict[str, Any] = {
-                                    "text": block.get("text", "")
-                                }
-                                if _tsig := block.get("signature"):
-                                    text_part["thought_signature"] = _encode_sig(_tsig)
-                                    logger.debug(
-                                        "[PROVIDER] Gemini: echoing thought_signature on text part"
-                                    )
-                                parts.append(text_part)
-                            elif (
-                                isinstance(block, dict)
-                                and block.get("type") == "thinking"
-                            ):
-                                # Echo thinking blocks that carry a thought_signature
-                                # (Gemini 2.5+ requires these to maintain reasoning context).
-                                # Thinking blocks WITHOUT a signature are from older models
-                                # that didn't require round-tripping — skip them as before.
-                                if _tsig := block.get("signature"):
-                                    thought_part: dict[str, Any] = {"thought": True}
-                                    if _thinking_text := block.get("thinking"):
-                                        thought_part["text"] = _thinking_text
-                                    thought_part["thought_signature"] = _encode_sig(
-                                        _tsig
-                                    )
-                                    logger.debug(
-                                        "[PROVIDER] Gemini: echoing thought_signature on thinking part"
-                                    )
-                                    parts.append(thought_part)
-                            elif (
-                                isinstance(block, dict)
-                                and block.get("type") == "tool_call"
-                            ):
-                                # Older histories retained signatures here while
-                                # tool_calls kept only id, tool, and arguments.
-                                content_tool_call_blocks.append(block)
-                    else:
-                        # Content is a simple string
-                        parts.append({"text": content})
-
-                # Handle tool calls
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    for tc in msg["tool_calls"]:
-                        # Extract name - handle both old format (tool) and new format (name)
-                        tool_name = tc.get("name") or tc.get("tool", "")
-
-                        fc_part: dict[str, Any] = {
-                            "function_call": {
-                                "name": tool_name,
-                                "args": tc.get("arguments", {}),
-                            }
-                        }
-                        _tc_sig = tc.get("signature")
-                        if _tc_sig is None:
-                            tool_call_id = tc.get("id")
-                            if tool_call_id:
-                                matching_content_calls = [
-                                    block
-                                    for block in content_tool_call_blocks
-                                    if (
-                                        block.get("id") == tool_call_id
-                                        and block.get("name") == tool_name
-                                        and block.get("input")
-                                        == tc.get("arguments", {})
-                                    )
-                                ]
-                                if len(matching_content_calls) == 1:
-                                    _tc_sig = matching_content_calls[0].get("signature")
-                        # Echo thought_signature if present (Gemini 2.5+ thinking models).
-                        # Omitting it causes HTTP 400 "Function call is missing a
-                        # thought_signature in functionCall parts".
-                        if _tc_sig:
-                            fc_part["thought_signature"] = _encode_sig(_tc_sig)
-                            logger.debug(
-                                "[PROVIDER] Gemini: echoing thought_signature on "
-                                "function_call part '%s'",
-                                tool_name,
-                            )
-                        parts.append(fc_part)
-
-                gemini_contents.append({"role": gemini_role, "parts": parts})
+                parts = self._assistant_parts(msg, import_signatures=import_signatures)
+                gemini_contents.append({"role": "model", "parts": parts})
+                for call in _message_tool_calls(msg):
+                    if call.get("id"):
+                        tool_names[call["id"]] = call.get("name") or call.get("tool", "")
 
             # Handle developer messages → user with XML wrapper
             elif role == "developer":
@@ -3495,24 +3634,9 @@ class GeminiProvider:
                     tool_call_id = "unknown"
 
                 if not tool_name:
-                    logger.debug(
-                        "Tool result missing name field, recovering from function_call history"
-                    )
-                    # Try to find the tool name from earlier function_call in conversation
-                    # Scan backwards to find matching function_call
-                    for prev_msg in reversed(gemini_contents):
-                        if prev_msg.get("role") == "model" and prev_msg.get("parts"):
-                            for part in prev_msg["parts"]:
-                                if "function_call" in part:
-                                    # Found the function call - use its name
-                                    tool_name = part["function_call"]["name"]
-                                    logger.info(
-                                        f"Recovered tool name '{tool_name}' from function_call history"
-                                    )
-                                    break
-                        if tool_name:
-                            break
-
+                    # Parallel calls may have different names; never attach a
+                    # result to whichever function happened to appear first.
+                    tool_name = tool_names.get(tool_call_id)
                     if not tool_name:
                         logger.error(
                             f"Could not determine tool name for tool_call_id: {tool_call_id}"

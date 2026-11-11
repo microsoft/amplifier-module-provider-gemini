@@ -16,9 +16,15 @@ import copy
 import json
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
+import pytest
+import httpx
 from amplifier_core import ModuleCoordinator
-from amplifier_core.message_models import ThinkingBlock
+from amplifier_core.message_models import ChatRequest, Message, ThinkingBlock
+from google.oauth2.credentials import Credentials
+from google import genai
+from google.genai import types
 
 from amplifier_module_provider_gemini import GeminiProvider
 
@@ -141,7 +147,9 @@ def test_inbound_text_signature_captured():
     test_inbound_signature_is_json_safe_not_raw_bytes."""
     sig_bytes = b"\x04\x05\x06"
     expected_b64 = base64.b64encode(sig_bytes).decode("ascii")
-    part = SimpleNamespace(text="final answer", thought=False, thought_signature=sig_bytes)
+    part = SimpleNamespace(
+        text="final answer", thought=False, thought_signature=sig_bytes
+    )
     response = _make_response([part])
 
     provider = _make_provider()
@@ -158,7 +166,9 @@ def test_inbound_text_signature_captured():
 def test_inbound_thinking_signature_unchanged():
     """Regression: ThinkingBlock.signature capture still works (existing code path)."""
     sig_bytes = b"\xde\xad\xbe\xef"
-    part = SimpleNamespace(text="my reasoning", thought=True, thought_signature=sig_bytes)
+    part = SimpleNamespace(
+        text="my reasoning", thought=True, thought_signature=sig_bytes
+    )
     response = _make_response([part])
 
     provider = _make_provider()
@@ -212,6 +222,7 @@ def test_outbound_tool_call_signature_echoed():
                     "name": "todo",
                     "arguments": {"content": "test"},
                     "signature": sig_bytes,
+                    "thinking_provenance": NATIVE_PROVENANCE,
                 }
             ],
         }
@@ -246,6 +257,7 @@ def test_outbound_thinking_block_not_dropped():
                     "type": "thinking",
                     "thinking": "my reasoning here",
                     "signature": sig_bytes,
+                    "thinking_provenance": NATIVE_PROVENANCE,
                     "visibility": "internal",
                 }
             ],
@@ -281,6 +293,7 @@ def test_outbound_no_signature_no_thought_signature_field():
                     "id": "call_1",
                     "name": "grep",
                     "arguments": {"pattern": "test"},
+                    "thinking_provenance": NATIVE_PROVENANCE,
                     # No signature key
                 }
             ],
@@ -298,8 +311,8 @@ def test_outbound_no_signature_no_thought_signature_field():
     )
 
 
-def test_outbound_thinking_block_without_signature_still_dropped():
-    """Thinking block WITHOUT signature (old model) should still be dropped — backward compat."""
+def test_outbound_untagged_thinking_is_visible_text_not_native_state():
+    """Legacy untagged thinking keeps its summary, not native opaque semantics."""
     messages = [
         {
             "role": "assistant",
@@ -318,13 +331,7 @@ def test_outbound_thinking_block_without_signature_still_dropped():
     provider = _make_provider()
     _, gemini_contents = provider._convert_messages(messages)
 
-    # Either no entry or an entry with no thought parts
-    if gemini_contents:
-        parts = gemini_contents[0]["parts"]
-        thought_parts = [p for p in parts if p.get("thought") is True]
-        assert not thought_parts, (
-            f"Thinking blocks without signature should not be echoed, got: {thought_parts}"
-        )
+    assert gemini_contents == [{"role": "model", "parts": [{"text": "some thoughts"}]}]
 
 
 # ============================================================
@@ -378,8 +385,8 @@ def test_round_trip_multiple_parallel_calls_only_first_has_signature():
 
     parts_in = [
         _fc_part("todo", sig=sig_bytes),
-        _fc_part("grep"),   # no signature
-        _fc_part("bash"),   # no signature
+        _fc_part("grep"),  # no signature
+        _fc_part("bash"),  # no signature
     ]
     response = _make_response(parts_in)
 
@@ -470,6 +477,7 @@ def test_legacy_signature_recovery_does_not_change_empty_signatures():
     provider = _make_provider()
     legacy_message = _legacy_loop_message(provider, [part])
     legacy_message["tool_calls"][0]["signature"] = ""
+    legacy_message["tool_calls"][0]["thinking_provenance"] = NATIVE_PROVENANCE
 
     _, gemini_contents = provider._convert_messages([legacy_message])
 
@@ -493,6 +501,7 @@ def test_legacy_signature_recovery_preserves_canonical_tool_call_signature():
     legacy_message["tool_calls"][0]["signature"] = base64.b64encode(
         canonical_signature
     ).decode("ascii")
+    legacy_message["tool_calls"][0]["thinking_provenance"] = NATIVE_PROVENANCE
 
     _, gemini_contents = provider._convert_messages([legacy_message])
 
@@ -519,7 +528,7 @@ def test_legacy_signature_recovery_requires_nonempty_matching_call_id():
 
     function_parts = _function_call_parts(gemini_contents)
     assert len(function_parts) == 1
-    assert "thought_signature" not in function_parts[0]
+    assert function_parts[0]["thought_signature"] == IMPORT_SENTINEL
 
 
 def test_legacy_signature_recovery_requires_a_matching_content_block():
@@ -538,7 +547,7 @@ def test_legacy_signature_recovery_requires_a_matching_content_block():
 
     function_parts = _function_call_parts(gemini_contents)
     assert len(function_parts) == 1
-    assert "thought_signature" not in function_parts[0]
+    assert function_parts[0]["thought_signature"] == IMPORT_SENTINEL
 
 
 def test_legacy_signature_recovery_rejects_mismatched_duplicate_call():
@@ -583,7 +592,7 @@ def test_legacy_signature_recovery_rejects_ambiguous_content_blocks():
 
     function_parts = _function_call_parts(gemini_contents)
     assert len(function_parts) == 1
-    assert "thought_signature" not in function_parts[0]
+    assert function_parts[0]["thought_signature"] == IMPORT_SENTINEL
 
 
 def test_legacy_parallel_calls_recover_only_the_signed_sibling():
@@ -636,8 +645,8 @@ def test_legacy_sequential_calls_do_not_recover_across_assistant_messages():
     assert "thought_signature" not in function_parts[1]
 
 
-def test_tool_call_content_alone_does_not_reconstruct_a_function_call():
-    """Content remains provenance-only; tool_calls still control emitted calls."""
+def test_explicit_empty_tool_calls_suppresses_content_function_calls():
+    """An explicit canonical list wins over the duplicate content blocks."""
     messages = [
         {
             "role": "assistant",
@@ -686,8 +695,12 @@ def test_inbound_signature_is_json_safe_not_raw_bytes():
     sig_bytes = bytes([0xFF, 0xFE, 0x80, 0x81, 0x00, 0x9D])
 
     fc = SimpleNamespace(name="todo", args={"content": "x"})
-    fc_part = SimpleNamespace(thought=False, function_call=fc, thought_signature=sig_bytes)
-    text_part = SimpleNamespace(text="answer", thought=False, thought_signature=sig_bytes)
+    fc_part = SimpleNamespace(
+        thought=False, function_call=fc, thought_signature=sig_bytes
+    )
+    text_part = SimpleNamespace(
+        text="answer", thought=False, thought_signature=sig_bytes
+    )
     response = _make_response([text_part, fc_part])
 
     provider = _make_provider()
@@ -709,3 +722,741 @@ def test_inbound_signature_is_json_safe_not_raw_bytes():
     # original bytes (nothing lost, nothing mangled).
     assert base64.b64decode(text_block.signature) == sig_bytes
     assert base64.b64decode(tc_block.signature) == sig_bytes
+
+
+NATIVE_PROVENANCE = {"version": 1, "provider": "gemini"}
+IMPORT_SENTINEL = base64.b64encode(b"skip_thought_signature_validator").decode("ascii")
+
+
+def _persist_response(provider, parts):
+    """Use Core's real discriminated block union and both JSON dump/load paths."""
+    response = provider._convert_to_chat_response(_make_response(parts))
+    message = Message(
+        role="assistant",
+        content=response.content,
+        tool_calls=[tc.model_dump() for tc in response.tool_calls or []],
+    )
+    restored = Message.model_validate_json(message.model_dump_json())
+    assert restored.model_dump() == json.loads(json.dumps(message.model_dump()))
+    return restored.model_dump()
+
+
+def test_native_interleaved_parts_survive_core_json_in_original_order():
+    provider = _make_provider()
+    raw_parts = [
+        types.Part(text="summary", thought=True),
+        types.Part(
+            function_call=types.FunctionCall(name="first", args={"x": 1}),
+            thought_signature=b"\xff\x00first",
+        ),
+        types.Part(text="between", thought_signature=b"\xfe\x00text"),
+        types.Part(function_call=types.FunctionCall(name="second", args={"y": 2})),
+        types.Part(text="", thought_signature=b"\x80seal"),
+    ]
+    message = _persist_response(provider, raw_parts)
+    for block in message["content"]:
+        assert block["thinking_provenance"] == NATIVE_PROVENANCE
+    for call in message["tool_calls"]:
+        assert call["thinking_provenance"] == NATIVE_PROVENANCE
+    original = copy.deepcopy(message)
+    _, contents = provider._convert_messages([message])
+    assert message == original
+    expected = [
+        {"text": "summary", "thought": True},
+        {
+            "function_call": {"name": "first", "args": {"x": 1}},
+            "thought_signature": base64.b64encode(b"\xff\x00first").decode("ascii"),
+        },
+        {
+            "text": "between",
+            "thought_signature": base64.b64encode(b"\xfe\x00text").decode("ascii"),
+        },
+        {"function_call": {"name": "second", "args": {"y": 2}}},
+        {
+            "text": "",
+            "thought_signature": base64.b64encode(b"\x80seal").decode("ascii"),
+        },
+    ]
+    assert contents == [{"role": "model", "parts": expected}]
+    # The real SDK must decode our persisted base64 back to the exact opaque bytes.
+    sdk_parts = types.Content.model_validate(contents[0]).parts
+    assert sdk_parts[1].thought_signature == b"\xff\x00first"
+    assert sdk_parts[-1].thought_signature == b"\x80seal"
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        None,
+        {"version": 1, "provider": "anthropic"},
+        {"version": 1, "provider": "github-copilot"},
+        {"version": 2, "provider": "gemini"},
+        {"version": True, "provider": "gemini"},
+        "gemini",
+    ],
+)
+def test_foreign_or_untagged_signatures_are_not_native_replay(provenance):
+    opaque = base64.b64encode(b"foreign-opaque").decode("ascii")
+    extra = {"signature": opaque}
+    if provenance is not None:
+        extra["thinking_provenance"] = provenance
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "visible summary", **extra},
+            {"type": "text", "text": "visible answer", **extra},
+        ],
+        "tool_calls": [
+            {"id": "one", "name": "first", "arguments": {"x": 1}, **extra},
+            {"id": "two", "name": "second", "arguments": {"y": 2}, **extra},
+        ],
+    }
+    provider = _make_provider()
+    original = copy.deepcopy(message)
+    _, contents = provider._convert_messages([message])
+    assert message == original
+    assert contents[0]["parts"][:2] == [
+        {"text": "visible summary"},
+        {"text": "visible answer"},
+    ]
+    calls = _function_call_parts(contents)
+    assert calls[0] == {
+        "function_call": {"name": "first", "args": {"x": 1}},
+        "thought_signature": IMPORT_SENTINEL,
+    }
+    assert calls[1] == {"function_call": {"name": "second", "args": {"y": 2}}}
+    assert opaque not in json.dumps(contents)
+
+
+@pytest.mark.asyncio
+async def test_stream_signatures_stay_on_original_parts_including_empty_seals():
+    provider = _make_provider()
+    raw_parts = [
+        types.Part(text="think", thought=True, thought_signature=b"thinking"),
+        types.Part(text="answer", thought_signature=b"answer"),
+        types.Part(
+            function_call=types.FunctionCall(name="first", args={"x": 1}),
+            thought_signature=b"call",
+        ),
+        types.Part(function_call=types.FunctionCall(name="second", args={"x": 2})),
+        types.Part(text="tail"),
+        types.Part(text="", thought_signature=b"\xffseal"),
+    ]
+
+    async def chunks():
+        for part in raw_parts:
+            yield types.GenerateContentResponse(
+                candidates=[types.Candidate(content=types.Content(parts=[part]))]
+            )
+
+    provider._client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content_stream=AsyncMock(return_value=chunks()),
+            )
+        )
+    )
+    result = await provider.complete(
+        ChatRequest(messages=[Message(role="user", content="go")])
+    )
+    dumped = Message(
+        role="assistant",
+        content=result.content,
+        tool_calls=[tc.model_dump() for tc in result.tool_calls],
+    ).model_dump(mode="json")
+    _, contents = provider._convert_messages([dumped])
+    parts = contents[0]["parts"]
+    assert [p.get("thought_signature") for p in parts] == [
+        base64.b64encode(sig).decode("ascii") if sig else None
+        for sig in (b"thinking", b"answer", b"call", None, None, b"\xffseal")
+    ]
+    assert [p.get("text") for p in parts] == ["think", "answer", None, None, "tail", ""]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-3.8-flash",
+        "models/gemini-4-pro",
+        "publishers/google/models/gemini-3.8-flash",
+        "projects/offline-project/locations/us-central1/publishers/google/models/gemini-4-pro",
+    ],
+)
+def test_known_native_missing_signature_is_not_fabricated(model):
+    provider = _make_provider()
+    message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "one",
+                "name": "first",
+                "arguments": {},
+                "thinking_provenance": NATIVE_PROVENANCE,
+            }
+        ],
+    }
+    _, contents = provider._convert_messages([message], model=model)
+    assert _function_call_parts(contents) == [
+        {"function_call": {"name": "first", "args": {}}}
+    ]
+
+
+def test_import_to_legacy_model_drops_opaque_signature_without_sentinel():
+    provider = _make_provider()
+    message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "one",
+                "name": "first",
+                "arguments": {},
+                "signature": "foreign-opaque",
+                "thinking_provenance": {"version": 1, "provider": "anthropic"},
+            }
+        ],
+    }
+    _, contents = provider._convert_messages([message], model="gemini-2.5-pro")
+    assert _function_call_parts(contents) == [
+        {"function_call": {"name": "first", "args": {}}}
+    ]
+
+
+@pytest.mark.parametrize("foreign_on", ["block", "call"])
+def test_duplicate_representation_cannot_launder_foreign_provenance(foreign_on):
+    provider = _make_provider()
+    message = _legacy_loop_message(
+        provider,
+        [
+            types.Part(
+                function_call=types.FunctionCall(name="first", args={"x": 1}),
+                thought_signature=b"native",
+            )
+        ],
+    )
+    target = (
+        message["content"][0] if foreign_on == "block" else message["tool_calls"][0]
+    )
+    target["thinking_provenance"] = {"version": 1, "provider": "github-copilot"}
+    _, contents = provider._convert_messages([message])
+    assert _function_call_parts(contents)[0]["thought_signature"] == IMPORT_SENTINEL
+
+
+def test_native_content_order_wins_over_reordered_duplicate_call_list():
+    provider = _make_provider()
+    message = _legacy_loop_message(
+        provider,
+        [
+            types.Part(
+                function_call=types.FunctionCall(name="first", args={"x": 1}),
+                thought_signature=b"first",
+            ),
+            types.Part(text="between"),
+            types.Part(function_call=types.FunctionCall(name="second", args={"x": 2})),
+        ],
+    )
+    message["tool_calls"].reverse()
+    _, contents = provider._convert_messages([message])
+    assert contents[0]["parts"] == [
+        {
+            "function_call": {"name": "first", "args": {"x": 1}},
+            "thought_signature": base64.b64encode(b"first").decode("ascii"),
+        },
+        {"text": "between"},
+        {"function_call": {"name": "second", "args": {"x": 2}}},
+    ]
+
+
+def test_native_duplicate_can_recover_signature_if_only_signature_was_lost():
+    provider = _make_provider()
+    message = _legacy_loop_message(
+        provider,
+        [
+            types.Part(
+                function_call=types.FunctionCall(name="first", args={"x": 1}),
+                thought_signature=b"native",
+            )
+        ],
+    )
+    message["tool_calls"][0]["thinking_provenance"] = NATIVE_PROVENANCE
+    message["tool_calls"][0]["signature"] = None
+    _, contents = provider._convert_messages([message])
+    assert _function_call_parts(contents)[0]["thought_signature"] == base64.b64encode(
+        b"native"
+    ).decode("ascii")
+
+
+@pytest.mark.parametrize("signature", ["same", "different", "", None])
+@pytest.mark.parametrize("provenance", ["absent", "foreign"])
+def test_signature_only_adapter_copy_uses_matching_native_evidence(signature, provenance):
+    """An adapter may copy the seal but omit its duplicate provenance field."""
+    provider = _make_provider()
+    message = _legacy_loop_message(
+        provider,
+        [
+            types.Part(
+                function_call=types.FunctionCall(name="first", args={"x": 1}),
+                thought_signature=b"native",
+            )
+        ],
+    )
+    call = message["tool_calls"][0]
+    native = base64.b64encode(b"native").decode("ascii")
+    call["signature"] = native if signature == "same" else (
+        base64.b64encode(b"other").decode("ascii")
+        if signature == "different" else signature
+    )
+    if provenance == "foreign":
+        call["thinking_provenance"] = {"version": 1, "provider": "anthropic"}
+    _, contents = provider._convert_messages([message], model="gemini-2.5-pro")
+    part = _function_call_parts(contents)[0]
+    if provenance == "absent" and signature in {"same", None}:
+        assert part["thought_signature"] == native
+    else:
+        assert "thought_signature" not in part
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thought", [False, True])
+async def test_stream_signature_only_seals_are_not_lost_or_moved(thought):
+    provider = _make_provider()
+
+    async def chunks():
+        for part in [
+            types.Part(text="before", thought=thought),
+            types.Part(thought=thought, thought_signature=b"\xffseal"),
+            types.Part(text="after", thought=thought),
+        ]:
+            yield types.GenerateContentResponse(
+                candidates=[types.Candidate(content=types.Content(parts=[part]))]
+            )
+
+    provider._client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content_stream=AsyncMock(return_value=chunks()),
+            )
+        )
+    )
+    result = await provider.complete(
+        ChatRequest(messages=[Message(role="user", content="go")])
+    )
+    blocks = json.loads(result.model_dump_json())["content"]
+    _, contents = provider._convert_messages([{"role": "assistant", "content": blocks}])
+    parts = contents[0]["parts"]
+    assert [p["text"] for p in parts] == ["before", "", "after"]
+    assert [p.get("thought_signature") for p in parts] == [
+        None,
+        base64.b64encode(b"\xffseal").decode("ascii"),
+        None,
+    ]
+    assert [p.get("thought", False) for p in parts] == [thought] * 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "vertex"),
+    [
+        ("gemini-3.8-flash", False),
+        ("gemini-4-pro", False),
+        ("models/gemini-3.8-flash", False),
+        ("gemini-3.8-flash", True),
+        ("publishers/google/models/gemini-3.8-flash", True),
+        ("gemini-4-pro", True),
+        (
+            "projects/offline-project/locations/us-central1/publishers/google/models/gemini-4-pro",
+            True,
+        ),
+    ],
+)
+async def test_sdk_wire_replays_all_native_steps_and_imports_foreign_step(
+    model, vertex
+):
+    """One offline SDK send, with native signatures and import sentinel distinct."""
+    provider = _make_provider()
+    first = _persist_response(
+        provider,
+        [
+            types.Part(
+                function_call=types.FunctionCall(name="first", args={"x": 1}),
+                thought_signature=b"\xffnative-one",
+            ),
+            types.Part(function_call=types.FunctionCall(name="second", args={"x": 2})),
+        ],
+    )
+    second = _persist_response(
+        provider,
+        [
+            types.Part(text="next"),
+            types.Part(
+                function_call=types.FunctionCall(name="third", args={"x": 3}),
+                thought_signature=b"\x80native-two",
+            ),
+        ],
+    )
+    foreign = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "imported summary",
+                "signature": "FOREIGN-OPAQUE",
+                "thinking_provenance": {"version": 1, "provider": "anthropic"},
+            }
+        ],
+        "tool_calls": [
+            {
+                "id": "foreign-one",
+                "name": "fourth",
+                "arguments": {"x": 4},
+                "signature": "FOREIGN-OPAQUE",
+                "thinking_provenance": {"version": 1, "provider": "github-copilot"},
+            },
+            {"id": "foreign-two", "name": "fifth", "arguments": {"x": 5}},
+        ],
+    }
+    messages = [Message(role="user", content="go")]
+    for message in (first, second, foreign):
+        messages.append(Message.model_validate(message))
+        for call in message["tool_calls"]:
+            messages.append(
+                Message(
+                    role="tool",
+                    tool_call_id=call["id"],
+                    content=f"result-{call['name']}",
+                )
+            )
+    request = ChatRequest(messages=messages, metadata={"stream": False})
+    original = request.model_dump_json()
+    sent = []
+    paths = []
+
+    def receive(http_request):
+        sent.append(json.loads(http_request.content))
+        paths.append(http_request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "done"}]},
+                        "finishReason": "STOP",
+                    }
+                ]
+            },
+        )
+
+    connection = (
+        {
+            "vertexai": True,
+            "project": "offline-project",
+            "location": "us-central1",
+            "credentials": Credentials(token="synthetic-offline-token"),
+        }
+        if vertex
+        else {"api_key": "synthetic-key"}
+    )
+    client = genai.Client(
+        **connection,
+        http_options=types.HttpOptions(
+            base_url="https://unit.test/",
+            async_client_args={"transport": httpx.MockTransport(receive)},
+        ),
+    )
+    provider._client = client
+    try:
+        await provider.complete(request, model=model)
+        assert request.model_dump_json() == original
+        assert len(sent) == 1
+        leaf = model.rsplit("/", 1)[-1]
+        assert paths == [
+            (
+                "/v1beta1/projects/offline-project/locations/us-central1/publishers/google/models/"
+                if vertex
+                else "/v1beta/models/"
+            )
+            + leaf
+            + ":generateContent"
+        ]
+        wire = sent[0]["contents"]
+        calls = [p for c in wire for p in c["parts"] if "functionCall" in p]
+        assert [p["functionCall"] for p in calls] == [
+            {"name": name, "args": {"x": index}}
+            for index, name in enumerate(
+                ("first", "second", "third", "fourth", "fifth"), 1
+            )
+        ]
+        # SDK 2.30 serializes bytes as URL-safe base64; stored Core signatures
+        # use standard base64. Compare the opaque bytes, not alphabet spelling.
+        assert [
+            base64.urlsafe_b64decode(p["thoughtSignature"])
+            if p.get("thoughtSignature")
+            else None
+            for p in calls
+        ] == [
+            b"\xffnative-one",
+            None,
+            b"\x80native-two",
+            b"skip_thought_signature_validator",
+            None,
+        ]
+        results = [
+            p["functionResponse"]
+            for c in wire
+            for p in c["parts"]
+            if "functionResponse" in p
+        ]
+        assert results == [
+            {"name": name, "response": {"result": f"result-{name}"}}
+            for name in ("first", "second", "third", "fourth", "fifth")
+        ]
+        assert "thinking_provenance" not in json.dumps(sent)
+        assert "FOREIGN-OPAQUE" not in json.dumps(sent)
+        assert (
+            base64.b64decode(calls[3]["thoughtSignature"])
+            == b"skip_thought_signature_validator"
+        )
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+async def test_sdk_wire_preserves_content_only_core_calls_and_result_names(native):
+    """Core's valid content-only representation crosses JSON and the SDK wire."""
+    blocks = [
+        {"type": "text", "text": "before"},
+        {
+            "type": "tool_call",
+            "id": "one",
+            "name": "first",
+            "input": {"x": 1},
+            "signature": base64.b64encode(b"\xffnative").decode("ascii")
+            if native
+            else "FOREIGN",
+            "thinking_provenance": NATIVE_PROVENANCE
+            if native
+            else {"version": 1, "provider": "anthropic"},
+        },
+        {"type": "text", "text": "between"},
+        {
+            "type": "tool_call",
+            "id": "two",
+            "name": "second",
+            "input": {"x": 2},
+            "thinking_provenance": NATIVE_PROVENANCE
+            if native
+            else {"version": 1, "provider": "github-copilot"},
+        },
+        {"type": "text", "text": "after"},
+    ]
+    assistant = Message.model_validate_json(
+        Message(role="assistant", content=blocks).model_dump_json()
+    )
+    assert "tool_calls" not in assistant.model_dump()
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="go"),
+            assistant,
+            Message(role="tool", tool_call_id="two", content="second-result"),
+            Message(role="tool", tool_call_id="one", content="first-result"),
+        ],
+        metadata={"stream": False},
+    )
+    original = request.model_dump_json()
+    sent = []
+
+    def receive(http_request):
+        sent.append(json.loads(http_request.content))
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "done"}]},
+                        "finishReason": "STOP",
+                    }
+                ]
+            },
+        )
+
+    client = genai.Client(
+        api_key="synthetic-key",
+        http_options=types.HttpOptions(
+            base_url="https://unit.test/",
+            async_client_args={"transport": httpx.MockTransport(receive)},
+        ),
+    )
+    provider = _make_provider()
+    provider._client = client
+    try:
+        await provider.complete(request)
+        assert request.model_dump_json() == original
+        assert len(sent) == 1
+        parts = sent[0]["contents"][1]["parts"]
+        assert len(parts) == 5
+        assert [p.get("text") for p in parts] == [
+            "before",
+            None,
+            "between",
+            None,
+            "after",
+        ]
+        assert parts[1]["functionCall"] == {"name": "first", "args": {"x": 1}}
+        assert parts[3]["functionCall"] == {"name": "second", "args": {"x": 2}}
+        assert base64.urlsafe_b64decode(parts[1]["thoughtSignature"]) == (
+            b"\xffnative" if native else b"skip_thought_signature_validator"
+        )
+        assert "thoughtSignature" not in parts[3]
+        results = [
+            p["functionResponse"]
+            for c in sent[0]["contents"]
+            for p in c["parts"]
+            if "functionResponse" in p
+        ]
+        assert results == [
+            {"name": "second", "response": {"result": "second-result"}},
+            {"name": "first", "response": {"result": "first-result"}},
+        ]
+        assert "FOREIGN" not in json.dumps(sent)
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "canonical",
+    [
+        [],
+        None,
+        [
+            {
+                "id": "one",
+                "name": "canonical",
+                "arguments": {"x": 2},
+                "thinking_provenance": NATIVE_PROVENANCE,
+            }
+        ],
+    ],
+)
+def test_explicit_core_tool_calls_override_content_call_disagreement(canonical):
+    assistant = Message.model_validate_json(
+        Message(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_call",
+                    "id": "one",
+                    "name": "content",
+                    "input": {"x": 1},
+                    "thinking_provenance": NATIVE_PROVENANCE,
+                }
+            ],
+            tool_calls=canonical,
+        ).model_dump_json()
+    )
+    assert "tool_calls" in assistant.model_dump()
+    provider = _make_provider()
+    _, contents = provider._convert_messages([assistant.model_dump()])
+    assert _function_call_parts(contents) == (
+        [{"function_call": {"name": "canonical", "args": {"x": 2}}}]
+        if canonical
+        else []
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "publishers/google/models/gemini-2.5-pro",
+        "projects/offline-project/locations/us-central1/publishers/google/models/gemini-2.5-pro",
+        "publishers/other/models/gemini-4-pro",
+        "projects/offline-project/locations/us-central1/models/gemini-4-pro",
+        "unrecognized/path/gemini-4-pro",
+        "gemini-30-pro",
+    ],
+)
+def test_import_sentinel_does_not_guess_unqualified_resource_or_generation(model):
+    assistant = Message(
+        role="assistant",
+        content=[
+            {
+                "type": "tool_call",
+                "id": "one",
+                "name": "first",
+                "input": {"x": 1},
+                "signature": "FOREIGN",
+                "thinking_provenance": {"version": 1, "provider": "anthropic"},
+            }
+        ],
+    )
+    _, contents = _make_provider()._convert_messages(
+        [assistant.model_dump()],
+        model=model,
+    )
+    assert _function_call_parts(contents) == [
+        {"function_call": {"name": "first", "args": {"x": 1}}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_stream_keeps_distinct_signed_text_parts_and_final_empty_seal():
+    """Google FAQ's empty-text signature part is not a delta on the prior part."""
+    payloads = [
+        {
+            "text": "first",
+            "thoughtSignature": base64.b64encode(b"\xffone").decode("ascii"),
+        },
+        {
+            "text": "second",
+            "thoughtSignature": base64.b64encode(b"\xfetwo").decode("ascii"),
+        },
+        {"text": "", "thoughtSignature": base64.b64encode(b"\x80seal").decode("ascii")},
+    ]
+    chunks = [
+        {"candidates": [{"content": {"role": "model", "parts": [part]}}]}
+        for part in payloads
+    ]
+    chunks.append({"candidates": [{"finishReason": "STOP"}]})
+    sends = []
+
+    def receive(request):
+        sends.append(request.url)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content="".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks),
+        )
+
+    client = genai.Client(
+        api_key="synthetic-key",
+        http_options=types.HttpOptions(
+            base_url="https://unit.test/",
+            async_client_args={"transport": httpx.MockTransport(receive)},
+        ),
+    )
+    provider = _make_provider()
+    provider._client = client
+    try:
+        result = await provider.complete(
+            ChatRequest(messages=[Message(role="user", content="go")])
+        )
+        assert len(sends) == 1
+        assert result.finish_reason == "stop"
+        restored = Message.model_validate_json(
+            Message(role="assistant", content=result.content).model_dump_json()
+        )
+        _, contents = provider._convert_messages([restored.model_dump()])
+        parts = contents[0]["parts"]
+        assert [p["text"] for p in parts] == ["first", "second", ""]
+        assert [base64.b64decode(p["thought_signature"]) for p in parts] == [
+            b"\xffone",
+            b"\xfetwo",
+            b"\x80seal",
+        ]
+        assert all("thought" not in p for p in parts)
+    finally:
+        await client.aio.aclose()
+        client.close()
