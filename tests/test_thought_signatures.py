@@ -987,6 +987,36 @@ def test_native_duplicate_can_recover_signature_if_only_signature_was_lost():
     ).decode("ascii")
 
 
+@pytest.mark.parametrize("signature", ["same", "different", "", None])
+@pytest.mark.parametrize("provenance", ["absent", "foreign"])
+def test_signature_only_adapter_copy_uses_matching_native_evidence(signature, provenance):
+    """An adapter may copy the seal but omit its duplicate provenance field."""
+    provider = _make_provider()
+    message = _legacy_loop_message(
+        provider,
+        [
+            types.Part(
+                function_call=types.FunctionCall(name="first", args={"x": 1}),
+                thought_signature=b"native",
+            )
+        ],
+    )
+    call = message["tool_calls"][0]
+    native = base64.b64encode(b"native").decode("ascii")
+    call["signature"] = native if signature == "same" else (
+        base64.b64encode(b"other").decode("ascii")
+        if signature == "different" else signature
+    )
+    if provenance == "foreign":
+        call["thinking_provenance"] = {"version": 1, "provider": "anthropic"}
+    _, contents = provider._convert_messages([message], model="gemini-2.5-pro")
+    part = _function_call_parts(contents)[0]
+    if provenance == "absent" and signature in {"same", None}:
+        assert part["thought_signature"] == native
+    else:
+        assert "thought_signature" not in part
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("thought", [False, True])
 async def test_stream_signature_only_seals_are_not_lost_or_moved(thought):

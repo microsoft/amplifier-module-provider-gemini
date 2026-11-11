@@ -3496,13 +3496,21 @@ class GeminiProvider:
                 positions[id(block)] = index
             source = call
             if (
-                call.get("signature") is None
-                and (
-                    "thinking_provenance" not in call or _is_gemini_block(call)
-                )
+                ("thinking_provenance" not in call or _is_gemini_block(call))
                 and block is not None
                 and _is_gemini_block(block)
+                and (
+                    call.get("signature") is None
+                    or (
+                        "thinking_provenance" not in call
+                        and bool(call.get("signature"))
+                        and call.get("signature") == block.get("signature")
+                    )
+                )
             ):
+                # Legacy host adapters may copy only the signature into the
+                # compatibility call. Its identical native content block still
+                # supplies origin evidence; a different/empty seal never does.
                 source = block
             part: dict[str, Any] = {
                 "function_call": {
