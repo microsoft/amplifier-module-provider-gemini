@@ -23,15 +23,21 @@ generations stale.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
+from amplifier_core.message_models import ChatRequest, Message
 
 from amplifier_module_provider_gemini import GeminiProvider
 from amplifier_module_provider_gemini._capabilities import (
     DEFAULT_LIMITS,
     get_limits,
+    has_exact_model_limits,
+    has_known_limits,
+    has_native_count_limits,
 )
 
-#: Every current Gemini text model, verified 2026-09-15 against
+#: Originally qualified Gemini 3 / 2.5 counter models, verified 2026-09-15 against
 #: https://ai.google.dev/gemini-api/docs/models/<id> ("Token limits").
 CURRENT_CONTEXT_WINDOW = 1_048_576
 CURRENT_MAX_OUTPUT = 65_536
@@ -89,6 +95,53 @@ def test_limits_follow_the_configured_model():
     limits = get_limits("gemini-2.5-flash-lite")
     assert defaults["context_window"] == limits.context_window
     assert defaults["max_output_tokens"] == limits.max_output_tokens
+
+
+@pytest.mark.asyncio
+async def test_robotics_exact_published_input_limit_does_not_qualify_native_count(monkeypatch):
+    """Public ER2 facts are separate from a qualified native-budget adapter."""
+    model = "gemini-robotics-er-2-preview"
+    provider = _provider(default_model=model)
+    info = provider.get_info()
+    assert info.defaults["model"] == model
+    assert info.defaults["context_window"] == 131_072
+    assert info.defaults["max_output_tokens"] == 65_536
+    assert info.defaults["max_tokens"] == 65_536
+    assert provider.max_tokens == 65_536
+    assert get_limits(model).context_window == 131_072
+    assert has_known_limits(model) and has_exact_model_limits(model)
+    assert not has_native_count_limits(model)
+    assert "vision" in info.capabilities
+    assert "request_budget" not in info.capabilities
+    assert "request_budget:provider_count" not in info.capabilities
+    counter = AsyncMock(side_effect=AssertionError("Unqualified native count dispatched"))
+    monkeypatch.setattr(provider, "_count_request_tokens", counter)
+    decision = await provider.request_budget(
+        ChatRequest(messages=[Message(role="user", content="offline")]),
+        context_estimate=100, request_options={"model": model},
+    )
+    assert decision is None
+    counter.assert_not_awaited()
+    assert provider._client is None
+
+
+@pytest.mark.parametrize("model", [
+    "gemini-robotics-er-2-preview-unverified",
+    "gemini-robotics-er-2-streaming-preview",
+])
+def test_robotics_fact_does_not_guess_other_endpoints(model):
+    assert get_limits(model) == DEFAULT_LIMITS
+    assert not has_known_limits(model)
+    assert not has_exact_model_limits(model)
+    assert not _provider(default_model=model)._native_counting_available(model)
+
+
+@pytest.mark.parametrize("model", ["gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen"])
+def test_robotics_fact_does_not_guess_gemini4_unified_window_semantics(model):
+    assert get_limits(model) == DEFAULT_LIMITS  # Existing fallback, not new qualification.
+    assert not has_known_limits(model)
+    assert not has_native_count_limits(model)
+    assert not _provider(default_model=model)._native_counting_available(model)
 
 
 # ---------------------------------------------------------------------------

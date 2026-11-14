@@ -53,7 +53,7 @@ from amplifier_core.message_models import ChatRequest
 from ._capabilities import DEFAULT_LIMITS
 from ._capabilities import get_limits
 from ._capabilities import has_exact_model_limits
-from ._capabilities import has_known_limits
+from ._capabilities import has_native_count_limits
 from ._cost import compute_cost
 from ._model_listing import DEFAULT_FILTERS, ModelFilters, selector_schema
 from ._media import NAMESPACE, UNAVAILABLE, content_parts, diagnostic_copy, fingerprint, has_media, has_refs, support
@@ -1423,7 +1423,7 @@ class GeminiProvider:
         if (
             not isinstance(model, str)
             or not model.startswith("gemini-")
-            or not has_known_limits(model)
+            or not has_native_count_limits(model)
         ):
             return _BUDGET_UNAVAILABLE_UNSUPPORTED_MODEL
         if not isinstance(self._api_key, str) or not self._api_key:
