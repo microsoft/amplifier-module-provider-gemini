@@ -692,6 +692,61 @@ an SDK client, authenticates, or performs I/O.
 
 ## Dependencies
 
+### Session media-v1 provider projection (candidate)
+
+The host/Foundation owns private hydration and canonical refs. This provider
+imports no Foundation code and exposes the structural fact method
+`get_media_request_support(*, model, request_options=None)`. It returns
+`{v: 1, positions: [...], mime_types: [...], evidence: ...}` for the **exact**
+selected model, independently of token-limit/name recommendation heuristics.
+
+| Exact model | User image | Call-bound tool-result image |
+| --- | --- | --- |
+| `gemini-3.1-pro-preview` | inline data | nested `functionResponse.parts` |
+| `gemini-2.5-flash` | inline data | unavailable text |
+| Other IDs, including unqualified aliases | unavailable text | unavailable text |
+
+System/developer/assistant image positions are unavailable. The host freezes the
+warning before count; no synthetic user image turn or provider switch is added.
+PNG/JPEG only are qualified. Evidence:
+[3.1 Pro modalities](https://aistudio.google.com/docs/models/gemini-3.1-pro-preview),
+[2.5 Flash modalities](https://aistudio.google.com/docs/models/gemini-2.5-flash),
+and [GenerateContent multimodal function responses](https://aistudio.google.com/docs/function-calling?generate-content=true#multimodal).
+This is vendor-format/offline qualification, **not** account entitlement or live
+image-understanding proof. Existing no-capability inline Core images retain their
+legacy route and are not promoted into qualified durable media.
+
+With `experimental.media.v1` present, every request needs its host-owned private
+association, including text-only/unavailable projections. The provider validates
+the original exact Core object before planning, count HTTP and each transport
+attempt using `cap.validate(request, purpose="count"|"transport",
+request_options=options)`. A weak request-scoped cache binds one vendor plan to
+the candidate/options/connection; SDK calls receive copies. No witness, pixels or
+plan enter canonical metadata or suspension state. Local refusal never creates a
+new automatic refit; host/loop single-refit and stream fences remain authoritative.
+
+The media SDK view disables automatic function calling, SDK retries, redirects
+and aiohttp's inner reconnect retry without changing the shared client. Explicit
+received transient errors may use the existing outer retry, with revalidation.
+Timeout/disconnect/unknown sends and partial streams do not replay. Unqualified
+custom/retrying HTTP transports refuse locally. These private SDK seams are
+covered against locked `google-genai` 2.30.1; future SDKs require the same physical
+send regressions. This provider has no `compact_context` or public iterator
+`stream` method; its complete method supports the existing streaming transport.
+
+Raw event payloads receive a diagnostic **copy before `hooks.emit`**. Known
+inline/file image transports are replaced with an explicit `not-retained` marker;
+no fabricated resolvable ref, ingest/publish operation or raw-base64 fallback is
+used. Request transport and opaque signature/provenance handling remain separate.
+
+Standalone offline checks:
+`env -u GOOGLE_API_KEY -u GEMINI_API_KEY uv run pytest -q -m "not live"`.
+Non-live fixtures additionally refuse real socket connections. The optional
+`tests/test_media_foundation_candidate.py` requires an explicitly selected
+Foundation candidate on `PYTHONPATH`; its absence is a reported skip, not accepted
+integration evidence. Merge still requires accepted Foundation/loop integration
+and exact-head independent review; this source does not enable a host by itself.
+
 - `google-genai>=2.30.1,<3` - Official Google AI Python SDK; 2.30.1 supplies the qualified Interactions image-operation boundary. It also retains the full thinking-level enum required by ordinary chat. New SDK versions require the same transport regressions.
 - `httpx>=0.28.1` - Async transport for the documented Developer
   `countTokens` REST endpoint.
@@ -748,10 +803,10 @@ cd amplifier-module-provider-gemini
 uv sync --dev
 
 # Run validation tests (protocol compliance)
-uv run pytest
+env -u GOOGLE_API_KEY -u GEMINI_API_KEY uv run pytest -m "not live"
 
 # Test with coverage
-uv run pytest --cov
+env -u GOOGLE_API_KEY -u GEMINI_API_KEY uv run pytest -m "not live" --cov
 ```
 
 These tests validate the provider implements the required protocol without needing the full CLI.

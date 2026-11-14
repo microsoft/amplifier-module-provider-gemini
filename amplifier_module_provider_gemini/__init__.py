@@ -23,6 +23,8 @@ import re
 import time
 from urllib.parse import quote, urlencode
 import uuid
+import weakref
+from copy import deepcopy
 from contextlib import suppress
 from typing import Any
 from typing import TYPE_CHECKING
@@ -54,6 +56,7 @@ from ._capabilities import has_exact_model_limits
 from ._capabilities import has_known_limits
 from ._cost import compute_cost
 from ._model_listing import DEFAULT_FILTERS, ModelFilters, selector_schema
+from ._media import NAMESPACE, UNAVAILABLE, content_parts, diagnostic_copy, fingerprint, has_media, has_refs, support
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
@@ -159,6 +162,10 @@ class _GeminiRequestPlan:
     contents: list[dict[str, Any]]
     config: Any
     count_unsupported_reason: str | None
+    media_request: Any = None
+    media_options: Any = None
+    media_identity: str | None = None
+    media_capability: Any = None
 
 
 # GenerateContentConfig has local controls that do not reach the Developer REST
@@ -1216,6 +1223,146 @@ class GeminiProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+        # Weak request identity owns each private count/send plan. Nothing is
+        # attached to Core metadata or persisted canonical/continuation state.
+        self._media_plans: dict[tuple[int, str], _GeminiRequestPlan] = {}
+
+    def _media_capability(self):
+        getter = getattr(self.coordinator, "get_capability", None)
+        capability = getter(NAMESPACE) if callable(getter) else None
+        return capability if getattr(capability, "version", None) == 1 else None
+
+    def get_media_request_support(self, *, model, request_options=None):
+        """Exact model/role facts for the host's pre-count neutral projection."""
+        if isinstance(request_options, Mapping):
+            model = request_options.get("model", model)
+        facts = support(model)
+        if "http_options" in self.extra_request_params:
+            return {"v": 1, "positions": [], "mime_types": facts["mime_types"],
+                    "reason": "unqualified HTTP body override"}
+        return {
+            "v": 1,
+            "positions": [role for role, value in facts["positions"].items() if value],
+            "mime_types": facts["mime_types"],
+            "evidence": "\n".join(facts["evidence"] + ([facts["tool_evidence"]] if facts["tool_evidence"] else [])),
+        }
+
+    def _media_identity(self, request, options):
+        owned_client = self._client is None or self._client is self._count_route_client
+        api = getattr(self._client, "_api_client", None)
+        http_options = getattr(api, "_http_options", None)
+        return fingerprint({
+            "request": request.model_dump(mode="json"),
+            "options": self._media_option_key(request, options),
+            "default_model": self.default_model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "extra_request_params": self.extra_request_params,
+            "client": "owned" if owned_client else id(self._client),
+            "credential": self._api_key,
+            "connection": None if api is None else {
+                "key": getattr(api, "api_key", None),
+                "vertexai": getattr(api, "vertexai", None),
+                "base_url": getattr(http_options, "base_url", None),
+                "api_version": getattr(http_options, "api_version", None),
+            },
+        })
+
+    def _media_option_key(self, request, options):
+        normalized = dict(options)
+        normalized.setdefault("model", self.default_model)
+        if normalized.get("reasoning_effort") == request.reasoning_effort:
+            normalized.pop("reasoning_effort", None)
+        return normalized
+
+    def _request_plan(self, request, *, warn_on_extra=False, **options):
+        if not has_refs(request) and self._media_capability() is None:
+            return self._build_request_plan(request, warn_on_extra=warn_on_extra, **options)
+        capability = self._media_capability()
+        if capability is None:
+            raise InvalidRequestError("Gemini media refs require a prepared media capability", provider=self.name)
+        try:
+            validation = capability.validate(request, purpose="count", request_options=options)
+        except ValueError:
+            raise InvalidRequestError("Gemini media validation refused preparation", provider=self.name) from None
+        if not isinstance(validation, Mapping) or validation.get("valid") is not True:
+            raise InvalidRequestError("Gemini media validation refused preparation", provider=self.name)
+        # A qualified capability-backed request may initialize (not send on)
+        # its chosen connection before the vendor plan is frozen.
+        self.client
+        identity = self._media_identity(request, options)
+        key = (id(request), fingerprint(self._media_option_key(request, options)))
+        if any(existing[0] == id(request) and existing != key for existing in self._media_plans):
+            raise InvalidRequestError("Gemini media options changed; count a new candidate", provider=self.name)
+        cached = self._media_plans.get(key)
+        if cached is not None:
+            if cached.media_request() is not request or cached.media_identity != identity:
+                raise InvalidRequestError(
+                    "Gemini media candidate changed; prepare and count a new candidate",
+                    provider=self.name,
+                )
+            return cached
+        planned_request = request.model_copy(deep=True)
+        self._repair_missing_tool_results(planned_request, record_repairs=False)
+        plan = self._build_request_plan(planned_request, warn_on_extra=warn_on_extra, **options)
+        # Request-specific controls: SDK and AFC cannot send an unchecked retry.
+        from google.genai import types
+        plan.config.http_options = types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=1)
+        )
+        plan.config.automatic_function_calling = types.AutomaticFunctionCallingConfig(disable=True)
+        reference = weakref.ref(request, lambda _: self._media_plans.pop(key, None))
+        plan = _GeminiRequestPlan(
+            plan.model, deepcopy(plan.contents), plan.config.model_copy(deep=True),
+            plan.count_unsupported_reason, reference, deepcopy(options), identity,
+            self._media_capability(),
+        )
+        self._media_plans[key] = plan
+        return plan
+
+    def _validate_media_attempt_sync(self, plan, *, purpose):
+        if plan.media_request is None:
+            return
+        request = plan.media_request()
+        if request is None or self._media_identity(request, plan.media_options) != plan.media_identity:
+            raise InvalidRequestError("Gemini media candidate changed before transport", provider=self.name)
+        capability = self._media_capability()
+        if capability is not plan.media_capability:
+            raise InvalidRequestError("Gemini media capability changed before transport", provider=self.name)
+        if capability is not None:
+            try:
+                result = capability.validate(
+                    request, purpose=purpose, request_options=plan.media_options
+                )
+            except ValueError:
+                raise InvalidRequestError("Gemini media validation refused transport", provider=self.name) from None
+            if not isinstance(result, Mapping) or result.get("valid") is not True:
+                raise InvalidRequestError("Gemini media validation refused transport", provider=self.name)
+        elif any(NAMESPACE in (message.metadata or {}) for message in request.messages):
+            raise InvalidRequestError("Gemini media refs require a prepared media capability", provider=self.name)
+
+    async def _validate_media_attempt(self, plan, *, purpose):
+        self._validate_media_attempt_sync(plan, purpose=purpose)
+
+    def _media_models(self, plan):
+        if plan.media_request is None:
+            return self.client.aio.models
+        # The existing request-local SDK view borrows, but never closes or
+        # mutates, the bound owner. It also bypasses aiohttp's inner retry.
+        from .image_operation import _compatibility_client
+        from ._media import AttemptHTTP
+        client = self.client
+        # Lazy construction is not a selection change. Binding happens before
+        # the first attempt and never permits replacing an existing connection.
+        if self._client is client and plan.media_request() is not None:
+            request = plan.media_request()
+            if self._media_identity(request, plan.media_options) != plan.media_identity:
+                raise InvalidRequestError("Gemini media connection changed before transport", provider=self.name)
+        original = client._api_client._async_httpx_client
+        return _compatibility_client(client, AttemptHTTP(
+            original,
+            lambda: self._validate_media_attempt_sync(plan, purpose="transport"),
+        ))
 
     @staticmethod
     def _is_cloudflare_challenge(error) -> bool:
@@ -1360,6 +1507,8 @@ class GeminiProvider:
         """
         limits = get_limits(self.default_model)
         capabilities = ["streaming", "tools", "thinking", "json_mode", "batch"]
+        if support(self.default_model)["positions"]["user"]:
+            capabilities.append("vision")
         # The adapter is Developer API-only. Individual request shapes still
         # return no decision when their public serialization cannot be counted.
         if self._native_counting_available(self.default_model):
@@ -1733,6 +1882,8 @@ class GeminiProvider:
         models: list[ModelInfo] = []
         for model in selector.select(raw_models):
             capabilities = []
+            if support(model["id"])["positions"]["user"]:
+                capabilities.append("vision")
             if "streamGenerateContent" in model.get("generation_methods", []):
                 capabilities.append("streaming")
             if model.get("thinking") is True:
@@ -1905,6 +2056,14 @@ class GeminiProvider:
         """
         kwargs = self._merge_request_options(request_options, kwargs)
 
+        if has_refs(request) or self._media_capability() is not None:
+            try:
+                return await self._complete_chat_request(request, **kwargs)
+            finally:
+                for key in list(self._media_plans):
+                    if key[0] == id(request):
+                        self._media_plans.pop(key, None)
+
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
         missing = self._repair_missing_tool_results(request, record_repairs=True)
         if missing:
@@ -2074,9 +2233,14 @@ class GeminiProvider:
             for message in request.messages
             if message.role in ("user", "assistant", "tool")
         ]
+        def instruction_text(message):
+            return "\n".join(
+                part["text"] for part in content_parts(message.model_dump()["content"], images=False)
+            )
+
         system_instruction = (
             "\n\n".join(
-                message.content if isinstance(message.content, str) else ""
+                instruction_text(message)
                 for message in system_msgs
             )
             if system_msgs
@@ -2084,9 +2248,7 @@ class GeminiProvider:
         )
         context_user_messages = []
         for message in developer_msgs:
-            developer_content = (
-                message.content if isinstance(message.content, str) else ""
-            )
+            developer_content = instruction_text(message)
             context_user_messages.append(
                 {
                     "role": "user",
@@ -2101,7 +2263,8 @@ class GeminiProvider:
             )
         model = kwargs.get("model", self.default_model)
         _, conversation_messages = self._convert_messages(
-            [message.model_dump() for message in conversation], model=model
+            [message.model_dump() for message in conversation], model=model,
+            media_v1=has_refs(request) or self._media_capability() is not None,
         )
         temperature = request.temperature or kwargs.get("temperature", self.temperature)
         max_tokens = request.max_output_tokens or kwargs.get(
@@ -2138,6 +2301,11 @@ class GeminiProvider:
             self.extra_request_params,
             warn=warn_on_extra,
         )
+        if kwargs.get("tool_choice", getattr(request, "tool_choice", None)) == "none":
+            # Finalization must not be reopened by configured ANY tool choice.
+            config.tool_config = genai.types.ToolConfig(
+                function_calling_config=genai.types.FunctionCallingConfig(mode="NONE")
+            )
         count_unsupported_reason = None
         if "tools" in self.extra_request_params:
             count_unsupported_reason = (
@@ -2181,6 +2349,19 @@ class GeminiProvider:
                 )
                 for content in plan.contents
             ]
+            # google-genai2.30.1's FunctionResponse transformer sends nested
+            # response parts using protobuf snake names, unlike ordinary Parts.
+            # Match those exact allowlisted media fields, never response JSON.
+            for content in contents:
+                for part in content.get("parts", []):
+                    for media in part.get("functionResponse", {}).get("parts", []):
+                        if "inlineData" in media:
+                            blob = media.pop("inlineData")
+                            if "mimeType" in blob:
+                                blob["mime_type"] = blob.pop("mimeType")
+                            if "displayName" in blob:
+                                blob["display_name"] = blob.pop("displayName")
+                            media["inline_data"] = blob
             # extra_request_params is intentionally applied after construction
             # and can contain mappings. Re-validate through the SDK's public
             # typed model before serialization so nested aliases match the
@@ -2283,6 +2464,7 @@ class GeminiProvider:
         )
         try:
             async with httpx.AsyncClient(timeout=self._count_timeout) as client:
+                await self._validate_media_attempt(plan, purpose="count")
                 response = await client.post(
                     endpoint,
                     headers={"x-goog-api-key": self._api_key},
@@ -2348,9 +2530,12 @@ class GeminiProvider:
         # wire request. Plan the same repair on a deep copy: probing must not
         # mutate conversation history or mark an uncommitted repair as done.
         try:
-            planned_request = request.model_copy(deep=True)
-            self._repair_missing_tool_results(planned_request, record_repairs=False)
-            plan = self._build_request_plan(planned_request, **options)
+            if has_refs(request) or self._media_capability() is not None:
+                plan = self._request_plan(request, **options)
+            else:
+                planned_request = request.model_copy(deep=True)
+                self._repair_missing_tool_results(planned_request, record_repairs=False)
+                plan = self._build_request_plan(planned_request, **options)
         except (AttributeError, TypeError, ValueError):
             # No exc_info: a traceback here can carry request content into the
             # log. The fixed code is the whole diagnostic.
@@ -2375,8 +2560,17 @@ class GeminiProvider:
                 _BUDGET_UNAVAILABLE_INVALID_OUTPUT_LIMIT, plan.model
             )
             return None
-        count, reason, http_status = await self._count_request_tokens(plan)
+        try:
+            count, reason, http_status = await self._count_request_tokens(plan)
+        except BaseException:
+            for key in list(self._media_plans):
+                if key[0] == id(request):
+                    self._media_plans.pop(key, None)
+            raise
         if count is None:
+            for key in list(self._media_plans):
+                if key[0] == id(request):
+                    self._media_plans.pop(key, None)
             await self._report_request_budget_unavailable(
                 reason or _BUDGET_UNAVAILABLE_INVALID_RESPONSE,
                 plan.model,
@@ -2423,7 +2617,7 @@ class GeminiProvider:
             ChatResponse with content blocks
         """
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
-        plan = self._build_request_plan(request, warn_on_extra=True, **kwargs)
+        plan = self._request_plan(request, warn_on_extra=True, **kwargs)
         model = plan.model
         all_messages = plan.contents
         config = plan.config
@@ -2442,7 +2636,7 @@ class GeminiProvider:
                 "has_system": bool(system_instruction),
             }
             if self.raw:
-                request_payload["raw"] = redact_secrets(
+                request_payload["raw"] = redact_secrets(diagnostic_copy(
                     {
                         "model": model,
                         "messages": all_messages,
@@ -2450,7 +2644,7 @@ class GeminiProvider:
                         "temperature": temperature,
                         "max_output_tokens": max_tokens,
                     }
-                )
+                ))
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -2461,15 +2655,22 @@ class GeminiProvider:
 
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
+            models = self._media_models(plan)
+            await self._validate_media_attempt(plan, purpose="transport")
             try:
                 # Call Gemini API (use .aio for async)
                 return await asyncio.wait_for(
-                    self.client.aio.models.generate_content(
-                        model=model, contents=all_messages, config=config
+                    models.generate_content(
+                        model=model, contents=deepcopy(all_messages), config=config.model_copy(deep=True)
                     ),
                     timeout=self.timeout,
                 )
             except asyncio.TimeoutError as e:
+                if plan.media_request is not None:
+                    raise LLMTimeoutError(
+                        "Gemini media send outcome unknown; do not replay",
+                        provider=self.name, retryable=False,
+                    ) from None
                 raise LLMTimeoutError(
                     f"Request timed out after {self.timeout}s",
                     provider="gemini",
@@ -2482,10 +2683,57 @@ class GeminiProvider:
                     and e.retry_after > self._retry_config.max_delay
                 ):
                     e.retryable = False
+                if has_media(request):
+                    raise RateLimitError(
+                        "Gemini media rate limit; payload details not retained",
+                        provider=self.name, status_code=e.status_code,
+                        retryable=e.retryable, retry_after=e.retry_after,
+                    ) from None
                 raise
             except LLMError:
+                if plan.media_request is not None:
+                    raise LLMError(
+                        "Gemini media transport failed; do not replay",
+                        provider=self.name, retryable=False,
+                    ) from None
                 raise  # Already translated, don't double-wrap
             except Exception as e:
+                if plan.media_request is not None:
+                    # Only an explicit received transient error is retryable.
+                    # Disconnect/timeouts/unknown sends never replay media.
+                    known_sdk_error = genai_errors is not None and isinstance(e, genai_errors.APIError)
+                    code = getattr(e, "code", None) if known_sdk_error else None
+                    error_type = ProviderUnavailableError
+                    retryable = code in (429, 500, 502, 503, 504)
+                    if code == 429:
+                        error_type = RateLimitError
+                    elif code == 401:
+                        error_type = AuthenticationError
+                    elif code == 403:
+                        error_type = AccessDeniedError
+                    elif isinstance(code, int) and 400 <= code < 500:
+                        # Preserve the existing provider-native overflow class;
+                        # this does not authorize a replay or infer local refit.
+                        raw_msg = str(e).lower()
+                        if (
+                            "context length" in raw_msg or "too many tokens" in raw_msg
+                            or "token limit" in raw_msg
+                            or ("exceeds" in raw_msg and any(word in raw_msg for word in ("token", "context", "length")))
+                        ):
+                            error_type = ContextLengthError
+                        elif any(word in raw_msg for word in ("content filter", "safety", "blocked", "harm")):
+                            error_type = ContentFilterError
+                        else:
+                            error_type = InvalidRequestError
+                    retry_after = self._extract_retry_after(e)
+                    if retry_after is not None and retry_after > self._retry_config.max_delay:
+                        retryable = False
+                    raise error_type(
+                        "Gemini media transport failed; payload details not retained",
+                        provider=self.name,
+                        status_code=code if isinstance(code, int) else None,
+                        retryable=retryable, retry_after=retry_after,
+                    ) from None
                 # --- Primary path: google.genai.errors (always available) ---
                 if genai_errors is not None:
                     if isinstance(e, genai_errors.ClientError):
@@ -2659,7 +2907,10 @@ class GeminiProvider:
                         "max_retries": self._retry_config.max_retries,
                         "delay": delay,
                         "error_type": type(error).__name__,
-                        "error_message": str(error),
+                        "error_message": (
+                            "Gemini media transport failed; payload details not retained"
+                            if has_media(request) else str(error)
+                        ),
                     },
                 )
 
@@ -2806,13 +3057,15 @@ class GeminiProvider:
                 current_block_type = None
 
             try:
+                models = self._media_models(plan)
+                await self._validate_media_attempt(plan, purpose="transport")
                 # Establish the stream; timeout covers connection setup
                 try:
                     stream = await asyncio.wait_for(
-                        self.client.aio.models.generate_content_stream(
+                        models.generate_content_stream(
                             model=model,
-                            contents=all_messages,
-                            config=config,
+                            contents=deepcopy(all_messages),
+                            config=config.model_copy(deep=True),
                         ),
                         timeout=self.timeout,
                     )
@@ -2820,7 +3073,7 @@ class GeminiProvider:
                     raise LLMTimeoutError(
                         f"Stream connection timed out after {self.timeout}s",
                         provider="gemini",
-                        retryable=True,
+                        retryable=plan.media_request is None,
                     ) from _te
 
                 # Iterate chunks; timeout enforced per-anext()
@@ -2836,7 +3089,7 @@ class GeminiProvider:
                         raise LLMTimeoutError(
                             f"Stream timed out waiting for next chunk after {self.timeout}s",
                             provider="gemini",
-                            retryable=True,
+                            retryable=plan.media_request is None,
                         ) from _te
 
                     # Capture usage (present only on the final chunk)
@@ -2956,10 +3209,18 @@ class GeminiProvider:
                             "request_id": request_id,
                             "error": {
                                 "type": type(_exc).__name__,
-                                "msg": str(_exc),
+                                "msg": (
+                                    "Gemini media stream interrupted; details not retained"
+                                    if has_media(request) else str(_exc)
+                                ),
                             },
                         },
                     )
+                if plan.media_request is not None:
+                    raise ProviderUnavailableError(
+                        "Gemini media stream outcome unknown; do not replay",
+                        provider=self.name, retryable=False,
+                    ) from None
                 raise
 
         async def _do_complete_streaming_guarded():
@@ -3027,17 +3288,14 @@ class GeminiProvider:
                     not hasattr(response.candidates[0], "content")
                     or not response.candidates[0].content
                 ):
-                    logger.error(f"Response structure: {response}")
-                    logger.error(
-                        f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
-                    )
+                    logger.error("Gemini response candidate has no content")
                     raise ValueError("Gemini API response candidate has no content")
 
                 if (
                     not hasattr(response.candidates[0].content, "parts")
                     or not response.candidates[0].content.parts
                 ):
-                    logger.error(f"Content: {response.candidates[0].content}")
+                    logger.error("Gemini response content has no parts")
                     raise ValueError("Gemini API response content has no parts")
 
                 # Convert to ChatResponse first (ordering fix — emit uses converted usage)
@@ -3101,12 +3359,7 @@ class GeminiProvider:
                 }
                 if self.raw and not _use_streaming:
                     # raw logging: only available on the blocking path
-                    response_payload["raw"] = redact_secrets(
-                        {
-                            "content_parts": str(response.candidates[0].content.parts),
-                            "raw": str(response)[:1000],
-                        }
-                    )
+                    response_payload["raw"] = redact_secrets(diagnostic_copy(response))
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
             return chat_response
@@ -3114,7 +3367,11 @@ class GeminiProvider:
         except LLMError as e:
             # Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = (
+                "Gemini media request failed; transport details not retained"
+                if has_media(request)
+                else str(e) or f"{type(e).__name__}: (no message)"
+            )
             logger.error("[PROVIDER] Gemini API error: %s", error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3128,11 +3385,20 @@ class GeminiProvider:
                         "error": error_msg,
                     },
                 )
+            if has_media(request):
+                raise type(e)(
+                    error_msg, provider=self.name, status_code=e.status_code,
+                    retryable=e.retryable, retry_after=e.retry_after,
+                ) from None
             raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = (
+                "Gemini media request failed; transport details not retained"
+                if has_media(request)
+                else str(e) or f"{type(e).__name__}: (no message)"
+            )
             logger.error("[PROVIDER] Gemini API error: %s", error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3146,6 +3412,10 @@ class GeminiProvider:
                         "error": error_msg,
                     },
                 )
+            if has_media(request):
+                raise ProviderUnavailableError(
+                    error_msg, provider=self.name, retryable=False,
+                ) from None
             raise
     def _convert_to_chat_response(
         self, response, *, model: str = ""
@@ -3543,6 +3813,9 @@ class GeminiProvider:
             parts.append({"text": content})
         for block in blocks:
             block_type = block.get("type")
+            if block_type == "image":
+                parts.append({"text": UNAVAILABLE})
+                continue
             if block_type == "tool_call":
                 index = positions.get(id(block))
                 if index is not None and index not in emitted:
@@ -3571,7 +3844,8 @@ class GeminiProvider:
         return parts
 
     def _convert_messages(
-        self, messages: list[dict[str, Any]], *, model: str | None = None
+        self, messages: list[dict[str, Any]], *, model: str | None = None,
+        media_v1: bool = False,
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """
         Convert Amplifier messages to Gemini format.
@@ -3601,6 +3875,10 @@ class GeminiProvider:
         tool_names: dict[str, str] = {}
         # This selects an API compatibility rule, never history provenance.
         import_signatures = _requires_function_call_signatures(model or self.default_model)
+        positions = (
+            support(model or self.default_model)["positions"]
+            if media_v1 else {"user": True, "tool": False}
+        )
 
         for msg in messages:
             role = msg.get("role")
@@ -3630,7 +3908,7 @@ class GeminiProvider:
                 tool_name = msg.get("name")
 
                 if not tool_call_id:
-                    logger.warning(f"Tool result missing tool_call_id: {msg}")
+                    logger.warning("Tool result missing tool_call_id")
                     tool_call_id = "unknown"
 
                 if not tool_name:
@@ -3643,15 +3921,38 @@ class GeminiProvider:
                         )
                         tool_name = "unknown"
 
+                projected_parts = content_parts(content, images=positions["tool"])
+                image_index = 0
+                ordered_result = []
+                images = []
+                for part in projected_parts:
+                    if "inline_data" in part:
+                        label = f"session-image-{image_index}"
+                        image_index += 1
+                        part["inline_data"]["display_name"] = label
+                        images.append(part)
+                        ordered_result.append({"image": {"$ref": label}})
+                    else:
+                        ordered_result.append(part)
+                response = {
+                    "name": tool_name,
+                    "response": {
+                        # Keep text fragments in order; raw Core ImageBlocks
+                        # must never land inside arbitrary function JSON.
+                        "result": (
+                            content if isinstance(content, str)
+                            else ordered_result
+                        )
+                    },
+                }
+                if images:
+                    response["parts"] = images
                 gemini_contents.append(
                     {
                         "role": "user",
                         "parts": [
                             {
-                                "function_response": {
-                                    "name": tool_name,
-                                    "response": {"result": content},
-                                }
+                                "function_response": response
                             }
                         ],
                     }
@@ -3659,40 +3960,17 @@ class GeminiProvider:
 
             # Regular user message
             else:
-                # Handle structured content (list of blocks including text and images)
-                if isinstance(content, list):
-                    parts = []
-                    for block in content:
-                        if isinstance(block, dict):
-                            block_type = block.get("type")
-                            if block_type == "text":
-                                parts.append({"text": block.get("text", "")})
-                            elif block_type == "image":
-                                # Convert ImageBlock to Gemini inline_data format
-                                source = block.get("source", {})
-                                if source.get("type") == "base64":
-                                    parts.append(
-                                        {
-                                            "inline_data": {
-                                                "mime_type": source.get(
-                                                    "media_type", "image/jpeg"
-                                                ),
-                                                "data": source.get("data"),
-                                            }
-                                        }
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Unsupported image source type: {source.get('type')}"
-                                    )
-
-                    if parts:
-                        gemini_contents.append({"role": "user", "parts": parts})
-                else:
-                    # Simple string content
-                    gemini_contents.append(
-                        {"role": "user", "parts": [{"text": content}]}
-                    )
+                parts = content_parts(content, images=positions["user"])
+                if not media_v1:
+                    # Legacy Core ImageBlock semantics are not a durable-ref
+                    # witness. Keep that old route separate from media-v1.
+                    for part in parts:
+                        if "inline_data" in part:
+                            part["inline_data"]["data"] = base64.b64encode(
+                                part["inline_data"]["data"]
+                            ).decode("ascii")
+                if parts:
+                    gemini_contents.append({"role": "user", "parts": parts})
 
         # Combine system messages
         system_instruction = "\n\n".join(system_messages) if system_messages else None
@@ -3878,6 +4156,7 @@ class GeminiProvider:
         Never raises, and never blocks the event loop: the SDK's synchronous
         `Client.close()` runs in a worker thread (`asyncio.to_thread`).
         """
+        self._media_plans.clear()
         client = self._client
         self._count_route_client = None
         self._client_uses_canonical_developer_route = None

@@ -11,8 +11,22 @@ The amplifier-core pytest plugin provides fixtures automatically:
 
 import asyncio
 import sys
+import socket
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def offline_network_fence(request, monkeypatch):
+    """Offline fixtures must never become provider calls through mock drift."""
+    if request.node.get_closest_marker("live") is not None:
+        return
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("Offline test attempted a real socket connection")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
 
 
 @pytest.fixture(scope="session", autouse=True)

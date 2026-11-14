@@ -691,7 +691,9 @@ async def test_default_projection_is_conservative_and_explicit_list_is_unfiltere
         assert before[1].display_name == "models/gemini-2.5-flash"
         assert before[1].context_window == 1000
         assert before[1].max_output_tokens == 200
-        assert before[1].capabilities == []
+        # Exact documented image modality, not a guessed family capability.
+        assert before[0].capabilities == []
+        assert before[1].capabilities == ["vision"]
         assert before[1].defaults == {}
         assert [item.id for item in discovered] == sorted([
             record["name"].removeprefix("models/") for record in records
