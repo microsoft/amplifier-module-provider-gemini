@@ -700,17 +700,40 @@ imports no Foundation code and exposes the structural fact method
 `{v: 1, positions: [...], mime_types: [...], evidence: ...}` for the **exact**
 selected model, independently of token-limit/name recommendation heuristics.
 
-| Exact model | User image | Call-bound tool-result image |
+Public evidence audited **2026-11-14**; exact IDs, never a runtime family-prefix
+guess. [Full evidence/availability matrix](contracts/gemini-media-evidence.v1.json).
+
+| Exact model IDs | User image | Call-bound tool-result image |
 | --- | --- | --- |
-| `gemini-3.1-pro-preview` | inline data | nested `functionResponse.parts` |
-| `gemini-2.5-flash` | inline data | unavailable text |
-| Other IDs, including unqualified aliases | unavailable text | unavailable text |
+| `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-customtools`, `gemini-3-flash-preview` | inline data | nested `functionResponse.parts` (explicit documented G3 scope) |
+| `gemini-4-hydrogen` | inline data | nested `functionResponse.parts` (named vendor example) |
+| `gemini-4-carbon`, `gemini-4-argon`, `gemini-robotics-er-2-preview` | inline data | unconfirmed scope: unavailable text |
+| `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` | inline data | unqualified placement: unavailable text |
+| Other IDs, including unresolved latest/dated aliases | not catalogued for this route: unavailable text | not catalogued for this route: unavailable text |
+
+Vision tags in `get_info` / `list_models` and media user-position facts share the
+same exact catalogue. An unqualified position is **not** a claim that the vendor
+cannot accept images. Image-generation, Live, TTS, embedding and managed-agent
+routes have distinct contracts; this text adapter does not advertise their
+media-v1 delivery from name similarity. Existing specialized image-operation
+support remains separate, not changed by these facts.
+
+Vendor documents `3.7-flash` routing to `3.8-flash` and `3.5-flash` to `3.6-flash`.
+The 2.5 models have existing-user access restrictions; announced December 1, 2026
+vendor routing changes are not applied locally. No alias resolution, account
+entitlement or automatic provider/model switch is manufactured here.
+
+Image support and native budget measurement are independent. Gemini 4's unified
+input/output window and Robotics ER's smaller window have not been qualified by
+the existing native-budget adapter: those four exact IDs return **count
+unavailable**, not a borrowed 3.x token budget or a `provider_count` claim.
+Offline tests still compare their wire-count projection to actual SDK send
+bytes/options. No long-decode, Gemini 4 thinking-level or Live behavior is added.
 
 System/developer/assistant image positions are unavailable. The host freezes the
 warning before count; no synthetic user image turn or provider switch is added.
-PNG/JPEG only are qualified. Evidence:
-[3.1 Pro modalities](https://aistudio.google.com/docs/models/gemini-3.1-pro-preview),
-[2.5 Flash modalities](https://aistudio.google.com/docs/models/gemini-2.5-flash),
+PNG/JPEG only are qualified. Evidence includes each exact model page,
+[GenerateContent image input](https://aistudio.google.com/docs/image-understanding?generate-content=true),
 and [GenerateContent multimodal function responses](https://aistudio.google.com/docs/function-calling?generate-content=true#multimodal).
 This is vendor-format/offline qualification, **not** account entitlement or live
 image-understanding proof. Existing no-capability inline Core images retain their

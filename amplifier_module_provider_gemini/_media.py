@@ -9,18 +9,72 @@ from pydantic import BaseModel
 import httpx
 
 NAMESPACE = "experimental.media.v1"
-UNAVAILABLE = "[Image unavailable: unsupported model or position; no pixels supplied]"
+UNAVAILABLE = "[Image unavailable: model or position not qualified for this route; no pixels supplied]"
 NOT_RETAINED = {"media_status": "not-retained", "reason": "diagnostic-image-omitted"}
 
 # Exact entries only: input modality evidence is separate from context limits,
 # recommendation names, account entitlement and live inference qualification.
-USER_IMAGE_MODELS = frozenset({"gemini-3.1-pro-preview", "gemini-2.5-flash"})
-TOOL_IMAGE_MODELS = frozenset({"gemini-3.1-pro-preview"})
+MEDIA_EVIDENCE_DATE = "2026-11-14"
+# Every key was read in an official model's input-modality table (customtools
+# is an explicitly listed version on the Pro page). Never extrapolate a suffix,
+# infer vision from a token-limit/recommendation entry, or resolve a latest alias.
 MODEL_EVIDENCE = {
-    "gemini-3.1-pro-preview": "https://aistudio.google.com/docs/models/gemini-3.1-pro-preview",
-    "gemini-2.5-flash": "https://aistudio.google.com/docs/models/gemini-2.5-flash",
+    model: f"https://aistudio.google.com/docs/models/{model}"
+    for model in (
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "gemini-4-hydrogen",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    )
 }
+MODEL_EVIDENCE["gemini-3.1-pro-preview-customtools"] = (
+    "https://aistudio.google.com/docs/models/gemini-3.1-pro-preview#gemini-31-pro-preview-customtools"
+)
+MODEL_EVIDENCE["gemini-robotics-er-2-preview"] = (
+    "https://aistudio.google.com/docs/robotics-overview?generate-content=true#model-versions"
+)
+USER_IMAGE_MODELS = frozenset(MODEL_EVIDENCE)
+# The guide explicitly scopes multimodal function responses to Gemini 3 series
+# and separately shows Hydrogen by name. Enumerate the documented text-model
+# endpoints, not all gemini-3* (e.g. image/TTS models cannot call functions).
+TOOL_IMAGE_MODELS = frozenset({
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
+    "gemini-3-flash-preview", "gemini-4-hydrogen",
+})
 TOOL_EVIDENCE = "https://aistudio.google.com/docs/function-calling?generate-content=true#multimodal"
+MODEL_NOTES = {
+    "gemini-3.7-flash": "Vendor documents automatic routing to gemini-3.8-flash; no local reroute.",
+    "gemini-3.5-flash": "Vendor documents automatic routing to gemini-3.6-flash; no local reroute.",
+    "gemini-2.5-pro": "Existing-user access; vendor routing changes December 1, 2026; tool-image placement unqualified.",
+    "gemini-2.5-flash": "Existing-user access; vendor routing changes December 1, 2026; tool-image placement unqualified.",
+    "gemini-2.5-flash-lite": "Existing-user access; tool-image placement unqualified.",
+    "gemini-4-carbon": "User image documented; nested tool-image model scope unconfirmed; native count budget unavailable.",
+    "gemini-4-argon": "User image documented; nested tool-image model scope unconfirmed; native count budget unavailable.",
+    "gemini-4-hydrogen": "Named multimodal function-response example; native count budget unavailable (unified-window semantics).",
+    "gemini-robotics-er-2-preview": "GenerateContent image example documented; tool-image scope unconfirmed; native count budget unavailable.",
+}
+# These models may accept images at the vendor, but their distinct output/API
+# contracts are not qualified by this text-provider adapter. This is deliberately
+# NOT a declaration of vendor incapability, nor permission to route to them.
+SPECIALIZED_IMAGE_MODELS = frozenset({
+    "gemini-nano-banana-2.1", "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image", "gemini-3-pro-image", "gemini-2.5-flash-image",
+    "gemini-3.8-live", "gemini-3.8-live-extended-thinking",
+    "gemini-3.1-flash-live-preview", "gemini-2.5-flash-native-audio-preview-12-2025",
+    "gemini-robotics-er-2-streaming-preview",
+})
 
 
 class AttemptHTTP(httpx.AsyncClient):
@@ -74,6 +128,14 @@ def support(model):
         "mime_types": ["image/png", "image/jpeg"],
         "evidence": [MODEL_EVIDENCE[model]] if model in MODEL_EVIDENCE else [],
         "tool_evidence": TOOL_EVIDENCE if model in TOOL_IMAGE_MODELS else None,
+        "evidence_date": MEDIA_EVIDENCE_DATE,
+        "reason": MODEL_NOTES.get(
+            model,
+            "Distinct media-output/Live route not qualified by this text adapter; not vendor image incapability."
+            if model in SPECIALIZED_IMAGE_MODELS
+            else "Model/position not catalogued for this route; absence of evidence is not vendor incapability."
+            if model not in USER_IMAGE_MODELS else None,
+        ),
         "qualification": "offline-wire-only; not account entitlement or live inference",
     }
 

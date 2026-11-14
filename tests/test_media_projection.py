@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -21,6 +22,22 @@ from amplifier_module_provider_gemini._media import NAMESPACE, diagnostic_copy
 
 
 PIXELS = b"offline-synthetic-original-image-bytes"
+# Literal catalogue snapshot, intentionally independent of production sets:
+# adding a declaration without adding actual SDK wire coverage must fail.
+CATALOGUE_USER_IDS = (
+    "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen",
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
+    "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash",
+    "gemini-2.5-flash-lite", "gemini-robotics-er-2-preview",
+)
+CATALOGUE_TOOL_IDS = (
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
+    "gemini-3-flash-preview", "gemini-4-hydrogen",
+)
 
 
 def image(data=PIXELS):
@@ -153,11 +170,11 @@ async def test_actual_sdk_wire_count_identity_sha_order_and_preemit_privacy(stre
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["gemini-3.1-pro-preview", "gemini-2.5-flash"])
+@pytest.mark.parametrize("model", CATALOGUE_USER_IDS)
 @pytest.mark.parametrize("image_format,mime", [("PNG", "image/png"), ("JPEG", "image/jpeg")])
 @pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
 async def test_every_advertised_user_model_valid_image_actual_sdk_wire(
-    model, image_format, mime, streaming, record_property,
+    model, image_format, mime, streaming, record_property, monkeypatch,
 ):
     """Literal model/MIME matrix is wire proof, not a capability self-assertion."""
     output = io.BytesIO()
@@ -181,6 +198,8 @@ async def test_every_advertised_user_model_valid_image_actual_sdk_wire(
         return httpx.Response(200, json=response())
 
     client = bind(p, receive)
+    p._count_route_client = client
+    p._client_uses_canonical_developer_route = True  # Mock route only.
     req = ChatRequest(messages=[
         Message(role="user", content=[
             TextBlock(text="before-user-image"),
@@ -197,6 +216,30 @@ async def test_every_advertised_user_model_valid_image_actual_sdk_wire(
         assert count_body.pop("model") == f"models/{model}"
         assert p._request_plan(req, **options) is plan
         await p._validate_media_attempt(plan, purpose="count")
+        real_client = httpx.AsyncClient
+        counted = []
+
+        def count_client(*, timeout):
+            def count(http_request):
+                counted.append(json.loads(http_request.content))
+                return httpx.Response(200, json={"totalTokens": 42})
+            return real_client(timeout=timeout, transport=httpx.MockTransport(count))
+
+        with monkeypatch.context() as patch:
+            patch.setattr(httpx, "AsyncClient", count_client)
+            budget = await p.request_budget(req, context_estimate=100, request_options=options)
+        if model in ("gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-robotics-er-2-preview"):
+            # New unified/specialized window semantics are not covered by the
+            # existing native budget counter; do not pretend a wire plan is a
+            # successful HTTP count or silently borrow another model's limits.
+            assert budget is None and not counted
+            native_count = "unavailable"
+        else:
+            assert budget["measurement"]["input_tokens"] == 42
+            counted_body = counted[0]["generateContentRequest"]
+            assert counted_body.pop("model") == f"models/{model}"
+            assert counted_body == count_body
+            native_count = "mock-http-count"
         await p.complete(req, request_options=options)
         assert len(sent) == 1
         url, actual = sent[0]
@@ -229,12 +272,85 @@ async def test_every_advertised_user_model_valid_image_actual_sdk_wire(
         record_property("gemini.media.advertised-user-wire", json.dumps({
             "model": model, "mime": mime, "format": image_format,
             "transport": method, "count_send_options_identity": True,
+            "native_budget_measurement": native_count,
             "decoded_sha256": hashlib.sha256(pixels).hexdigest(),
             "sanitized_actual_wire": diagnostic_copy(actual),
         }))
     finally:
         await close(client)
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", CATALOGUE_TOOL_IDS)
+@pytest.mark.parametrize("image_format,mime", [("PNG", "image/png"), ("JPEG", "image/jpeg")])
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+async def test_catalogued_tool_models_valid_pixels_original_call_wire(
+    model, image_format, mime, streaming, record_property,
+):
+    output = io.BytesIO()
+    Image.new("RGB", (3, 2), (19, 83, 147)).save(output, format=image_format)
+    pixels = output.getvalue()
+    cap = Capability()
+    p = provider(cap, streaming)
+    sent = []
+
+    def receive(req):
+        sent.append((str(req.url), json.loads(req.content)))
+        if streaming:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  text="data: " + json.dumps(response()) + "\n\n")
+        return httpx.Response(200, json=response())
+
+    client = bind(p, receive)
+    req = ChatRequest(messages=[
+        Message(role="user", content="look at the tool result"),
+        Message(role="assistant", content="", tool_calls=[
+            {"id": "call-1", "name": "read_file", "arguments": {}},
+        ]),
+        Message(role="tool", tool_call_id="call-1", name="read_file", content=[
+            TextBlock(text="before-tool"),
+            ImageBlock(source={"type": "base64", "media_type": mime,
+                               "data": base64.b64encode(pixels).decode("ascii")}),
+            TextBlock(text="after-tool"),
+        ], metadata={NAMESPACE: {"refs": []}, "owner": {"retained": True}}),
+        Message(role="user", content="unchanged-tail"),
+    ], max_output_tokens=73)
+    before = req.model_dump()
+    options = {"model": model, "temperature": 0.25, "tool_choice": "none"}
+    try:
+        plan = p._request_plan(req, **options)
+        count_body = p._count_request_payload(plan)["generateContentRequest"]
+        assert count_body.pop("model") == f"models/{model}"
+        await p._validate_media_attempt(plan, purpose="count")
+        await p.complete(req, request_options=options)
+        assert len(sent) == 1
+        url, actual = sent[0]
+        assert f"/models/{model}:" in url
+        assert normalize(deepcopy(actual)) == count_body
+        assert len(actual["contents"]) == 4
+        tool = actual["contents"][2]["parts"][0]["functionResponse"]
+        assert tool["name"] == "read_file"
+        assert tool["response"]["result"] == [
+            {"text": "before-tool"}, {"image": {"$ref": "session-image-0"}},
+            {"text": "after-tool"},
+        ]
+        blob = tool["parts"][0]["inline_data"]
+        assert blob["mime_type"] == mime
+        assert base64.b64decode(blob["data"], altchars=b"-_", validate=True) == pixels
+        assert actual["contents"][3]["parts"] == [{"text": "unchanged-tail"}]
+        assert req.model_dump() == before
+        assert all(value is req and seen_options == options for value, _, seen_options in cap.calls)
+        events = json.dumps([call.args for call in p.coordinator.hooks.emit.call_args_list])
+        assert base64.b64encode(pixels).decode("ascii") not in events
+        assert base64.urlsafe_b64encode(pixels).decode("ascii") not in events
+        assert "not-retained" in events
+        record_property("gemini.media.catalogued-tool-wire", json.dumps({
+            "model": model, "mime": mime, "transport": "stream" if streaming else "complete",
+            "decoded_sha256": hashlib.sha256(pixels).hexdigest(),
+            "count_projection_send_identity": True, "sanitized_actual_wire": diagnostic_copy(actual),
+        }))
+    finally:
+        await close(client)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["expired", "revoked"])
@@ -433,3 +549,47 @@ def test_exact_support_unknown_models_positions_and_diagnostic_copy():
     assert value["inline_data"]["data"] == PIXELS
     assert safe["thought_signature"] == "opaque-signature"
     assert safe["inline_data"]["media_status"] == "not-retained"
+
+
+def test_media_catalogue_matches_literal_wire_matrix_and_unknown_is_not_incapable():
+    from amplifier_module_provider_gemini._media import USER_IMAGE_MODELS, TOOL_IMAGE_MODELS
+    assert USER_IMAGE_MODELS == frozenset(CATALOGUE_USER_IDS)
+    assert TOOL_IMAGE_MODELS == frozenset(CATALOGUE_TOOL_IDS)
+    for model in CATALOGUE_USER_IDS:
+        p = GeminiProvider(config={"default_model": model})
+        facts = p.get_media_request_support(model=model)
+        assert facts["positions"] == (["user", "tool"] if model in CATALOGUE_TOOL_IDS else ["user"])
+        assert facts["evidence"].startswith("https://aistudio.google.com/docs/")
+        assert "vision" in p.get_info().capabilities
+    for model in ("gemini-future", "gemini-flash-latest", "gemini-3-pro-preview",
+                  "gemini-4-hydrogen-new", "gemini-3.1-flash-image", "gemini-3.8-live"):
+        facts = provider().get_media_request_support(model=model)
+        assert facts["positions"] == []
+        assert "incapability" in facts["reason"]
+    evidence = json.loads(
+        (Path(__file__).parents[1] / "contracts" / "gemini-media-evidence.v1.json").read_text()
+    )
+    assert evidence["audit_date_utc"] == "2026-11-14"
+    assert {row["id"] for row in evidence["matrix"]} == set(CATALOGUE_USER_IDS)
+    assert {
+        row["id"] for row in evidence["matrix"]
+        if row["tool"] in ("explicit-G3-guide-scope", "named-multimodal-function-response-example")
+    } == set(CATALOGUE_TOOL_IDS)
+
+
+@pytest.mark.asyncio
+async def test_listed_vision_tags_and_media_positions_share_exact_catalogue_not_name_guesses():
+    extras = ["gemini-4-future", "gemini-3.8-flash-not-a-model",
+              "gemini-flash-latest", "gemini-3.1-flash-image", "gemini-3.8-live"]
+    p = provider()
+    p._list_models_from_api = AsyncMock(return_value=[
+        {"id": model, "generation_methods": ["generateContent", "streamGenerateContent"]}
+        for model in (*CATALOGUE_USER_IDS, *extras)
+    ])
+    listed = await p.list_models(filters={})
+    assert {model.id for model in listed} == set(CATALOGUE_USER_IDS) | set(extras)
+    for model in listed:
+        assert ("vision" in model.capabilities) == (model.id in CATALOGUE_USER_IDS)
+        assert ("user" in p.get_media_request_support(model=model.id)["positions"]) == (
+            "vision" in model.capabilities
+        )

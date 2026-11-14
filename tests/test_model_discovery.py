@@ -306,7 +306,8 @@ async def test_reported_capabilities_only_no_name_guesses():
     async with provider_at(lambda _: httpx.Response(200, json={"models": records})) as (provider, _):
         found = {m.id: m for m in await provider.list_models(filters={})}
         assert found["custom"].capabilities == ["streaming", "thinking"]
-        assert found["gemini-3.8-flash"].capabilities == []
+        # Literal public modality evidence, not an inference from the name.
+        assert found["gemini-3.8-flash"].capabilities == ["vision"]
         assert found["gemini-3-pro-image-preview"].capabilities == []
         assert all(m.context_window == m.max_output_tokens == 0 for m in found.values())
         assert all(m.defaults == {} for m in found.values())

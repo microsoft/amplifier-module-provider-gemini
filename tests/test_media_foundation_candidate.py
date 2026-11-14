@@ -119,12 +119,21 @@ async def test_real_f1_store_projection_count_send_and_epoch_retry(tmp_path, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model,tool_images", [
+    ("gemini-4-carbon", False), ("gemini-4-argon", False), ("gemini-4-hydrogen", True),
+    ("gemini-3.8-flash", True), ("gemini-3.7-flash", True), ("gemini-3.6-flash", True),
+    ("gemini-3.5-flash", True), ("gemini-3.5-flash-lite", True),
+    ("gemini-3.1-flash-lite", True), ("gemini-3.1-pro-preview", True),
+    ("gemini-3.1-pro-preview-customtools", True), ("gemini-3-flash-preview", True),
+    ("gemini-2.5-pro", False), ("gemini-2.5-flash", False),
+    ("gemini-2.5-flash-lite", False), ("gemini-robotics-er-2-preview", False),
+])
 @pytest.mark.parametrize("image_format,mime", [("PNG", "image/png"), ("JPEG", "image/jpeg")])
 @pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
-async def test_real_f1_flash_user_wire_and_tool_unavailable_frozen_before_count(
-    tmp_path, monkeypatch, image_format, mime, streaming, record_property,
+async def test_real_f1_catalogue_user_and_tool_projection_frozen_before_count(
+    tmp_path, monkeypatch, model, tool_images, image_format, mime, streaming, record_property,
 ):
-    """Flash gets admitted user pixels, but tool pixels stay at their warning slot."""
+    """Each exact route freezes admitted pixels or a warning before measurement."""
     from google import genai
     from google.genai import types
     from types import SimpleNamespace
@@ -169,7 +178,6 @@ async def test_real_f1_flash_user_wire_and_tool_unavailable_frozen_before_count(
         Message(role="user", content="unchanged-tail"),
     ], max_output_tokens=73)
     canonical_before = canonical.model_dump()
-    model = "gemini-2.5-flash"
     options = {"model": model, "temperature": 0.25, "tool_choice": "none"}
     prepared = await cap.prepare_request(canonical, provider_identity={
         "provider": "gemini", "account": "offline", "generation": 1,
@@ -184,9 +192,10 @@ async def test_real_f1_flash_user_wire_and_tool_unavailable_frozen_before_count(
     tool_message = projected.messages[2]
     assert tool_message.tool_call_id == "call1"
     assert tool_message.metadata == canonical.messages[2].metadata
-    assert [block.type for block in tool_message.content] == ["text", "text", "text"]
-    warning = tool_message.content[1].text
-    assert "Image unavailable" in warning and "no pixels supplied" in warning
+    assert [block.type for block in tool_message.content] == ["text", "image" if tool_images else "text", "text"]
+    warning = None if tool_images else tool_message.content[1].text
+    if warning is not None:
+        assert "Image unavailable" in warning and "no pixels supplied" in warning
     assert [tool_message.content[0].text, tool_message.content[2].text] == ["before-tool", "after-tool"]
     projected_before = projected.model_dump()
     sent = []
@@ -221,15 +230,23 @@ async def test_real_f1_flash_user_wire_and_tool_unavailable_frozen_before_count(
         monkeypatch.setattr(httpx, "AsyncClient", count_client)
         budget = await p.request_budget(projected, context_estimate=100, request_options=options)
         monkeypatch.setattr(httpx, "AsyncClient", real_client)
-        assert budget["measurement"]["input_tokens"] == 42
+        if model in ("gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-robotics-er-2-preview"):
+            assert budget is None and not counted
+            plan = p._request_plan(projected, **options)
+            count_body = p._count_request_payload(plan)["generateContentRequest"]
+            native_count = "unavailable; wire projection only"
+        else:
+            assert budget["measurement"]["input_tokens"] == 42
+            assert len(counted) == 1
+            count_url, count_envelope = counted[0]
+            assert f"/models/{model}:countTokens" in count_url
+            count_body = json.loads(json.dumps(count_envelope["generateContentRequest"]))
+            native_count = "mock-http-count"
         await p.complete(projected, request_options=options)
-        assert len(counted) == len(sent) == 1
-        count_url, count_envelope = counted[0]
+        assert len(sent) == 1
         send_url, actual = sent[0]
-        assert f"/models/{model}:countTokens" in count_url
         method = "streamGenerateContent" if streaming else "generateContent"
         assert f"/models/{model}:{method}" in send_url
-        count_body = json.loads(json.dumps(count_envelope["generateContentRequest"]))
         assert count_body.pop("model") == f"models/{model}"
         normalized = json.loads(json.dumps(actual))
         user_blob = normalized["contents"][0]["parts"][1]["inlineData"]
@@ -241,10 +258,18 @@ async def test_real_f1_flash_user_wire_and_tool_unavailable_frozen_before_count(
         assert base64.b64decode(user_blob["data"], altchars=b"-_", validate=True) == pixels
         tool_wire = actual["contents"][2]["parts"][0]["functionResponse"]
         assert tool_wire["name"] == "read_file"
-        assert "parts" not in tool_wire
-        assert tool_wire["response"]["result"] == [
-            {"text": "before-tool"}, {"text": warning}, {"text": "after-tool"},
-        ]
+        if tool_images:
+            tool_blob = tool_wire["parts"][0]["inline_data"]
+            assert tool_blob["mime_type"] == mime
+            assert base64.b64decode(tool_blob["data"], altchars=b"-_", validate=True) == pixels
+            assert tool_wire["response"]["result"] == [
+                {"text": "before-tool"}, {"image": {"$ref": "session-image-0"}}, {"text": "after-tool"},
+            ]
+        else:
+            assert "parts" not in tool_wire
+            assert tool_wire["response"]["result"] == [
+                {"text": "before-tool"}, {"text": warning}, {"text": "after-tool"},
+            ]
         assert len(actual["contents"]) == 4
         assert actual["contents"][3]["parts"] == [{"text": "unchanged-tail"}]
         assert count_body["generationConfig"]["temperature"] == 0.25
@@ -256,11 +281,12 @@ async def test_real_f1_flash_user_wire_and_tool_unavailable_frozen_before_count(
         assert base64.b64encode(pixels).decode("ascii") not in events
         assert base64.urlsafe_b64encode(pixels).decode("ascii") not in events
         assert "not-retained" in events
-        record_property("gemini.media.flash-f1-unavailable-wire", json.dumps({
+        record_property("gemini.media.catalogue-f1-wire", json.dumps({
             "model": model, "mime": mime, "format": image_format, "transport": method,
             "count_send_options_identity": True,
+            "native_budget_measurement": native_count,
             "user_decoded_sha256": hashlib.sha256(pixels).hexdigest(),
-            "tool_projection": "unavailable at original call-bound position before count",
+            "tool_projection": "image" if tool_images else "unavailable at original call-bound position before count",
             "sanitized_actual_wire": diagnostic_copy(actual),
         }))
     finally:

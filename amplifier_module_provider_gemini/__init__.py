@@ -1245,6 +1245,7 @@ class GeminiProvider:
             "positions": [role for role, value in facts["positions"].items() if value],
             "mime_types": facts["mime_types"],
             "evidence": "\n".join(facts["evidence"] + ([facts["tool_evidence"]] if facts["tool_evidence"] else [])),
+            **({"reason": facts["reason"]} if facts["reason"] else {}),
         }
 
     def _media_identity(self, request, options):
