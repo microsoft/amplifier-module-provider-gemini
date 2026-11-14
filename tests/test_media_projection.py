@@ -4,12 +4,14 @@ import base64
 import asyncio
 from copy import deepcopy
 import hashlib
+import io
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from PIL import Image
 from google import genai
 from google.genai import types
 from amplifier_core.message_models import ChatRequest, ImageBlock, Message, TextBlock
@@ -145,6 +147,90 @@ async def test_actual_sdk_wire_count_identity_sha_order_and_preemit_privacy(stre
                 {"position": "tool:first:0", "sha256": hashlib.sha256(b"one").hexdigest()},
                 {"position": "tool:first:1", "sha256": hashlib.sha256(b"two").hexdigest()},
             ],
+        }))
+    finally:
+        await close(client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gemini-3.1-pro-preview", "gemini-2.5-flash"])
+@pytest.mark.parametrize("image_format,mime", [("PNG", "image/png"), ("JPEG", "image/jpeg")])
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+async def test_every_advertised_user_model_valid_image_actual_sdk_wire(
+    model, image_format, mime, streaming, record_property,
+):
+    """Literal model/MIME matrix is wire proof, not a capability self-assertion."""
+    output = io.BytesIO()
+    Image.new("RGB", (3, 2), (19, 83, 147)).save(output, format=image_format)
+    pixels = output.getvalue()
+    with Image.open(io.BytesIO(pixels)) as decoded:
+        assert decoded.format == image_format
+        assert decoded.size == (3, 2)
+        decoded.verify()
+    cap = Capability()
+    p = provider(cap, streaming)
+    sent = []
+
+    def receive(req):
+        sent.append((str(req.url), json.loads(req.content)))
+        if streaming:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                text="data: " + json.dumps(response()) + "\n\n",
+            )
+        return httpx.Response(200, json=response())
+
+    client = bind(p, receive)
+    req = ChatRequest(messages=[
+        Message(role="user", content=[
+            TextBlock(text="before-user-image"),
+            ImageBlock(source={"type": "base64", "media_type": mime,
+                               "data": base64.b64encode(pixels).decode("ascii")}),
+            TextBlock(text="after-user-image"),
+        ], metadata={NAMESPACE: {"refs": []}, "owner": {"keep": "unchanged"}}),
+    ], max_output_tokens=73)
+    before = req.model_dump()
+    options = {"model": model, "temperature": 0.25, "tool_choice": "none"}
+    try:
+        plan = p._request_plan(req, **options)
+        count_body = p._count_request_payload(plan)["generateContentRequest"]
+        assert count_body.pop("model") == f"models/{model}"
+        assert p._request_plan(req, **options) is plan
+        await p._validate_media_attempt(plan, purpose="count")
+        await p.complete(req, request_options=options)
+        assert len(sent) == 1
+        url, actual = sent[0]
+        method = "streamGenerateContent" if streaming else "generateContent"
+        assert f"/models/{model}:{method}" in url
+        assert normalize(deepcopy(actual)) == count_body
+        parts = actual["contents"][0]["parts"]
+        assert len(parts) == 3
+        assert parts[0] == {"text": "before-user-image"}
+        assert parts[2] == {"text": "after-user-image"}
+        blob = parts[1]["inlineData"]
+        assert blob.get("mime_type", blob.get("mimeType")) == mime
+        # Locked google-genai2.30.1 encodes bytes with urlsafe_b64encode.
+        assert base64.b64decode(blob["data"], altchars=b"-_", validate=True) == pixels
+        assert count_body["generationConfig"]["temperature"] == 0.25
+        assert count_body["generationConfig"]["maxOutputTokens"] == 73
+        assert count_body["toolConfig"]["functionCallingConfig"]["mode"] == "NONE"
+        assert all(value is req and seen_options == options
+                   for value, _, seen_options in cap.calls)
+        assert {purpose for _, purpose, _ in cap.calls} == {"count", "transport"}
+        assert req.model_dump() == before
+        events = json.dumps([call.args for call in p.coordinator.hooks.emit.call_args_list])
+        assert base64.b64encode(pixels).decode("ascii") not in events
+        assert base64.urlsafe_b64encode(pixels).decode("ascii") not in events
+        assert "not-retained" in events
+        if streaming:
+            assert any(call.args[0] == "llm:stream_block_delta"
+                       for call in p.coordinator.hooks.emit.call_args_list)
+        assert not p._media_plans
+        record_property("gemini.media.advertised-user-wire", json.dumps({
+            "model": model, "mime": mime, "format": image_format,
+            "transport": method, "count_send_options_identity": True,
+            "decoded_sha256": hashlib.sha256(pixels).hexdigest(),
+            "sanitized_actual_wire": diagnostic_copy(actual),
         }))
     finally:
         await close(client)
