@@ -20,11 +20,10 @@ Sources:
   https://ai.google.dev/gemini-api/docs/models/<id>   ("Token limits" block)
   https://ai.google.dev/gemini-api/docs/deprecations
 
-Every current Gemini text model reports the SAME limits -- 1,048,576 input /
-65,536 output -- so the table below is uniform today. It is still written out
-per model rather than collapsed to a constant, because that uniformity is an
-observation about this moment, not a property of the API, and the next model
-that breaks it should break one row rather than the rule.
+The originally qualified Gemini 3 / 2.5 counter models share 1,048,576 input /
+65,536 output limits. Public model facts need not share that uniformity or imply
+native-count qualification: the exact Robotics ER2 endpoint documents a smaller
+input limit. Keep its publication-only fact separate from the counter's model set.
 
 `list_models(filters={})` remains the live source of truth and is not replaced by this
 table: it reports whatever the API says for every model on the account,
@@ -41,6 +40,7 @@ __all__ = [
     "ModelLimits",
     "get_limits",
     "has_known_limits",
+    "has_native_count_limits",
     "has_exact_model_limits",
     "DEFAULT_LIMITS",
 ]
@@ -57,11 +57,9 @@ class ModelLimits:
 #: What an unrecognized model id gets.
 #:
 #: Inference-only fallback; model listing uses zero for unknown API limits.
-#: Matches every current model. An unknown id is far more likely
-#: to be a model released after this file was verified -- which would share
-#: these limits -- than a smaller legacy one, and the failure direction is
-#: benign either way: an over-large context window surfaces as a loud API
-#: error on an oversized request, not as silent truncation.
+#: Legacy fallback retained for uncatalogued IDs; not authoritative evidence
+#: about a future, smaller or unified-window model. Known publication-only
+#: exceptions below must not inherit it or gain native-count qualification.
 DEFAULT_LIMITS = ModelLimits(context_window=1_048_576, max_output_tokens=65_536)
 
 
@@ -81,14 +79,25 @@ _LIMITS: dict[str, ModelLimits] = {
     "gemini-2.5-flash-lite": ModelLimits(1_048_576, 65_536),
 }
 
+# Public model facts do not qualify a native-budget adapter. Exact IDs only:
+# do not propagate this fact to the separate Live endpoint or guessed suffixes.
+# Audited 2026-11-14, "Model endpoints" / standard ER2 table:
+# https://aistudio.google.com/docs/robotics-overview?generate-content=true#model-versions
+_PUBLICATION_ONLY_LIMITS = {
+    "gemini-robotics-er-2-preview": ModelLimits(131_072, 65_536),
+}
+
 
 def get_limits(model_id: str) -> ModelLimits:
     """Return token limits for *model_id*, falling back to `DEFAULT_LIMITS`.
 
-    Matches on the exact id first, then on the longest known prefix, so dated
+    Publication-only facts match exact IDs. Counter models match their exact id
+    first, then the longest known prefix, so dated
     or suffixed aliases (``gemini-3.7-flash-preview-09-2026``) resolve to their
     base model instead of silently taking the unknown-model default.
     """
+    if model_id in _PUBLICATION_ONLY_LIMITS:
+        return _PUBLICATION_ONLY_LIMITS[model_id]
     if model_id in _LIMITS:
         return _LIMITS[model_id]
 
@@ -101,9 +110,14 @@ def get_limits(model_id: str) -> ModelLimits:
 
 def has_known_limits(model_id: str) -> bool:
     """Whether a model has a documented exact/prefix token-limit entry."""
+    return model_id in _PUBLICATION_ONLY_LIMITS or has_native_count_limits(model_id)
+
+
+def has_native_count_limits(model_id: str) -> bool:
+    """Whether the existing counter qualified this model's budget semantics."""
     return model_id in _LIMITS or any(model_id.startswith(known) for known in _LIMITS)
 
 
 def has_exact_model_limits(model_id: str) -> bool:
     """Whether the literal model ID is documented, without trusting a suffix."""
-    return model_id in _LIMITS
+    return model_id in _LIMITS or model_id in _PUBLICATION_ONLY_LIMITS

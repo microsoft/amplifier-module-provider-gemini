@@ -306,7 +306,8 @@ async def test_reported_capabilities_only_no_name_guesses():
     async with provider_at(lambda _: httpx.Response(200, json={"models": records})) as (provider, _):
         found = {m.id: m for m in await provider.list_models(filters={})}
         assert found["custom"].capabilities == ["streaming", "thinking"]
-        assert found["gemini-3.8-flash"].capabilities == []
+        # Literal public modality evidence, not an inference from the name.
+        assert found["gemini-3.8-flash"].capabilities == ["vision"]
         assert found["gemini-3-pro-image-preview"].capabilities == []
         assert all(m.context_window == m.max_output_tokens == 0 for m in found.values())
         assert all(m.defaults == {} for m in found.values())
@@ -691,7 +692,9 @@ async def test_default_projection_is_conservative_and_explicit_list_is_unfiltere
         assert before[1].display_name == "models/gemini-2.5-flash"
         assert before[1].context_window == 1000
         assert before[1].max_output_tokens == 200
-        assert before[1].capabilities == []
+        # Exact documented image modality, not a guessed family capability.
+        assert before[0].capabilities == []
+        assert before[1].capabilities == ["vision"]
         assert before[1].defaults == {}
         assert [item.id for item in discovered] == sorted([
             record["name"].removeprefix("models/") for record in records
