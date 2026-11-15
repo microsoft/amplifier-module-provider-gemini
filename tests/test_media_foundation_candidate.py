@@ -74,12 +74,11 @@ async def test_real_f1_store_projection_count_send_and_epoch_retry(tmp_path, mon
         return httpx.Response(200, json={"candidates": [{"content": {"role": "model", "parts": [{"text": "OK"}]}}]})
 
     client = genai.Client(api_key="offline", http_options=types.HttpOptions(
-        base_url="https://offline.invalid",
+        base_url="https://generativelanguage.googleapis.com/",
         async_client_args={"transport": httpx.MockTransport(generate)},
     ))
     p._client = client
-    # Deliberately mark the fixture's mock route as this provider's selected
-    # Developer route so request_budget exercises the actual HTTP count seam.
+    # Exercise the canonical Developer URL with a socket-free MockTransport.
     p._count_route_client = client
     p._client_uses_canonical_developer_route = True
     real_client = httpx.AsyncClient
@@ -211,11 +210,11 @@ async def test_real_f1_catalogue_user_and_tool_projection_frozen_before_count(
         return httpx.Response(200, json=reply)
 
     client = genai.Client(api_key="offline", http_options=types.HttpOptions(
-        base_url="https://offline.invalid",
+        base_url="https://generativelanguage.googleapis.com/",
         async_client_args={"transport": httpx.MockTransport(generate)},
     ))
     p._client = p._count_route_client = client
-    p._client_uses_canonical_developer_route = True  # Mock route, not a live-route claim.
+    p._client_uses_canonical_developer_route = True  # Canonical URL, socket-free transport.
     real_client = httpx.AsyncClient
     counted = []
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from copy import deepcopy
 from pydantic import BaseModel
 import httpx
 
@@ -77,37 +78,183 @@ SPECIALIZED_IMAGE_MODELS = frozenset({
 })
 
 
+_HTTP_DATA = frozenset({
+    "_auth", "_base_url", "_cookies", "_default_encoding", "_event_hooks",
+    "_headers", "_mounts", "_params", "_state", "_timeout", "_transport",
+    "_trust_env", "follow_redirects", "max_redirects",
+})
+_HTTP_EXECUTION = frozenset(
+    name for base in httpx.AsyncClient.__mro__
+    for name, value in vars(base).items() if callable(value)
+)
+
+
+def _http_state(client):
+    """Qualified HTTPX state; no secrets or URLs are emitted."""
+    if _HTTP_EXECUTION.intersection(vars(client)):
+        raise ValueError("Unqualified media HTTP execution override")
+    if client.auth is not None:
+        raise ValueError("Unqualified media HTTP authentication flow")
+    if client.event_hooks.get("request") or client.event_hooks.get("response"):
+        raise ValueError("Unqualified media HTTP request hooks")
+    if (
+        client.params or client.cookies
+        or client.base_url.userinfo or client.base_url.query or client.base_url.fragment
+        or any(name in client.headers for name in ("authorization", "proxy-authorization", "cookie"))
+    ):
+        raise ValueError("Unqualified media HTTP credential defaults")
+    for transport in [client._transport, *client._mounts.values()]:
+        if transport is None or isinstance(transport, httpx.MockTransport):
+            continue
+        if (
+            type(transport) is not httpx.AsyncHTTPTransport
+            or getattr(getattr(transport, "_pool", None), "_retries", None) != 0
+        ):
+            raise ValueError("Unqualified retrying media HTTP transport")
+    return (
+        tuple(client.headers.multi_items()), str(client.base_url),
+        tuple(client.params.multi_items()),
+        tuple((c.name, c.value, c.domain, c.path) for c in client.cookies.jar),
+        id(client._transport),
+        tuple((id(pattern), id(transport)) for pattern, transport in client._mounts.items()),
+    )
+
+
+def validate_wire(request, *, base, key, model, purpose):
+    """Validate the concrete, merged SDK/HTTP request, not an API-key property."""
+    path = f"models/{model.removeprefix('models/')}"
+    root = str(base).rstrip("/") + "/v1beta/" + path
+    urls = (
+        [root + ":countTokens"] if purpose == "count" else
+        [root + ":generateContent", root + ":streamGenerateContent?alt=sse"]
+    )
+    authority = request.url.netloc.decode("ascii")
+    if (
+        request.method != "POST"
+        or request.url not in [httpx.URL(url) for url in urls]
+        or request.url.userinfo or request.url.fragment
+        or request.headers.get_list("x-goog-api-key") != [key]
+        or request.headers.get_list("host") != [authority]
+        or set(request.extensions) - {"timeout"}
+        or any(name in request.headers for name in ("authorization", "proxy-authorization", "cookie"))
+    ):
+        raise ValueError("Gemini media effective HTTP request refused")
+
+
+class MediaConnection:
+    """Attest a selected static Developer connection before freezing a plan."""
+
+    def __init__(self, client, *, api_key, base_url):
+        from google.genai._api_client import BaseApiClient
+        api = client._api_client
+        if type(api) is not BaseApiClient:
+            raise ValueError("Unqualified media SDK connection")
+        self.client, self.api = client, api
+        self.sdk_execution = frozenset(
+            name for base in BaseApiClient.__mro__
+            for name, value in vars(base).items() if callable(value)
+        )
+        self.options, self.http = api._http_options, api._async_httpx_client
+        self.key = api_key
+        self.base = httpx.URL(base_url)
+        if (
+            not isinstance(self.key, str) or not self.key or self.key != self.key.strip()
+            or self.base.scheme != "https" or self.base.userinfo
+            or self.base.query or self.base.fragment
+        ):
+            raise ValueError("Unqualified media static connection")
+        self.headers = deepcopy(self.options.headers)
+        self.http_state = _http_state(self.http)
+        self.routing = self._routing()
+        self.validate()
+
+    def _routing(self):
+        api = self.api
+        return (
+            api.custom_base_url, api.project, api.location,
+            getattr(api, "_async_httpx_use_mtls_endpoint", False),
+        )
+
+    def validate(self):
+        api, options = self.api, self.options
+        headers = httpx.Headers(options.headers or {})
+        if (
+            self.sdk_execution.intersection(vars(api))
+            or self.client._api_client is not api
+            or api._http_options is not options
+            or api._async_httpx_client is not self.http
+            or api.api_key != self.key
+            or api.vertexai or getattr(api, "enterprise", False)
+            or getattr(api, "_credentials", None) is not None
+            or httpx.URL(options.base_url) != self.base
+            or options.api_version != "v1beta"
+            or options.extra_body
+            or getattr(options.base_url_resource_scope, "value", options.base_url_resource_scope)
+            not in (None, "DEFAULT")
+            or headers.get_list("x-goog-api-key") != [self.key]
+            or any(name in headers for name in ("authorization", "proxy-authorization", "cookie"))
+            or options.headers != self.headers
+            or self._routing() != self.routing or self.routing[-1]
+            or _http_state(self.http) != self.http_state
+        ):
+            raise ValueError("Gemini media effective connection changed")
+
+    def wire(self, request, *, model, purpose):
+        self.validate()
+        validate_wire(request, base=self.base, key=self.key, model=model, purpose=purpose)
+
+    def isolated_options(self):
+        # No deepcopy of transports/locks: only isolate mutable wire options.
+        return self.options.model_copy(update={
+            "headers": deepcopy(self.headers),
+            "retry_options": deepcopy(self.options.retry_options),
+        })
+
+
 class AttemptHTTP(httpx.AsyncClient):
-    """Borrow transport without cleanup ownership or a hidden redirect/auth send."""
+    """Request-local HTTPX state, borrowing transports but never their cleanup."""
 
-    def __init__(self, original, validate):
-        # No parent constructor: this view owns no pool, session or descriptors.
-        if original.auth is not None:
-            raise ValueError("Unqualified media HTTP authentication flow")
-        if original.event_hooks.get("request"):
-            raise ValueError("Unqualified media HTTP request hooks")
-        for transport in [original._transport, *original._mounts.values()]:
-            if transport is None or isinstance(transport, httpx.MockTransport):
-                continue
-            if (
-                type(transport) is not httpx.AsyncHTTPTransport
-                or getattr(getattr(transport, "_pool", None), "_retries", None) != 0
-            ):
-                raise ValueError("Unqualified retrying media HTTP transport")
-        self.original, self.validate = original, validate
-
-    def build_request(self, *args, **kwargs):
-        return self.original.build_request(*args, **kwargs)
+    def __init__(self, original, validate, wire=None):
+        state = _http_state(original)
+        # No constructor/pool allocation. Do not invoke the owner's request/send
+        # extension points: those can add auth/hooks after our earlier check.
+        # Only qualified HTTPX DATA state. Never copy instance methods,
+        # descriptors or extension attributes that could shadow this guard.
+        self.__dict__ = {name: original.__dict__[name] for name in _HTTP_DATA}
+        self._headers = httpx.Headers(original.headers)
+        self._params = httpx.QueryParams(original.params)
+        self._cookies = httpx.Cookies(original.cookies)
+        self._mounts = original._mounts.copy()
+        self._event_hooks = {"request": [], "response": []}
+        self.original, self.validate, self.wire = original, validate, wire
+        self.owner_state = state
 
     async def request(self, *args, **kwargs):
-        self.validate()
         kwargs["follow_redirects"] = False
-        return await self.original.request(*args, **kwargs)
+        return await super().request(*args, **kwargs)
 
     async def send(self, request, **kwargs):
-        self.validate()
+        self._validate(request)
+        if kwargs.get("auth") not in (None, httpx.USE_CLIENT_DEFAULT):
+            raise ValueError("Unqualified media HTTP authentication flow")
+        kwargs["auth"] = None
         kwargs["follow_redirects"] = False
-        return await self.original.send(request, **kwargs)
+        return await super().send(request, **kwargs)
+
+    def _validate(self, request):
+        self.validate()
+        if (
+            _http_state(self.original) != self.owner_state
+            or _http_state(self) != self.owner_state
+        ):
+            raise ValueError("Gemini media HTTP connection changed")
+        if self.wire is not None:
+            self.wire(request)
+
+    async def _send_single_request(self, request):
+        # Beneath HTTPX auth/hooks, directly before the selected transport.
+        self._validate(request)
+        return await super()._send_single_request(request)
 
     async def aclose(self):
         pass

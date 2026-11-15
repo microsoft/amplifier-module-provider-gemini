@@ -92,7 +92,7 @@ def response():
 
 def bind(p, receive):
     client = genai.Client(api_key="offline", http_options=types.HttpOptions(
-        base_url="https://offline.invalid",
+        base_url="https://generativelanguage.googleapis.com/",
         async_client_args={"transport": httpx.MockTransport(receive)},
     ))
     p._client = client
@@ -199,7 +199,7 @@ async def test_every_advertised_user_model_valid_image_actual_sdk_wire(
 
     client = bind(p, receive)
     p._count_route_client = client
-    p._client_uses_canonical_developer_route = True  # Mock route only.
+    p._client_uses_canonical_developer_route = True  # Real canonical URL; MockTransport only.
     req = ChatRequest(messages=[
         Message(role="user", content=[
             TextBlock(text="before-user-image"),
@@ -515,7 +515,8 @@ async def test_request_hook_cannot_revoke_or_mutate_body_between_witness_and_sen
 
     client._api_client._async_httpx_client.event_hooks["request"].append(revoke)
     try:
-        with pytest.raises(ProviderUnavailableError):
+        # Static qualification now rejects the hook even before SDK dispatch.
+        with pytest.raises((InvalidRequestError, ProviderUnavailableError)):
             await p.complete(request())
         assert not sent
         assert cap.valid

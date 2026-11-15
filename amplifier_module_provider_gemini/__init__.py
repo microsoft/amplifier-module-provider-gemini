@@ -166,6 +166,7 @@ class _GeminiRequestPlan:
     media_options: Any = None
     media_identity: str | None = None
     media_capability: Any = None
+    media_connection: Any = None
 
 
 # GenerateContentConfig has local controls that do not reach the Developer REST
@@ -1127,6 +1128,8 @@ class GeminiProvider:
         # fixed Developer counter; generation keeps using the caller's client.
         self._client_uses_canonical_developer_route: bool | None = None
         self._count_route_client: Any = None
+        self._media_client_origin: Any = None
+        self._media_selected_binding: Any = None
         self._add_cost = (
             add_cost if add_cost is not None else lambda cost, model=None: None
         )
@@ -1262,12 +1265,38 @@ class GeminiProvider:
             "client": "owned" if owned_client else id(self._client),
             "credential": self._api_key,
             "connection": None if api is None else {
+                "api_object": id(api),
+                "http_object": id(getattr(api, "_async_httpx_client", None)),
                 "key": getattr(api, "api_key", None),
                 "vertexai": getattr(api, "vertexai", None),
                 "base_url": getattr(http_options, "base_url", None),
                 "api_version": getattr(http_options, "api_version", None),
+                "headers": getattr(http_options, "headers", None),
             },
         })
+
+    def _media_connection(self):
+        from ._media import MediaConnection
+        client = self.client
+        api = client._api_client
+        origin = self._media_client_origin
+        if origin is not None:
+            selected_client, selected_api, selected_options, selected_http, base = origin
+            if (
+                client is not selected_client or api is not selected_api
+                or api._http_options is not selected_options
+                or api._async_httpx_client is not selected_http
+                or self._media_selected_binding is None
+                or self._media_selected_binding.key != self._api_key
+            ):
+                raise ValueError("Gemini media selected connection changed")
+            self._media_selected_binding.validate()
+            return self._media_selected_binding
+        else:
+            # Injected custom SDK connections stay generation-only. Require
+            # their declared constructor route, never arbitrary observed state.
+            base = api.custom_base_url or "https://generativelanguage.googleapis.com/"
+        return MediaConnection(client, api_key=self._api_key, base_url=base)
 
     def _media_option_key(self, request, options):
         normalized = dict(options)
@@ -1291,6 +1320,10 @@ class GeminiProvider:
         # A qualified capability-backed request may initialize (not send on)
         # its chosen connection before the vendor plan is frozen.
         self.client
+        try:
+            connection = self._media_connection()
+        except (ValueError, TypeError, AttributeError):
+            raise InvalidRequestError("Gemini media selected connection refused", provider=self.name) from None
         identity = self._media_identity(request, options)
         key = (id(request), fingerprint(self._media_option_key(request, options)))
         if any(existing[0] == id(request) and existing != key for existing in self._media_plans):
@@ -1317,6 +1350,7 @@ class GeminiProvider:
             plan.model, deepcopy(plan.contents), plan.config.model_copy(deep=True),
             plan.count_unsupported_reason, reference, deepcopy(options), identity,
             self._media_capability(),
+            connection,
         )
         self._media_plans[key] = plan
         return plan
@@ -1341,6 +1375,13 @@ class GeminiProvider:
                 raise InvalidRequestError("Gemini media validation refused transport", provider=self.name)
         elif any(NAMESPACE in (message.metadata or {}) for message in request.messages):
             raise InvalidRequestError("Gemini media refs require a prepared media capability", provider=self.name)
+        # A capability callback is an extension point; attest again AFTER it.
+        try:
+            plan.media_connection.validate()
+        except (ValueError, TypeError, AttributeError):
+            raise InvalidRequestError("Gemini media effective connection changed", provider=self.name) from None
+        if self._media_identity(request, plan.media_options) != plan.media_identity:
+            raise InvalidRequestError("Gemini media candidate changed before transport", provider=self.name)
 
     async def _validate_media_attempt(self, plan, *, purpose):
         self._validate_media_attempt_sync(plan, purpose=purpose)
@@ -1360,10 +1401,13 @@ class GeminiProvider:
             if self._media_identity(request, plan.media_options) != plan.media_identity:
                 raise InvalidRequestError("Gemini media connection changed before transport", provider=self.name)
         original = client._api_client._async_httpx_client
-        return _compatibility_client(client, AttemptHTTP(
+        models = _compatibility_client(client, AttemptHTTP(
             original,
             lambda: self._validate_media_attempt_sync(plan, purpose="transport"),
+            lambda wire: plan.media_connection.wire(wire, model=plan.model, purpose="transport"),
         ))
+        models._api_client._http_options = plan.media_connection.isolated_options()
+        return models
 
     @staticmethod
     def _is_cloudflare_challenge(error) -> bool:
@@ -1410,6 +1454,23 @@ class GeminiProvider:
             )
             self._client_uses_canonical_developer_route = route_is_canonical
             self._count_route_client = self._client
+            api = self._client._api_client
+            self._media_client_origin = (
+                self._client, api, api._http_options, api._async_httpx_client,
+                "https://generativelanguage.googleapis.com/"
+                if route_is_canonical else os.environ.get("GOOGLE_GEMINI_BASE_URL"),
+            )
+            # Snapshot the actual factory-selected SDK/HTTP objects immediately,
+            # not their potentially mutated state at a later first media plan.
+            # Unqualified legacy connections stay legacy, never fail open media.
+            from ._media import MediaConnection
+            try:
+                self._media_selected_binding = MediaConnection(
+                    self._client, api_key=self._api_key,
+                    base_url=self._media_client_origin[-1],
+                )
+            except (TypeError, ValueError, AttributeError):
+                self._media_selected_binding = None
         return self._client
 
     def _native_counting_unavailable_reason(self, model: Any) -> str | None:
@@ -2444,6 +2505,12 @@ class GeminiProvider:
         route_or_model_reason = self._native_counting_unavailable_reason(plan.model)
         if route_or_model_reason is not None:
             return None, route_or_model_reason, None
+        if plan.media_request is not None:
+            # A generation-only custom route cannot borrow the fixed counter's
+            # identity, even when a stale creation marker claims canonical.
+            import httpx
+            if plan.media_connection.base != httpx.URL("https://generativelanguage.googleapis.com/"):
+                return None, _BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE, None
         if plan.count_unsupported_reason is not None:
             # plan.count_unsupported_reason is an internal English string kept
             # for local debugging; only the fixed code leaves this module.
@@ -2466,7 +2533,20 @@ class GeminiProvider:
         try:
             async with httpx.AsyncClient(timeout=self._count_timeout) as client:
                 await self._validate_media_attempt(plan, purpose="count")
-                response = await client.post(
+                counted_client = client
+                if plan.media_request is not None:
+                    from ._media import AttemptHTTP, validate_wire
+                    def validate_count(wire):
+                        validate_wire(
+                            wire, base="https://generativelanguage.googleapis.com/",
+                            key=plan.media_connection.key, model=plan.model, purpose="count",
+                        )
+                    counted_client = AttemptHTTP(
+                        client,
+                        lambda: self._validate_media_attempt_sync(plan, purpose="count"),
+                        validate_count,
+                    )
+                response = await counted_client.post(
                     endpoint,
                     headers={"x-goog-api-key": self._api_key},
                     json=payload,
@@ -4160,6 +4240,8 @@ class GeminiProvider:
         self._media_plans.clear()
         client = self._client
         self._count_route_client = None
+        self._media_client_origin = None
+        self._media_selected_binding = None
         self._client_uses_canonical_developer_route = None
         if client is None:
             # Client was never built (lazy init) -- nothing to close.
