@@ -147,11 +147,16 @@ def _sdk_environment_uses_vertexai() -> bool:
 
 
 def _sdk_environment_uses_canonical_developer_route() -> bool:
-    """Whether SDK environment defaults select this counter's fixed endpoint."""
-    return not (
-        os.environ.get("GOOGLE_GEMINI_BASE_URL")
-        or _sdk_environment_uses_vertexai()
-    )
+    """Whether SDK defaults select this counter's fixed endpoint (no client)."""
+    if _sdk_environment_uses_vertexai():
+        return False
+    try:
+        from google.genai._base_url import get_base_url
+        selected = get_base_url(False)
+    except (ImportError, AttributeError, TypeError, KeyError, ValueError):
+        return False
+    return selected in (None, "", "https://generativelanguage.googleapis.com/",
+                        "https://generativelanguage.googleapis.com")
 
 
 @dataclass(frozen=True)
@@ -1251,7 +1256,7 @@ class GeminiProvider:
             **({"reason": facts["reason"]} if facts["reason"] else {}),
         }
 
-    def _media_identity(self, request, options):
+    def _media_identity(self, request, options, connection):
         owned_client = self._client is None or self._client is self._count_route_client
         api = getattr(self._client, "_api_client", None)
         http_options = getattr(api, "_http_options", None)
@@ -1271,7 +1276,8 @@ class GeminiProvider:
                 "vertexai": getattr(api, "vertexai", None),
                 "base_url": getattr(http_options, "base_url", None),
                 "api_version": getattr(http_options, "api_version", None),
-                "headers": getattr(http_options, "headers", None),
+                "headers": connection.headers_identity(),
+                "timeout": getattr(http_options, "timeout", None),
             },
         })
 
@@ -1322,9 +1328,9 @@ class GeminiProvider:
         self.client
         try:
             connection = self._media_connection()
-        except (ValueError, TypeError, AttributeError):
+            identity = self._media_identity(request, options, connection)
+        except (ValueError, TypeError, AttributeError, ImportError, KeyError):
             raise InvalidRequestError("Gemini media selected connection refused", provider=self.name) from None
-        identity = self._media_identity(request, options)
         key = (id(request), fingerprint(self._media_option_key(request, options)))
         if any(existing[0] == id(request) and existing != key for existing in self._media_plans):
             raise InvalidRequestError("Gemini media options changed; count a new candidate", provider=self.name)
@@ -1359,7 +1365,7 @@ class GeminiProvider:
         if plan.media_request is None:
             return
         request = plan.media_request()
-        if request is None or self._media_identity(request, plan.media_options) != plan.media_identity:
+        if request is None or self._media_identity(request, plan.media_options, plan.media_connection) != plan.media_identity:
             raise InvalidRequestError("Gemini media candidate changed before transport", provider=self.name)
         capability = self._media_capability()
         if capability is not plan.media_capability:
@@ -1378,9 +1384,9 @@ class GeminiProvider:
         # A capability callback is an extension point; attest again AFTER it.
         try:
             plan.media_connection.validate()
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, ImportError, KeyError):
             raise InvalidRequestError("Gemini media effective connection changed", provider=self.name) from None
-        if self._media_identity(request, plan.media_options) != plan.media_identity:
+        if self._media_identity(request, plan.media_options, plan.media_connection) != plan.media_identity:
             raise InvalidRequestError("Gemini media candidate changed before transport", provider=self.name)
 
     async def _validate_media_attempt(self, plan, *, purpose):
@@ -1389,6 +1395,12 @@ class GeminiProvider:
     def _media_models(self, plan):
         if plan.media_request is None:
             return self.client.aio.models
+        try:
+            return self._borrow_media_models(plan)
+        except (ValueError, TypeError, AttributeError, ImportError, KeyError):
+            raise InvalidRequestError("Gemini media SDK transport unavailable", provider=self.name) from None
+
+    def _borrow_media_models(self, plan):
         # The existing request-local SDK view borrows, but never closes or
         # mutates, the bound owner. It also bypasses aiohttp's inner retry.
         from .image_operation import _compatibility_client
@@ -1398,7 +1410,7 @@ class GeminiProvider:
         # the first attempt and never permits replacing an existing connection.
         if self._client is client and plan.media_request() is not None:
             request = plan.media_request()
-            if self._media_identity(request, plan.media_options) != plan.media_identity:
+            if self._media_identity(request, plan.media_options, plan.media_connection) != plan.media_identity:
                 raise InvalidRequestError("Gemini media connection changed before transport", provider=self.name)
         original = client._api_client._async_httpx_client
         models = _compatibility_client(client, AttemptHTTP(
@@ -1439,11 +1451,6 @@ class GeminiProvider:
                 raise ValueError("api_key must be provided for API calls")
             from google import genai
 
-            # The SDK selects its route at construction from these environment
-            # defaults. Keep the selection with this client so a later
-            # environment change cannot make the fixed Developer counter
-            # describe an already noncanonical generation client.
-            route_is_canonical = _sdk_environment_uses_canonical_developer_route()
             # GenAI accepts milliseconds; None disables its model-work deadline.
             # Keep this explicit so its transport cannot impose a shorter wait.
             self._client = genai.Client(
@@ -1452,24 +1459,33 @@ class GeminiProvider:
                     timeout=None if self.timeout is None else self.timeout * 1000
                 ),
             )
-            self._client_uses_canonical_developer_route = route_is_canonical
             self._count_route_client = self._client
-            api = self._client._api_client
-            self._media_client_origin = (
-                self._client, api, api._http_options, api._async_httpx_client,
-                "https://generativelanguage.googleapis.com/"
-                if route_is_canonical else os.environ.get("GOOGLE_GEMINI_BASE_URL"),
-            )
+            self._client_uses_canonical_developer_route = False
+            self._media_client_origin = (self._client, None, None, None, None)
             # Snapshot the actual factory-selected SDK/HTTP objects immediately,
             # not their potentially mutated state at a later first media plan.
             # Unqualified legacy connections stay legacy, never fail open media.
-            from ._media import MediaConnection
             try:
+                from ._media import MediaConnection
+                api = self._client._api_client
+                # Attest the constructor's selected route immediately. SDK
+                # default URLs precede environment; an environment-only
+                # prediction is not the selected connection.
+                base = api._http_options.base_url
+                self._media_client_origin = (
+                    self._client, api, api._http_options, api._async_httpx_client, base,
+                )
+                self._client_uses_canonical_developer_route = (
+                    not api.vertexai and base in (
+                        "https://generativelanguage.googleapis.com/",
+                        "https://generativelanguage.googleapis.com",
+                    )
+                )
                 self._media_selected_binding = MediaConnection(
                     self._client, api_key=self._api_key,
-                    base_url=self._media_client_origin[-1],
+                    base_url=base,
                 )
-            except (TypeError, ValueError, AttributeError):
+            except (TypeError, ValueError, AttributeError, ImportError, KeyError):
                 self._media_selected_binding = None
         return self._client
 

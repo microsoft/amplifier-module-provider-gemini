@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 from copy import deepcopy
 from pydantic import BaseModel
 import httpx
@@ -89,8 +90,31 @@ _HTTP_EXECUTION = frozenset(
 )
 
 
+def media_headers(options, *, baseline=None):
+    """Normalize only the SDK's exact derived X-Server-Timeout insertion.
+
+    genai 2.30.1 populates this case-sensitive spelling with ceil(timeout_ms /
+    1000) on an ordinary request. All other headers, spellings and values remain
+    identity-bearing. The timeout itself remains bound by MediaConnection.
+    """
+    headers = deepcopy(options.headers)
+    timeout = options.timeout
+    if (
+        timeout and headers is not None and baseline is not None
+        and not any(name.lower() == "x-server-timeout" for name in baseline)
+    ):
+        derived = str(math.ceil(timeout / 1000.0))
+        if headers.get("X-Server-Timeout") == derived:
+            headers.pop("X-Server-Timeout")
+    return headers
+
+
 def _http_state(client):
     """Qualified HTTPX state; no secrets or URLs are emitted."""
+    if not _HTTP_DATA.issubset(vars(client)):
+        raise ValueError("Unqualified media HTTP client state")
+    if client.is_closed:
+        raise ValueError("Gemini media HTTP owner is closed")
     if _HTTP_EXECUTION.intersection(vars(client)):
         raise ValueError("Unqualified media HTTP execution override")
     if client.auth is not None:
@@ -103,20 +127,40 @@ def _http_state(client):
         or any(name in client.headers for name in ("authorization", "proxy-authorization", "cookie"))
     ):
         raise ValueError("Unqualified media HTTP credential defaults")
+    pool_ids = []
     for transport in [client._transport, *client._mounts.values()]:
-        if transport is None or isinstance(transport, httpx.MockTransport):
+        if transport is None:
             continue
+        execution = {
+            name for base in type(transport).__mro__
+            for name, value in vars(base).items() if callable(value)
+        }
+        if execution.intersection(vars(transport)):
+            raise ValueError("Unqualified media transport execution override")
+        if type(transport) is httpx.MockTransport:
+            continue
+        from httpcore import AsyncConnectionPool, AsyncHTTPProxy, AsyncSOCKSProxy
+        pool = getattr(transport, "_pool", None)
         if (
             type(transport) is not httpx.AsyncHTTPTransport
-            or getattr(getattr(transport, "_pool", None), "_retries", None) != 0
+            or type(pool) not in (AsyncConnectionPool, AsyncHTTPProxy, AsyncSOCKSProxy)
+            or getattr(pool, "_retries", None) != 0
         ):
             raise ValueError("Unqualified retrying media HTTP transport")
+        pool_execution = {
+            name for base in type(pool).__mro__
+            for name, value in vars(base).items() if callable(value)
+        }
+        if pool_execution.intersection(vars(pool)):
+            raise ValueError("Unqualified media pool execution override")
+        pool_ids.append((id(transport), id(pool)))
     return (
         tuple(client.headers.multi_items()), str(client.base_url),
         tuple(client.params.multi_items()),
         tuple((c.name, c.value, c.domain, c.path) for c in client.cookies.jar),
         id(client._transport),
         tuple((id(pattern), id(transport)) for pattern, transport in client._mounts.items()),
+        tuple(pool_ids),
     )
 
 
@@ -164,6 +208,7 @@ class MediaConnection:
         ):
             raise ValueError("Unqualified media static connection")
         self.headers = deepcopy(self.options.headers)
+        self.timeout = self.options.timeout
         self.http_state = _http_state(self.http)
         self.routing = self._routing()
         self.validate()
@@ -193,7 +238,8 @@ class MediaConnection:
             not in (None, "DEFAULT")
             or headers.get_list("x-goog-api-key") != [self.key]
             or any(name in headers for name in ("authorization", "proxy-authorization", "cookie"))
-            or options.headers != self.headers
+            or media_headers(options, baseline=self.headers) != self.headers
+            or options.timeout != self.timeout
             or self._routing() != self.routing or self.routing[-1]
             or _http_state(self.http) != self.http_state
         ):
@@ -202,6 +248,9 @@ class MediaConnection:
     def wire(self, request, *, model, purpose):
         self.validate()
         validate_wire(request, base=self.base, key=self.key, model=model, purpose=purpose)
+
+    def headers_identity(self):
+        return media_headers(self.options, baseline=self.headers)
 
     def isolated_options(self):
         # No deepcopy of transports/locks: only isolate mutable wire options.
@@ -257,6 +306,11 @@ class AttemptHTTP(httpx.AsyncClient):
         return await super()._send_single_request(request)
 
     async def aclose(self):
+        pass
+
+    async def __aexit__(self, *args):
+        # HTTPX's normal __aexit__ closes transports directly, bypassing aclose.
+        # Borrowed views never acquire cleanup ownership.
         pass
 
 
