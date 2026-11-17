@@ -3502,7 +3502,7 @@ class GeminiProvider:
 
     def _assistant_parts(
         self, msg: dict[str, Any], *, import_signatures: bool,
-        image_call_ids: set[str] | None = None,
+        response_call_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Replay native part order using the authoritative call representation.
 
@@ -3570,7 +3570,7 @@ class GeminiProvider:
                     "args": call.get("arguments", {}),
                 }
             }
-            if image_call_ids and call.get("id") in image_call_ids:
+            if response_call_ids and call.get("id") in response_call_ids:
                 part["function_call"]["id"] = call["id"]
             if signature := _native_signature(source):
                 part["thought_signature"] = signature
@@ -3687,10 +3687,16 @@ class GeminiProvider:
         user_images = route_supported and selected_model in USER_IMAGE_MODELS
         tool_images = route_supported and selected_model in TOOL_IMAGE_MODELS
         messages = normalize_results(messages)
-        image_calls = {
+        # Every response routed through tool_response carries an ID, including
+        # explicit boolean status with no image. Replay BOTH halves of those
+        # pairs; function name/order cannot disambiguate same-name parallel calls.
+        response_calls = {
             msg.get("tool_call_id")
             for msg in messages
-            if msg.get("role") == "tool" and tool_has_images(msg.get("content"))
+            if msg.get("role") == "tool" and (
+                tool_has_images(msg.get("content"))
+                or isinstance(msg.get("is_error"), bool)
+            )
         }
 
         for msg in messages:
@@ -3706,7 +3712,7 @@ class GeminiProvider:
             if role == "assistant":
                 parts = self._assistant_parts(
                     msg, import_signatures=import_signatures,
-                    image_call_ids=image_calls,
+                    response_call_ids=response_calls,
                 )
                 gemini_contents.append({"role": "model", "parts": parts})
                 for call in _message_tool_calls(msg):

@@ -210,6 +210,118 @@ async def test_public_entry_sends_native_call_bound_tool_pixels(stream, shape):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize(
+    "shape,output",
+    [
+        ("direct", ""),
+        ("direct", []),
+        *[
+            (shape, output)
+            for shape in ("user-envelope", "tool-envelope")
+            for output in (False, 0, None, "", [], {})
+        ],
+    ],
+)
+async def test_same_name_parallel_status_results_have_two_sided_ids(
+    stream, shape, flag, output
+):
+    """Count/send equality alone cannot detect a one-sided call ID."""
+    p = provider(stream=stream)
+    request = tool_request()
+    image_call = request.messages[0].content[0]
+    image_signature = base64.b64encode(b"image-call-signature").decode()
+    plain_signature = base64.b64encode(b"plain-call-signature").decode()
+    native = {"version": 1, "provider": "gemini"}
+    request.messages[0].content = [
+        image_call.model_copy(
+            update={
+                "signature": image_signature,
+                "thinking_provenance": native,
+            }
+        ),
+        ToolCallBlock(
+            id="plain-call",
+            name="read_file",
+            input={"path": "plain.txt"},
+            signature=plain_signature,
+            thinking_provenance=native,
+        ),
+    ]
+    # Return the second same-name call FIRST. Name/order matching is ambiguous.
+    if shape == "direct":
+        plain = Message(
+            role="tool",
+            tool_call_id="plain-call",
+            name="read_file",
+            content=output,
+            is_error=flag,
+        )
+    else:
+        plain = Message(
+            role="user" if shape == "user-envelope" else "tool",
+            tool_call_id=None if shape == "user-envelope" else "plain-call",
+            name=None if shape == "user-envelope" else "read_file",
+            content=[
+                ToolResultBlock(
+                    tool_call_id="plain-call",
+                    output=output,
+                    is_error=flag,
+                )
+            ],
+        )
+    request.messages.insert(1, plain)
+    before = request.model_dump()
+    sent = []
+    client = wire_client(
+        p, lambda req: sent.append(json.loads(req.content)) or reply(req)
+    )
+    try:
+        await p.complete(request)
+        assert request.model_dump() == before
+        assert not p._repaired_tool_ids
+        parts = sent[0]["contents"][0]["parts"]
+        calls = {part["functionCall"]["id"]: part for part in parts}
+        assert set(calls) == {"call-1", "plain-call"}
+        assert calls["call-1"]["functionCall"] == {
+            "id": "call-1",
+            "name": "read_file",
+            "args": {"path": "fixture.png"},
+        }
+        assert calls["plain-call"]["functionCall"] == {
+            "id": "plain-call",
+            "name": "read_file",
+            "args": {"path": "plain.txt"},
+        }
+        assert calls["call-1"]["thoughtSignature"] == image_signature
+        assert calls["plain-call"]["thoughtSignature"] == plain_signature
+        results = [
+            content["parts"][0]["functionResponse"]
+            for content in sent[0]["contents"][1:]
+        ]
+        assert [result["id"] for result in results] == ["plain-call", "call-1"]
+        for result in results:
+            assert result["id"] in calls
+            assert result["name"] == calls[result["id"]]["functionCall"]["name"]
+        assert results[0]["response"] == {"error" if flag else "output": output}
+        assert "parts" not in results[0]
+        assert len(results[1]["parts"]) == 2
+        for media in results[1]["parts"]:
+            assert base64.urlsafe_b64decode(
+                media["inline_data"]["data"]
+            ) == base64.b64decode(PIXELS)
+        count = p._count_request_payload(p._build_request_plan(request))[
+            "generateContentRequest"
+        ]
+        assert count.pop("model") == "models/gemini-3.7-flash"
+        assert sent == [count]
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
 async def test_existing_native_counter_counts_the_same_tool_pixels(monkeypatch):
     p = provider()
     request = tool_request("user-envelope")
