@@ -169,6 +169,10 @@ async def test_count_projection_matches_the_real_sdk_generation_body(
         ),
     )
     provider._client = client
+    # Explicitly bind this controlled SDK fixture to the existing route witness.
+    # An arbitrary injected client alone is not Developer-route qualification.
+    provider._count_route_client = client
+    provider._client_uses_canonical_developer_route = True
     try:
         await provider.complete(request)
         assert expected["contents"][1]["parts"][1]["inlineData"]["mimeType"] == "image/png"

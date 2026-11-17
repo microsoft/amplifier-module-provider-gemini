@@ -54,6 +54,20 @@ from ._capabilities import has_exact_model_limits
 from ._capabilities import has_known_limits
 from ._cost import compute_cost
 from ._model_listing import DEFAULT_FILTERS, ModelFilters, selector_schema
+from ._image_input import (
+    IMAGE_ERROR,
+    TOOL_IMAGE_MODELS,
+    UNAVAILABLE,
+    USER_IMAGE_MODELS,
+    diagnostic_copy,
+    has_images,
+    image_part,
+    media_echoes,
+    normalize_results,
+    result_ids,
+    tool_has_images,
+    tool_response,
+)
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import TextBlock
@@ -1801,6 +1815,11 @@ class GeminiProvider:
         tool_results: set[str] = set()  # {call_id}
 
         for idx, msg in enumerate(messages):
+            if isinstance(msg.content, list) and msg.role in ("user", "tool"):
+                tool_results.update(result_ids([
+                    block.model_dump() if hasattr(block, "model_dump") else block
+                    for block in msg.content
+                ]))
             # Check assistant messages for ToolCallBlock in content
             if msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
@@ -2076,7 +2095,7 @@ class GeminiProvider:
         ]
         system_instruction = (
             "\n\n".join(
-                message.content if isinstance(message.content, str) else ""
+                self._instruction_text(message.content)
                 for message in system_msgs
             )
             if system_msgs
@@ -2084,9 +2103,7 @@ class GeminiProvider:
         )
         context_user_messages = []
         for message in developer_msgs:
-            developer_content = (
-                message.content if isinstance(message.content, str) else ""
-            )
+            developer_content = self._instruction_text(message.content)
             context_user_messages.append(
                 {
                     "role": "user",
@@ -2181,6 +2198,19 @@ class GeminiProvider:
                 )
                 for content in plan.contents
             ]
+            # google-genai 2.30.1's FunctionResponse transformer uses protobuf
+            # names for nested media, unlike ordinary Part's typed aliases.
+            # Match only native media fields, never arbitrary response JSON.
+            for content in contents:
+                for part in content.get("parts", []):
+                    for media in part.get("functionResponse", {}).get("parts", []):
+                        if "inlineData" in media:
+                            blob = media.pop("inlineData")
+                            if "mimeType" in blob:
+                                blob["mime_type"] = blob.pop("mimeType")
+                            if "displayName" in blob:
+                                blob["display_name"] = blob.pop("displayName")
+                            media["inline_data"] = blob
             # extra_request_params is intentionally applied after construction
             # and can contain mappings. Re-validate through the SDK's public
             # typed model before serialization so nested aliases match the
@@ -2423,6 +2453,16 @@ class GeminiProvider:
             ChatResponse with content blocks
         """
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
+        image_request = has_images(request)
+        diagnostic_echoes = media_echoes(request)
+
+        def error_text(exc: Exception) -> str:
+            # Error strings can echo the complete SDK request (including inline
+            # bytes/URLs). Do not parse, truncate, or publish that echo.
+            if image_request:
+                return IMAGE_ERROR
+            return str(exc) or f"{type(exc).__name__}: (no message)"
+
         plan = self._build_request_plan(request, warn_on_extra=True, **kwargs)
         model = plan.model
         all_messages = plan.contents
@@ -2443,13 +2483,13 @@ class GeminiProvider:
             }
             if self.raw:
                 request_payload["raw"] = redact_secrets(
-                    {
+                    diagnostic_copy({
                         "model": model,
                         "messages": all_messages,
                         "system_instruction": system_instruction,
                         "temperature": temperature,
                         "max_output_tokens": max_tokens,
-                    }
+                    }, diagnostic_echoes)
                 )
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
@@ -2477,13 +2517,17 @@ class GeminiProvider:
                 ) from e
             except RateLimitError as e:
                 # Fail-fast: if retry_after exceeds max_delay, mark non-retryable
+                if image_request:
+                    e.args = (IMAGE_ERROR,)
                 if (
                     e.retry_after is not None
                     and e.retry_after > self._retry_config.max_delay
                 ):
                     e.retryable = False
                 raise
-            except LLMError:
+            except LLMError as e:
+                if image_request:
+                    e.args = (IMAGE_ERROR,)
                 raise  # Already translated, don't double-wrap
             except Exception as e:
                 # --- Primary path: google.genai.errors (always available) ---
@@ -2492,6 +2536,7 @@ class GeminiProvider:
                         code = getattr(e, "code", None)
                         details = getattr(e, "details", None)
                         error_msg = (
+                            IMAGE_ERROR if image_request else
                             json.dumps(details) if details is not None else str(e)
                         )
                         if code == 429:
@@ -2568,6 +2613,7 @@ class GeminiProvider:
                         code = getattr(e, "code", None)
                         details = getattr(e, "details", None)
                         error_msg = (
+                            IMAGE_ERROR if image_request else
                             json.dumps(details) if details is not None else str(e)
                         )
                         retry_after_val = self._extract_retry_after(e)
@@ -2590,7 +2636,7 @@ class GeminiProvider:
                         ):
                             retryable = False
                         raise RateLimitError(
-                            str(e),
+                            error_text(e),
                             provider="gemini",
                             status_code=429,
                             retryable=retryable,
@@ -2598,7 +2644,7 @@ class GeminiProvider:
                         ) from e
                     if isinstance(e, google_exceptions.Unauthenticated):
                         raise AuthenticationError(
-                            str(e), provider="gemini", status_code=401
+                            error_text(e), provider="gemini", status_code=401
                         ) from e
                     if isinstance(e, google_exceptions.PermissionDenied):
                         # Falsy check (not just `is None`) is intentional:
@@ -2614,22 +2660,22 @@ class GeminiProvider:
                                 retryable=True,
                             ) from e
                         raise AccessDeniedError(
-                            str(e), provider="gemini", status_code=403
+                            error_text(e), provider="gemini", status_code=403
                         ) from e
                     if isinstance(e, google_exceptions.InvalidArgument):
                         raise InvalidRequestError(
-                            str(e), provider="gemini", status_code=400
+                            error_text(e), provider="gemini", status_code=400
                         ) from e
                     if isinstance(e, google_exceptions.ServiceUnavailable):
                         raise ProviderUnavailableError(
-                            str(e),
+                            error_text(e),
                             provider="gemini",
                             status_code=503,
                             retryable=True,
                         ) from e
                     if isinstance(e, google_exceptions.DeadlineExceeded):
                         raise LLMTimeoutError(
-                            str(e),
+                            error_text(e),
                             provider="gemini",
                             retryable=True,
                         ) from e
@@ -2637,7 +2683,7 @@ class GeminiProvider:
                 # Unknown errors default to retryable per design doc
                 details = getattr(e, "details", None)
                 error_msg = (
-                    json.dumps(details)
+                    IMAGE_ERROR if image_request else json.dumps(details)
                     if details is not None
                     else (str(e) or f"{type(e).__name__}: (no message)")
                 )
@@ -2659,7 +2705,7 @@ class GeminiProvider:
                         "max_retries": self._retry_config.max_retries,
                         "delay": delay,
                         "error_type": type(error).__name__,
-                        "error_message": str(error),
+                        "error_message": error_text(error),
                     },
                 )
 
@@ -2956,7 +3002,7 @@ class GeminiProvider:
                             "request_id": request_id,
                             "error": {
                                 "type": type(_exc).__name__,
-                                "msg": str(_exc),
+                                "msg": error_text(_exc),
                             },
                         },
                     )
@@ -3027,17 +3073,14 @@ class GeminiProvider:
                     not hasattr(response.candidates[0], "content")
                     or not response.candidates[0].content
                 ):
-                    logger.error(f"Response structure: {response}")
-                    logger.error(
-                        f"Candidate: {response.candidates[0] if response.candidates else 'None'}"
-                    )
+                    logger.error("Gemini response candidate has no content")
                     raise ValueError("Gemini API response candidate has no content")
 
                 if (
                     not hasattr(response.candidates[0].content, "parts")
                     or not response.candidates[0].content.parts
                 ):
-                    logger.error(f"Content: {response.candidates[0].content}")
+                    logger.error("Gemini response content has no parts")
                     raise ValueError("Gemini API response content has no parts")
 
                 # Convert to ChatResponse first (ordering fix — emit uses converted usage)
@@ -3102,10 +3145,9 @@ class GeminiProvider:
                 if self.raw and not _use_streaming:
                     # raw logging: only available on the blocking path
                     response_payload["raw"] = redact_secrets(
-                        {
-                            "content_parts": str(response.candidates[0].content.parts),
-                            "raw": str(response)[:1000],
-                        }
+                        diagnostic_copy({
+                            "content_parts": response.candidates[0].content.parts,
+                        }, diagnostic_echoes)
                     )
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
@@ -3114,7 +3156,7 @@ class GeminiProvider:
         except LLMError as e:
             # Kernel error types — emit llm:response error event, then propagate
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = error_text(e)
             logger.error("[PROVIDER] Gemini API error: %s", error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3128,11 +3170,14 @@ class GeminiProvider:
                         "error": error_msg,
                     },
                 )
+            if image_request:
+                e.args = (IMAGE_ERROR,)
+                raise e from None
             raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
-            error_msg = str(e) or f"{type(e).__name__}: (no message)"
+            error_msg = error_text(e)
             logger.error("[PROVIDER] Gemini API error: %s", error_msg)
 
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -3146,6 +3191,12 @@ class GeminiProvider:
                         "error": error_msg,
                     },
                 )
+            if image_request:
+                raise LLMError(
+                    IMAGE_ERROR, provider="gemini",
+                    status_code=getattr(e, "code", None),
+                    retryable=getattr(e, "retryable", False),
+                ) from None
             raise
     def _convert_to_chat_response(
         self, response, *, model: str = ""
@@ -3450,7 +3501,8 @@ class GeminiProvider:
         return response.tool_calls
 
     def _assistant_parts(
-        self, msg: dict[str, Any], *, import_signatures: bool
+        self, msg: dict[str, Any], *, import_signatures: bool,
+        response_call_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Replay native part order using the authoritative call representation.
 
@@ -3518,6 +3570,8 @@ class GeminiProvider:
                     "args": call.get("arguments", {}),
                 }
             }
+            if response_call_ids and call.get("id") in response_call_ids:
+                part["function_call"]["id"] = call["id"]
             if signature := _native_signature(source):
                 part["thought_signature"] = signature
             if not _is_gemini_block(source):
@@ -3543,6 +3597,9 @@ class GeminiProvider:
             parts.append({"text": content})
         for block in blocks:
             block_type = block.get("type")
+            if block_type == "image":
+                parts.append({"text": UNAVAILABLE})
+                continue
             if block_type == "tool_call":
                 index = positions.get(id(block))
                 if index is not None and index not in emitted:
@@ -3569,6 +3626,22 @@ class GeminiProvider:
             if index not in emitted:
                 append_call(index)
         return parts
+
+    @staticmethod
+    def _instruction_text(content: Any) -> str:
+        """Retain structured instruction text and mark unsupported image slots."""
+        if isinstance(content, str):
+            return content
+        parts = []
+        for block in content if isinstance(content, list) else []:
+            if hasattr(block, "model_dump"):
+                block = block.model_dump()
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif block.get("type") == "image":
+                    parts.append(UNAVAILABLE)
+        return "\n".join(parts)
 
     def _convert_messages(
         self, messages: list[dict[str, Any]], *, model: str | None = None
@@ -3601,6 +3674,30 @@ class GeminiProvider:
         tool_names: dict[str, str] = {}
         # This selects an API compatibility rule, never history provenance.
         import_signatures = _requires_function_call_signatures(model or self.default_model)
+        selected_model = model or self.default_model
+        # Preserve the provider's retained route decision once it owns a client.
+        # An injected client has no established Developer API route; controlled
+        # fixtures can bind it using the existing count-route witness.
+        route_supported = (
+            _sdk_environment_uses_canonical_developer_route()
+            if self._client is None else
+            self._client is self._count_route_client
+            and self._client_uses_canonical_developer_route is True
+        )
+        user_images = route_supported and selected_model in USER_IMAGE_MODELS
+        tool_images = route_supported and selected_model in TOOL_IMAGE_MODELS
+        messages = normalize_results(messages)
+        # Every response routed through tool_response carries an ID, including
+        # explicit boolean status with no image. Replay BOTH halves of those
+        # pairs; function name/order cannot disambiguate same-name parallel calls.
+        response_calls = {
+            msg.get("tool_call_id")
+            for msg in messages
+            if msg.get("role") == "tool" and (
+                tool_has_images(msg.get("content"))
+                or isinstance(msg.get("is_error"), bool)
+            )
+        }
 
         for msg in messages:
             role = msg.get("role")
@@ -3608,12 +3705,15 @@ class GeminiProvider:
 
             # Extract system messages
             if role == "system":
-                system_messages.append(content)
+                system_messages.append(self._instruction_text(content))
                 continue
 
             # Convert assistant → model role with potential tool calls
             if role == "assistant":
-                parts = self._assistant_parts(msg, import_signatures=import_signatures)
+                parts = self._assistant_parts(
+                    msg, import_signatures=import_signatures,
+                    response_call_ids=response_calls,
+                )
                 gemini_contents.append({"role": "model", "parts": parts})
                 for call in _message_tool_calls(msg):
                     if call.get("id"):
@@ -3621,7 +3721,7 @@ class GeminiProvider:
 
             # Handle developer messages → user with XML wrapper
             elif role == "developer":
-                wrapped = f"<context_file>\n{content}\n</context_file>"
+                wrapped = f"<context_file>\n{self._instruction_text(content)}\n</context_file>"
                 gemini_contents.append({"role": "user", "parts": [{"text": wrapped}]})
 
             # Handle tool results → function_response
@@ -3630,7 +3730,9 @@ class GeminiProvider:
                 tool_name = msg.get("name")
 
                 if not tool_call_id:
-                    logger.warning(f"Tool result missing tool_call_id: {msg}")
+                    if tool_has_images(content):
+                        raise ValueError("Image tool result requires a matching tool call ID")
+                    logger.warning("Tool result missing tool_call_id")
                     tool_call_id = "unknown"
 
                 if not tool_name:
@@ -3643,15 +3745,25 @@ class GeminiProvider:
                         )
                         tool_name = "unknown"
 
+                if tool_has_images(content) and (
+                    tool_names.get(tool_call_id) != tool_name
+                ):
+                    raise ValueError("Image tool result requires a matching function call")
+                response = (
+                    tool_response(
+                        content, name=tool_name, call_id=tool_call_id,
+                        supported=tool_images,
+                        is_error=msg.get("is_error"),
+                    )
+                    if tool_has_images(content) or isinstance(msg.get("is_error"), bool)
+                    else {"name": tool_name, "response": {"result": content}}
+                )
                 gemini_contents.append(
                     {
                         "role": "user",
                         "parts": [
                             {
-                                "function_response": {
-                                    "name": tool_name,
-                                    "response": {"result": content},
-                                }
+                                "function_response": response
                             }
                         ],
                     }
@@ -3668,23 +3780,7 @@ class GeminiProvider:
                             if block_type == "text":
                                 parts.append({"text": block.get("text", "")})
                             elif block_type == "image":
-                                # Convert ImageBlock to Gemini inline_data format
-                                source = block.get("source", {})
-                                if source.get("type") == "base64":
-                                    parts.append(
-                                        {
-                                            "inline_data": {
-                                                "mime_type": source.get(
-                                                    "media_type", "image/jpeg"
-                                                ),
-                                                "data": source.get("data"),
-                                            }
-                                        }
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Unsupported image source type: {source.get('type')}"
-                                    )
+                                parts.append(image_part(block, supported=user_images))
 
                     if parts:
                         gemini_contents.append({"role": "user", "parts": parts})

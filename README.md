@@ -621,9 +621,64 @@ The Gemini API does not provide tool call IDs (unlike Anthropic and OpenAI). The
 
 **Impact**: Tool call IDs are unique and functional but not provided by the API itself. This is transparent to users but documented for debugging purposes.
 
-### Text-Only in Current Version
+### Chat image input
 
-The provider implements text generation, tool calling, and thinking support. Multimodal capabilities (images, video, audio) are not yet supported.
+Ordinary chat accepts ordered inline base64 user images (PNG, JPEG, WebP, HEIC,
+HEIF) on documented exact image-input text-model endpoints. Historical user
+images follow the same projection. Unknown aliases, specialized image/Live/TTS
+models and unqualified routes are not inferred to support images.
+
+On the canonical Gemini **Developer GenerateContent** route, documented
+multimodal function responses use the original `functionResponse.parts` for
+PNG/JPEG/WebP pixels. Supported exact endpoints are `gemini-3.8-flash`,
+`gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`,
+`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`,
+`gemini-3.1-pro-preview-customtools`, `gemini-3-flash-preview`, and the separately
+named `gemini-4-hydrogen` example. This is not blanket Gemini 2.5 or all-model
+tool-image support. The provider does not change model, account, endpoint,
+thinking/signatures, retry policy or continuation to send an image.
+
+Canonical correlated `role=tool` text/image lists and Core `ToolResultBlock.output`
+envelopes retain function name/ID, result status and text. Explicit `is_error=true`
+uses the native response `error` key; explicit false uses `output`, including
+falsey outputs. Unspecified status retains the existing `result` convention.
+Native nested parts are
+**media-only**, not interleaved text/image parts: unique `displayName`/`$ref`
+associations remain in the original result slots. Pixels are not JSON strings
+or fabricated user-image turns. Plain business JSON is not recursively
+reinterpreted as image input.
+
+Assistant/system/developer images and unqualified model/route positions receive
+an explicit original-slot unavailable marker, not silent deletion or a permanent
+conversation failure. URL inputs likewise receive an actionable marker asking
+for inline data. Other unsupported historical sources/MIME types likewise keep a
+marker so an ordinary follow-up can dispatch; malformed supported base64 still
+fails without echoing the payload. This adapter has not qualified URL/file-URI transport, and never
+downloads a URL locally. This is an adapter limitation, **not** a claim that
+Google's APIs prohibit remote files. Vertex/Cloud qualification is separate.
+The existing native counter sees the same projected image-bearing request as
+generation, with the same route/model eligibility rules. Raw hook copies omit
+typed pixels/URLs before the first subscriber, including exact request-known
+media echoes in raw request/response text. This is not a generic URL filter and
+does not rewrite the actual SDK payload or returned response. Image-request error
+echoes are omitted without changing send/retry decisions.
+
+The offline fixtures exercise the real `google-genai` 2.30.1 serialization and
+buffered/SSE entry paths, not live visual understanding, model availability,
+account entitlement or provider acceptance. Image generation/editing remains the
+separate opt-in capability below; video/audio input is outside this chat repair.
+
+Sources checked 2026-11-17:
+[Developer function responses](https://aistudio.google.com/docs/function-calling?generate-content=true#multimodal),
+[model input tables](https://aistudio.google.com/docs/models),
+[SDK types](https://github.com/googleapis/python-genai/blob/v2.30.1/google/genai/types.py).
+SDK type comments for nested `file_data`/`display_name` conflict with newer
+Developer examples; the byte/field serialization assertions cover the actual
+installed SDK boundary, not a live resolution of that documentation conflict.
+The scoped model/position evidence and diagnostic omission approach acknowledge
+Brian Krabach's separately owned [draft #65](https://github.com/microsoft/amplifier-module-provider-gemini/pull/65)
+at `0909697cc7244ce0adee9eaec9b989b9db35670a`; its broader prepared-media,
+connection lifecycle and host contracts are not imported or superseded here.
 
 ### Gemini 3.x Thinking Cannot Be Disabled
 
