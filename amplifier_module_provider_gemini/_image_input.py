@@ -80,7 +80,37 @@ def has_images(value: Any) -> bool:
     return isinstance(value, (list, tuple)) and any(map(has_images, value))
 
 
-def diagnostic_copy(value: Any) -> Any:
+def media_echoes(value: Any) -> frozenset[str]:
+    """Exact request-scoped source strings only, not a generic URL/text filter."""
+    found: set[str] = set()
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if isinstance(value, dict):
+        if value.get("type") == "image" and isinstance(value.get("source"), dict):
+            source = value["source"]
+            for key in ("data", "url", "file_id"):
+                text = source.get(key)
+                if isinstance(text, str) and text:
+                    found.add(text)
+            encoded = source.get("data")
+            if source.get("type") == "base64" and isinstance(encoded, str):
+                try:
+                    found.add(
+                        base64.urlsafe_b64encode(
+                            base64.b64decode(encoded, validate=True)
+                        ).decode("ascii")
+                    )
+                except (TypeError, ValueError):
+                    pass
+        for item in value.values():
+            found.update(media_echoes(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.update(media_echoes(item))
+    return frozenset(found - {""})
+
+
+def diagnostic_copy(value: Any, echoes: frozenset[str] = frozenset()) -> Any:
     """Omit typed media before the first hook; never stringify unknown objects."""
     if isinstance(value, BaseModel):
         value = value.model_dump()
@@ -90,14 +120,20 @@ def diagnostic_copy(value: Any) -> Any:
         return {
             key: dict(OMITTED)
             if key in {"inline_data", "inlineData", "file_data", "fileData"}
-            else diagnostic_copy(item)
+            else diagnostic_copy(item, echoes)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [diagnostic_copy(item) for item in value]
+        return [diagnostic_copy(item, echoes) for item in value]
     if isinstance(value, bytes):
         return dict(OMITTED)
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if isinstance(value, str):
+        # Omit the containing diagnostic string: never risk a partial URL/token
+        # substitution and never modify the canonical SDK or response payload.
+        if any(echo in value for echo in echoes):
+            return "[diagnostic-image-echo-omitted]"
+        return value
+    if value is None or isinstance(value, (bool, int, float)):
         return value
     return {"diagnostic_status": "not-retained"}
 
@@ -114,7 +150,12 @@ def image_part(block: dict[str, Any], *, supported: bool) -> dict[str, Any]:
         source.get("type") != "base64"
         or source.get("media_type") not in IMAGE_MIME_TYPES
     ):
-        raise ValueError("Supply a supported inline base64 image and MIME type")
+        return {
+            "text": (
+                "[Image unavailable: unsupported source or MIME type; no pixels "
+                "supplied. Supply a supported inline base64 image instead.]"
+            )
+        }
     try:
         encoded = source["data"]
         if not isinstance(encoded, str) or not encoded:
@@ -184,6 +225,11 @@ def normalize_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": block.get("output"),
+                        **(
+                            {"is_error": block["is_error"]}
+                            if "is_error" in block
+                            else {}
+                        ),
                     }
                 )
             else:
@@ -199,6 +245,7 @@ def tool_response(
     name: str,
     call_id: str,
     supported: bool,
+    is_error: bool | None = None,
 ) -> dict[str, Any]:
     """Native call-bound images; result JSON retains text/status and image order."""
     images: list[dict[str, Any]] = []
@@ -248,7 +295,13 @@ def tool_response(
     response = {
         "id": call_id,
         "name": name,
-        "response": {"result": project_result(content)},
+        "response": {
+            "error"
+            if is_error is True
+            else "output"
+            if is_error is False
+            else "result": project_result(content)
+        },
     }
     if images:
         response["parts"] = images

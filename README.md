@@ -639,7 +639,10 @@ tool-image support. The provider does not change model, account, endpoint,
 thinking/signatures, retry policy or continuation to send an image.
 
 Canonical correlated `role=tool` text/image lists and Core `ToolResultBlock.output`
-envelopes retain function name/ID, result status and text. Native nested parts are
+envelopes retain function name/ID, result status and text. Explicit `is_error=true`
+uses the native response `error` key; explicit false uses `output`, including
+falsey outputs. Unspecified status retains the existing `result` convention.
+Native nested parts are
 **media-only**, not interleaved text/image parts: unique `displayName`/`$ref`
 associations remain in the original result slots. Pixels are not JSON strings
 or fabricated user-image turns. Plain business JSON is not recursively
@@ -648,13 +651,17 @@ reinterpreted as image input.
 Assistant/system/developer images and unqualified model/route positions receive
 an explicit original-slot unavailable marker, not silent deletion or a permanent
 conversation failure. URL inputs likewise receive an actionable marker asking
-for inline data: this adapter has not qualified URL/file-URI transport, and never
+for inline data. Other unsupported historical sources/MIME types likewise keep a
+marker so an ordinary follow-up can dispatch; malformed supported base64 still
+fails without echoing the payload. This adapter has not qualified URL/file-URI transport, and never
 downloads a URL locally. This is an adapter limitation, **not** a claim that
 Google's APIs prohibit remote files. Vertex/Cloud qualification is separate.
 The existing native counter sees the same projected image-bearing request as
 generation, with the same route/model eligibility rules. Raw hook copies omit
-typed pixels/URLs before the first subscriber; image-request error echoes are
-omitted without changing send/retry decisions.
+typed pixels/URLs before the first subscriber, including exact request-known
+media echoes in raw request/response text. This is not a generic URL filter and
+does not rewrite the actual SDK payload or returned response. Image-request error
+echoes are omitted without changing send/retry decisions.
 
 The offline fixtures exercise the real `google-genai` 2.30.1 serialization and
 buffered/SSE entry paths, not live visual understanding, model availability,

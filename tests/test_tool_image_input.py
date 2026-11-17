@@ -304,7 +304,6 @@ def test_url_is_explicit_original_slot_unavailable_not_silently_dropped(role):
     [
         {"type": "base64", "media_type": "image/png", "data": "%%%"},
         {"type": "base64", "media_type": "image/png", "data": ""},
-        {"type": "base64", "media_type": "text/plain", "data": PIXELS},
     ],
 )
 def test_malformed_image_error_does_not_echo_source(source):
@@ -571,3 +570,214 @@ def test_native_signature_replay_remains_byte_exact_with_tool_images():
     call_part = count["contents"][0]["parts"][0]
     assert call_part["thoughtSignature"] == signature
     assert call_part["functionCall"]["id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_raw_known_media_echoes_omitted_but_sdk_and_response_text_unchanged():
+    p = provider(raw=True)
+    hooks = Hooks()
+    p.coordinator = SimpleNamespace(hooks=hooks)
+    echo = f"original sources {URL} {PIXELS}"
+    request = tool_request()
+    request.messages.insert(
+        0,
+        Message(
+            role="user",
+            content=[
+                TextBlock(text=echo),
+                image(url=True),
+                image(),
+                TextBlock(text="ordinary https://public.invalid/keep-this-text"),
+            ],
+        ),
+    )
+    before = request.model_dump()
+    sent = []
+
+    def receive(req):
+        sent.append(json.loads(req.content))
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {"text": echo},
+                            ],
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+            },
+        )
+
+    client = wire_client(p, receive)
+    try:
+        response = await p.complete(request)
+        assert response.content[0].text == echo
+        assert request.model_dump() == before
+        assert sent[0]["contents"][0]["parts"][0] == {"text": echo}
+        count = p._count_request_payload(p._build_request_plan(request))[
+            "generateContentRequest"
+        ]
+        count.pop("model")
+        # Ordinary user inline MIME spelling is an established SDK difference.
+        sent[0]["contents"][0]["parts"][2]["inlineData"]["mimeType"] = sent[0][
+            "contents"
+        ][0]["parts"][2]["inlineData"].pop("mime_type")
+        assert sent[0] == count
+        request_raw = next(
+            payload["raw"] for name, payload in hooks.events if name == "llm:request"
+        )
+        response_raw = next(
+            payload["raw"] for name, payload in hooks.events if name == "llm:response"
+        )
+        assert "diagnostic-image-echo-omitted" in json.dumps(request_raw)
+        assert "diagnostic-image-echo-omitted" in json.dumps(response_raw)
+        assert "https://public.invalid/keep-this-text" in json.dumps(request_raw)
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize("shape", ["direct", "user-envelope", "tool-envelope"])
+async def test_explicit_tool_error_status_keeps_pair_pixels_and_count_send(flag, shape):
+    p = provider()
+    request = tool_request(shape)
+    if shape == "direct":
+        request.messages[-1] = request.messages[-1].model_copy(
+            update={"is_error": flag}
+        )
+    else:
+        request.messages[-1].content[0] = (
+            request.messages[-1]
+            .content[0]
+            .model_copy(
+                update={"is_error": flag},
+            )
+        )
+    request.messages[0].content.append(
+        ToolCallBlock(id="call-2", name="other", input={})
+    )
+    request.messages.append(
+        Message(
+            role="tool",
+            tool_call_id="call-2",
+            name="other",
+            content="",
+            is_error=not flag,
+        )
+    )
+    before = request.model_dump()
+    sent = []
+    client = wire_client(
+        p, lambda req: sent.append(json.loads(req.content)) or reply(req)
+    )
+    try:
+        await p.complete(request)
+        assert request.model_dump() == before
+        first = sent[0]["contents"][1]["parts"][0]["functionResponse"]
+        second = sent[0]["contents"][2]["parts"][0]["functionResponse"]
+        assert (first["id"], first["name"]) == ("call-1", "read_file")
+        assert set(first["response"]) == {"error" if flag else "output"}
+        assert len(first["parts"]) == 2
+        assert (second["id"], second["name"]) == ("call-2", "other")
+        assert second["response"] == {"output" if flag else "error": ""}
+        count = p._count_request_payload(p._build_request_plan(request))[
+            "generateContentRequest"
+        ]
+        count.pop("model")
+        assert sent == [count]
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.parametrize("flag", [True, False])
+@pytest.mark.parametrize("output", [False, 0, None, "", [], {}])
+def test_explicit_tool_status_preserves_falsey_envelope_output(flag, output):
+    request = tool_request()
+    request.messages[-1] = Message(
+        role="user",
+        content=[
+            ToolResultBlock(tool_call_id="call-1", output=output, is_error=flag),
+        ],
+    )
+    fr = (
+        provider()
+        ._build_request_plan(request)
+        .contents[1]["parts"][0]["function_response"]
+    )
+    assert fr == {
+        "id": "call-1",
+        "name": "read_file",
+        "response": {"error" if flag else "output": output},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["user", "tool"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"type": "file", "file_id": "old-file"},
+        {"type": "file_id", "file_id": "old-id"},
+        {"type": "base64", "media_type": "text/plain", "data": PIXELS},
+    ],
+)
+async def test_unsupported_historical_image_allows_plain_followup_sdk_dispatch(
+    role, source
+):
+    p = provider()
+    request = (
+        tool_request()
+        if role == "tool"
+        else ChatRequest(
+            messages=[
+                Message(
+                    role="user",
+                    content=[
+                        TextBlock(text="before"),
+                        ImageBlock(source=source),
+                        TextBlock(text="after"),
+                    ],
+                ),
+            ]
+        )
+    )
+    if role == "tool":
+        request.messages[-1].content = [
+            TextBlock(text="before"),
+            ImageBlock(source=source),
+            TextBlock(text="after"),
+        ]
+    request.messages.append(Message(role="assistant", content="historical response"))
+    request.messages.append(Message(role="user", content="plain followup"))
+    before = request.model_dump()
+    sent = []
+    client = wire_client(
+        p, lambda req: sent.append(json.loads(req.content)) or reply(req)
+    )
+    try:
+        response = await p.complete(request)
+        assert response.content[0].text == "OK"
+        assert request.model_dump() == before
+        assert sent[0]["contents"][-1] == {
+            "role": "user",
+            "parts": [{"text": "plain followup"}],
+        }
+        slot = sent[0]["contents"][1 if role == "tool" else 0]["parts"]
+        if role == "tool":
+            slot = slot[0]["functionResponse"]["response"]["result"]
+        assert slot[0]["text"] == "before"
+        assert "Image unavailable" in slot[1]["text"]
+        assert slot[2]["text"] == "after"
+        assert "old-file" not in json.dumps(sent)
+        assert PIXELS not in json.dumps(sent)
+    finally:
+        await client.aio.aclose()
+        client.close()

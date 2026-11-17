@@ -62,6 +62,7 @@ from ._image_input import (
     diagnostic_copy,
     has_images,
     image_part,
+    media_echoes,
     normalize_results,
     result_ids,
     tool_has_images,
@@ -2453,6 +2454,7 @@ class GeminiProvider:
         """
         logger.debug(f"Received ChatRequest with {len(request.messages)} messages")
         image_request = has_images(request)
+        diagnostic_echoes = media_echoes(request)
 
         def error_text(exc: Exception) -> str:
             # Error strings can echo the complete SDK request (including inline
@@ -2487,7 +2489,7 @@ class GeminiProvider:
                         "system_instruction": system_instruction,
                         "temperature": temperature,
                         "max_output_tokens": max_tokens,
-                    })
+                    }, diagnostic_echoes)
                 )
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
@@ -3145,7 +3147,7 @@ class GeminiProvider:
                     response_payload["raw"] = redact_secrets(
                         diagnostic_copy({
                             "content_parts": response.candidates[0].content.parts,
-                        })
+                        }, diagnostic_echoes)
                     )
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
@@ -3745,8 +3747,9 @@ class GeminiProvider:
                     tool_response(
                         content, name=tool_name, call_id=tool_call_id,
                         supported=tool_images,
+                        is_error=msg.get("is_error"),
                     )
-                    if tool_has_images(content)
+                    if tool_has_images(content) or isinstance(msg.get("is_error"), bool)
                     else {"name": tool_name, "response": {"result": content}}
                 )
                 gemini_contents.append(
