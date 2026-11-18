@@ -656,10 +656,22 @@ marker so an ordinary follow-up can dispatch; malformed supported base64 still
 fails without echoing the payload. This adapter has not qualified URL/file-URI transport, and never
 downloads a URL locally. This is an adapter limitation, **not** a claim that
 Google's APIs prohibit remote files. Vertex/Cloud qualification is separate.
+
+Foundation's indexed v2 support reports original user and matching tool-result
+positions on the canonical Developer `v1beta` route only. It reports the MIME
+intersection (PNG/JPEG/WebP) when tool positions are included; user-only
+requests can also advertise HEIC/HEIF. An injected client, a custom endpoint,
+or a per-request SDK HTTP override is not enough to establish route support.
+When the host binds enabled `experimental.media.v1`, the adapter revalidates
+the exact private request before count and each buffered or streaming send
+attempt. It does not hydrate references itself.
+
 The existing native counter sees the same projected image-bearing request as
 generation, with the same route/model eligibility rules. Raw hook copies omit
 typed pixels/URLs before the first subscriber, including exact request-known
-media echoes in raw request/response text. This is not a generic URL filter and
+media echoes in raw request/response keys and values. Image-bearing requests
+omit streaming text deltas because a source echo can span multiple chunks.
+This is not a generic URL filter and
 does not rewrite the actual SDK payload or returned response. Image-request error
 echoes are omitted without changing send/retry decisions.
 
@@ -738,12 +750,23 @@ Counting is unavailable when the SDK would route generation away from the
 canonical Gemini Developer endpoint: a nonempty `GOOGLE_GEMINI_BASE_URL`, or
 effective Vertex/Enterprise selection through `GOOGLE_GENAI_USE_VERTEXAI` /
 `GOOGLE_GENAI_USE_ENTERPRISE`, disables both count advertisement and dispatch.
+Any non-null `extra_request_params.http_options` override likewise disables
+`request_budget` / `request_budget:provider_count` advertisement and makes
+`request_budget()` return `None` with reason `unsupported_route`, without sending
+a count request. This applies to **text-only as well as image-bearing requests**.
+The counter uses a fixed Developer `v1beta` endpoint; SDK HTTP overrides can
+change generation's endpoint, API version or body and are not projected by the
+counter. This conservative gate also includes `{}` and timeout/header-only
+overrides; it does not inspect them for a safe subset. Omit `http_options` or set
+it to `null` to retain normal canonical-route counting. This does not itself
+block text-only generation, and a missing native count is not a zero-token count.
+
 The SDK's 2.23 parsing is followed exactly: `true`/`1` are case-insensitive,
 and a present Enterprise variable wins over Vertex even when it is explicitly
 false. A client constructed by this provider retains its route decision; an
 injected client has no public base-URL guarantee and therefore fails closed.
-`get_info()` reads only these route-selection variables and never constructs
-an SDK client, authenticates, or performs I/O.
+`get_info()` checks route eligibility without constructing an SDK client,
+authenticating, or performing I/O.
 
 ## Dependencies
 
