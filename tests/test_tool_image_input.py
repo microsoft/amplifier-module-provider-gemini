@@ -19,6 +19,8 @@ from amplifier_core.message_models import (
     ToolCallBlock,
     ToolResultBlock,
 )
+from amplifier_core.llm_errors import InvalidRequestError
+from amplifier_core.utils.retry import RetryConfig
 from google import genai
 from google.genai import types
 
@@ -110,6 +112,55 @@ def tool_request(shape="direct"):
     )
 
 
+def test_indexed_support_checks_original_positions_and_effective_model():
+    p = provider()
+    request = tool_request()
+    request.messages.insert(0, Message(role="system", content="instruction"))
+    request.messages.insert(1, Message(role="user", content="question"))
+    request.messages.append(
+        Message(role="tool", tool_call_id="unknown", content="other")
+    )
+    before = request.model_dump()
+    assert p.get_media_request_support_for_request(request=request, model=None) == {
+        "v": 2,
+        "positions": [
+            {"message_index": 1, "role": "user"},
+            {"message_index": 3, "role": "tool"},
+        ],
+        "mime_types": ["image/jpeg", "image/png", "image/webp"],
+    }
+    user_only = p.get_media_request_support_for_request(
+        request=request, model=None, request_options={"model": "gemini-2.5-pro"}
+    )
+    assert user_only["positions"] == [{"message_index": 1, "role": "user"}]
+    assert "image/heic" in user_only["mime_types"]
+    assert request.model_dump() == before
+    assert p._client is None
+
+
+@pytest.mark.parametrize("route", ["vertex", "proxy", "override", "injected", "alias"])
+def test_indexed_support_fails_closed(monkeypatch, route):
+    p = provider()
+    model = p.default_model
+    if route == "vertex":
+        monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    elif route == "proxy":
+        monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://proxy.invalid")
+    elif route == "override":
+        p.extra_request_params = {"http_options": {"api_version": "v1"}}
+    elif route == "injected":
+        p._client = object()
+    else:
+        model += "-unknown"
+    assert p.get_media_request_support_for_request(
+        request=tool_request(), model=model
+    ) == {
+        "v": 2,
+        "positions": [],
+        "mime_types": [],
+    }
+
+
 def wire_client(p, receive):
     client = genai.Client(
         api_key="offline-placeholder",
@@ -121,6 +172,82 @@ def wire_client(p, receive):
     p._client = p._count_route_client = client
     p._client_uses_canonical_developer_route = True
     return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_media_dispatch_revalidates_exact_request_after_hook(stream):
+    p = provider(stream=stream)
+    request = tool_request()
+    options = {"model": p.default_model}
+    witness_calls = []
+    sent = []
+    enabled = True
+
+    def validate(candidate, *, purpose, request_options):
+        assert candidate is request
+        assert request_options == options
+        witness_calls.append(purpose)
+        if not enabled:
+            raise ValueError(PIXELS)
+        return {"valid": True}
+
+    class RevokingHooks(Hooks):
+        async def emit(self, name, payload):
+            nonlocal enabled
+            await super().emit(name, payload)
+            if name == "llm:request":
+                enabled = False
+
+    capability = SimpleNamespace(enabled=True, validate=validate)
+    p.coordinator = SimpleNamespace(
+        hooks=RevokingHooks(), get_capability=lambda _: capability
+    )
+    client = wire_client(p, lambda req: sent.append(req) or reply(req))
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await p.complete(request, request_options=options)
+        assert witness_calls == ["transport", "transport"]
+        assert caught.value.__cause__ is None
+        assert PIXELS not in str(caught.value)
+        assert not sent
+    finally:
+        await client.aio.aclose()
+        client.close()
+
+
+@pytest.mark.asyncio
+async def test_media_witness_rechecked_on_provider_retry():
+    p = provider()
+    p._retry_config = RetryConfig(max_retries=1, initial_delay=0.001)
+    request = tool_request()
+    sent = []
+    calls = []
+
+    def validate(candidate, *, purpose, request_options):
+        assert candidate is request
+        calls.append(purpose)
+        return {"valid": not sent}
+
+    cap = SimpleNamespace(enabled=True, validate=validate)
+    p.coordinator = SimpleNamespace(hooks=Hooks(), get_capability=lambda _: cap)
+
+    def receive(req):
+        sent.append(req)
+        return httpx.Response(
+            503,
+            json={"error": {"code": 503, "status": "UNAVAILABLE", "message": PIXELS}},
+        )
+
+    client = wire_client(p, receive)
+    try:
+        with pytest.raises(InvalidRequestError):
+            await p.complete(request)
+        assert len(sent) == 1
+        assert calls == ["transport"] * 3
+    finally:
+        await client.aio.aclose()
+        client.close()
 
 
 def reply(request):
@@ -349,6 +476,69 @@ async def test_existing_native_counter_counts_the_same_tool_pixels(monkeypatch):
     ) == base64.b64decode(PIXELS)
     assert request.model_dump() == before
     assert not p._repaired_tool_ids
+
+
+@pytest.mark.asyncio
+async def test_prepared_count_requires_witness_at_http_boundary(monkeypatch):
+    p = provider()
+    request = tool_request()
+    calls = []
+
+    def validate(candidate, *, purpose, request_options):
+        assert candidate is request
+        assert request_options == {"model": p.default_model}
+        calls.append(purpose)
+        return {"valid": len(calls) == 1}
+
+    cap = SimpleNamespace(enabled=True, validate=validate)
+    p.coordinator = SimpleNamespace(hooks=Hooks(), get_capability=lambda _: cap)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(
+            **kwargs,
+            transport=httpx.MockTransport(
+                lambda _: pytest.fail("Revoked prepared request reached countTokens")
+            ),
+        ),
+    )
+    with pytest.raises(InvalidRequestError, match="validation refused"):
+        await p.request_budget(
+            request, context_estimate=1000, request_options={"model": p.default_model}
+        )
+    assert calls == ["count", "count"]
+
+
+@pytest.mark.asyncio
+async def test_image_stream_omits_split_echo_but_keeps_returned_text():
+    p = provider(stream=True, raw=True)
+    hooks = Hooks()
+    p.coordinator = SimpleNamespace(hooks=hooks)
+    request = tool_request()
+    chunks = [PIXELS[:23], PIXELS[23:]]
+
+    def receive(req):
+        events = [
+            {"candidates": [{"content": {"parts": [{"text": chunk}], "role": "model"}}]}
+            for chunk in chunks
+        ]
+        events[-1]["candidates"][0]["finishReason"] = "STOP"
+        return httpx.Response(
+            200,
+            text="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = wire_client(p, receive)
+    try:
+        response = await p.complete(request)
+        assert response.content[0].text == PIXELS
+        assert all(name != "llm:stream_block_delta" for name, _ in hooks.events)
+        assert all(chunk not in json.dumps(hooks.events) for chunk in chunks)
+    finally:
+        await client.aio.aclose()
+        client.close()
 
 
 @pytest.mark.parametrize("position", ["assistant", "system", "developer"])

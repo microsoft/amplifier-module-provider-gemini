@@ -56,6 +56,8 @@ from ._cost import compute_cost
 from ._model_listing import DEFAULT_FILTERS, ModelFilters, selector_schema
 from ._image_input import (
     IMAGE_ERROR,
+    IMAGE_MIME_TYPES,
+    TOOL_IMAGE_MIME_TYPES,
     TOOL_IMAGE_MODELS,
     UNAVAILABLE,
     USER_IMAGE_MODELS,
@@ -92,6 +94,7 @@ if TYPE_CHECKING:
     from google import genai  # noqa: F401
 
 logger = logging.getLogger(__name__)
+_SESSION_MEDIA_CAPABILITY = "experimental.media.v1"
 
 # ---------------------------------------------------------------------------
 # Teardown hard bound (see GeminiProvider.close)
@@ -1278,6 +1281,92 @@ class GeminiProvider:
             self._count_route_client = self._client
         return self._client
 
+    def _canonical_developer_route(self) -> bool:
+        if self._client is None:
+            return _sdk_environment_uses_canonical_developer_route()
+        return (
+            self._client is self._count_route_client
+            and self._client_uses_canonical_developer_route is True
+        )
+
+    def _chat_image_route(self) -> bool:
+        # An override can change the version, endpoint, or body after the
+        # adapter projects it. Do not qualify that escape hatch for media.
+        return (
+            self._canonical_developer_route()
+            and self.extra_request_params.get("http_options") is None
+        )
+
+    def _session_media_capability(self) -> Any:
+        lookup = getattr(self.coordinator, "get_capability", None)
+        capability = lookup(_SESSION_MEDIA_CAPABILITY) if callable(lookup) else None
+        return capability if getattr(capability, "enabled", False) is True else None
+
+    def _media_attempt_guard(self, request: ChatRequest, options: dict[str, Any]):
+        # The wrapper supplies the exact private request. Legacy direct inline
+        # callers (no bound capability or reference carrier) remain supported.
+        capability = self._session_media_capability()
+        requires_witness = capability is not None or any(
+            _SESSION_MEDIA_CAPABILITY in (message.metadata or {})
+            for message in request.messages
+        )
+
+        def validate(purpose: str) -> None:
+            if not requires_witness:
+                return
+            try:
+                if capability is not None and self._session_media_capability() is capability:
+                    result = capability.validate(
+                        request, purpose=purpose, request_options=options
+                    )
+                    if type(result) is dict and result.get("valid") is True:
+                        return
+            except Exception:
+                pass
+            raise InvalidRequestError(
+                "Gemini session media validation refused", provider=self.name
+            )
+
+        return validate
+
+    def get_media_request_support_for_request(
+        self, *, request: ChatRequest, model: str | None, request_options=None
+    ) -> dict[str, Any]:
+        """Describe only the original message positions the adapter can hydrate."""
+        selected = (request_options or {}).get("model", model or self.default_model)
+        positions = []
+        mimes = IMAGE_MIME_TYPES
+        if (
+            isinstance(self._api_key, str)
+            and self._api_key
+            and isinstance(selected, str)
+            and selected in USER_IMAGE_MODELS
+            and self._chat_image_route()
+        ):
+            calls: dict[str, list[str]] = {}
+            for index, message in enumerate(request.messages):
+                role = message.role
+                eligible = role == "user"
+                if role == "assistant" and selected in TOOL_IMAGE_MODELS:
+                    for call in _message_tool_calls(message.model_dump()):
+                        name = call.get("name") or call.get("tool")
+                        if call.get("id") and name:
+                            calls.setdefault(call["id"], []).append(name)
+                if role == "tool" and selected in TOOL_IMAGE_MODELS:
+                    names = calls.get(message.tool_call_id, [])
+                    eligible = len(names) == 1 and (
+                        not message.name or message.name == names[0]
+                    )
+                    if eligible:
+                        mimes = TOOL_IMAGE_MIME_TYPES
+                if eligible:
+                    positions.append({"message_index": index, "role": role})
+        return {
+            "v": 2,
+            "positions": positions,
+            "mime_types": sorted(mimes) if positions else [],
+        }
+
     def _native_counting_unavailable_reason(self, model: Any) -> str | None:
         """Return the safe reason code blocking native counting, or ``None``.
 
@@ -1296,18 +1385,9 @@ class GeminiProvider:
             # No usable Developer credential means the fixed Developer counting
             # route cannot be dispatched at all -- a route fact, not a model one.
             return _BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE
-        if self._client is not None:
-            # google-genai exposes ``Client.vertexai`` but has no established
-            # public base_url property. A false value therefore cannot prove
-            # an injected client is canonical, so only our creation snapshot
-            # is eligible.
-            canonical = (
-                self._client is self._count_route_client
-                and self._client_uses_canonical_developer_route is True
-            )
-        else:
-            canonical = _sdk_environment_uses_canonical_developer_route()
-        return None if canonical else _BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE
+        if not self._chat_image_route():
+            return _BUDGET_UNAVAILABLE_UNSUPPORTED_ROUTE
+        return None
 
     def _native_counting_available(self, model: Any) -> bool:
         """Return whether a fixed Developer countTokens request can match generation."""
@@ -1923,29 +2003,39 @@ class GeminiProvider:
             ChatResponse with content blocks, tool calls, usage
         """
         kwargs = self._merge_request_options(request_options, kwargs)
+        validate_media = self._media_attempt_guard(request, kwargs)
+        validate_media("transport")
+        diagnostic_echoes = media_echoes(request)
+        planned_request = request
+        managed = self._session_media_capability() is not None
+        if managed:
+            # Repair a derived plan, not the exact private request Foundation
+            # will validate and clean up. Share blocks; only the list changes.
+            planned_request = request.model_copy(update={"messages": list(request.messages)})
 
         # VALIDATE AND REPAIR: Check for missing tool results (backup safety net)
-        missing = self._repair_missing_tool_results(request, record_repairs=True)
+        missing = self._repair_missing_tool_results(planned_request, record_repairs=not managed)
         if missing:
             logger.warning(
                 f"[PROVIDER] Gemini: Detected {len(missing)} missing tool result(s). "
-                f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
+                "Injecting synthetic errors. This indicates a bug in context management."
             )
             if self.coordinator and hasattr(self.coordinator, "hooks"):
                 await self.coordinator.hooks.emit(
                     "provider:tool_sequence_repaired",
-                    {
+                    diagnostic_copy({
                         "provider": self.name,
                         "repair_count": len(missing),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
                             for _, call_id, tool_name, _ in missing
                         ],
-                    },
+                    }, diagnostic_echoes),
                 )
 
-        return await self._complete_chat_request(request, **kwargs)
+        return await self._complete_chat_request(
+            planned_request, validate_media=validate_media, **kwargs
+        )
 
     def _resolve_thinking_config(
         self, model: str, request: ChatRequest, kwargs: dict[str, Any]
@@ -2279,7 +2369,7 @@ class GeminiProvider:
         return {"generateContentRequest": request}
 
     async def _count_request_tokens(
-        self, plan: _GeminiRequestPlan
+        self, plan: _GeminiRequestPlan, *, validate_media=None
     ) -> tuple[int | None, str | None, int | None]:
         """Call the documented Developer REST counter without SDK internals.
 
@@ -2313,6 +2403,8 @@ class GeminiProvider:
         )
         try:
             async with httpx.AsyncClient(timeout=self._count_timeout) as client:
+                if validate_media is not None:
+                    validate_media("count")
                 response = await client.post(
                     endpoint,
                     headers={"x-goog-api-key": self._api_key},
@@ -2369,6 +2461,8 @@ class GeminiProvider:
             raise ValueError("context_estimate must be a nonnegative integer")
 
         options = self._merge_request_options(request_options, kwargs)
+        validate_media = self._media_attempt_guard(request, options)
+        validate_media("count")
         selected_model = options.get("model", self.default_model)
         reason = self._native_counting_unavailable_reason(selected_model)
         if reason is not None:
@@ -2405,7 +2499,9 @@ class GeminiProvider:
                 _BUDGET_UNAVAILABLE_INVALID_OUTPUT_LIMIT, plan.model
             )
             return None
-        count, reason, http_status = await self._count_request_tokens(plan)
+        count, reason, http_status = await self._count_request_tokens(
+            plan, validate_media=validate_media
+        )
         if count is None:
             await self._report_request_budget_unavailable(
                 reason or _BUDGET_UNAVAILABLE_INVALID_RESPONSE,
@@ -2437,7 +2533,7 @@ class GeminiProvider:
         }
 
     async def _complete_chat_request(
-        self, request: ChatRequest, **kwargs
+        self, request: ChatRequest, *, validate_media, **kwargs
     ) -> ChatResponse:
         """
         Handle ChatRequest format with developer message conversion.
@@ -2463,21 +2559,32 @@ class GeminiProvider:
                 return IMAGE_ERROR
             return str(exc) or f"{type(exc).__name__}: (no message)"
 
-        plan = self._build_request_plan(request, warn_on_extra=True, **kwargs)
+        try:
+            plan = self._build_request_plan(
+                request, warn_on_extra=not image_request, **kwargs
+            )
+        except Exception:
+            if not image_request:
+                raise
+            plan = None
+        if plan is None:
+            raise InvalidRequestError(IMAGE_ERROR, provider=self.name)
         model = plan.model
         all_messages = plan.contents
+        native_images = image_request and has_images(all_messages)
         config = plan.config
         system_instruction = config.system_instruction
         temperature = config.temperature
         max_tokens = config.max_output_tokens
+        event_model = diagnostic_copy(model, diagnostic_echoes)
 
-        logger.info(f"Gemini API call - model: {model}, messages: {len(all_messages)}")
+        logger.info("Gemini API call - model: %s, messages: %d", event_model, len(all_messages))
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             request_payload: dict[str, Any] = {
                 "provider": "gemini",
-                "model": model,
+                "model": event_model,
                 "message_count": len(all_messages),
                 "has_system": bool(system_instruction),
             }
@@ -2499,12 +2606,21 @@ class GeminiProvider:
         # Error translation happens inside _do_complete() so that retry_with_backoff
         # sees LLMError (and checks retryable) rather than raw SDK exceptions.
 
+        def transport_client():
+            validate_media("transport")
+            client = self.client
+            if native_images and not self._chat_image_route():
+                raise InvalidRequestError(
+                    "Gemini image transport route changed", provider=self.name
+                )
+            return client
+
         async def _do_complete():
             """Single API call attempt with SDK → kernel error translation."""
             try:
                 # Call Gemini API (use .aio for async)
                 return await asyncio.wait_for(
-                    self.client.aio.models.generate_content(
+                    transport_client().aio.models.generate_content(
                         model=model, contents=all_messages, config=config
                     ),
                     timeout=self.timeout,
@@ -2700,7 +2816,7 @@ class GeminiProvider:
                     PROVIDER_RETRY,
                     {
                         "provider": self.name,
-                        "model": model,
+                        "model": event_model,
                         "attempt": attempt,
                         "max_retries": self._retry_config.max_retries,
                         "delay": delay,
@@ -2733,7 +2849,7 @@ class GeminiProvider:
                                 "provider:concurrency",
                                 {
                                     "provider": "gemini",
-                                    "model": model,
+                                    "model": event_model,
                                     "active_requests": _active_requests,
                                     "waiting_requests": _waiting_requests,
                                     "max_concurrent": self._max_concurrent_requests,
@@ -2752,7 +2868,7 @@ class GeminiProvider:
                             "provider:concurrency",
                             {
                                 "provider": "gemini",
-                                "model": model,
+                                "model": event_model,
                                 "active_requests": _active_requests,
                                 "waiting_requests": _waiting_requests,
                                 "max_concurrent": 0,
@@ -2830,7 +2946,7 @@ class GeminiProvider:
                         "block_type": btype,
                     }
                     if name is not None:
-                        payload["name"] = name
+                        payload["name"] = diagnostic_copy(name, diagnostic_echoes)
                     await self.coordinator.hooks.emit(
                         "llm:stream_block_start", payload
                     )
@@ -2855,7 +2971,7 @@ class GeminiProvider:
                 # Establish the stream; timeout covers connection setup
                 try:
                     stream = await asyncio.wait_for(
-                        self.client.aio.models.generate_content_stream(
+                        transport_client().aio.models.generate_content_stream(
                             model=model,
                             contents=all_messages,
                             config=config,
@@ -2964,7 +3080,10 @@ class GeminiProvider:
                         # Emit delta — ONE event for all block content (contract: guard with if text:)
                         # block_type sourced from current_block_type (equals part_type after _open_block)
                         if text:
-                            if hooks_available:
+                            # A source can be split across deltas. Keep the
+                            # response content intact, but do not publish
+                            # unreviewable partial text for image requests.
+                            if hooks_available and not image_request:
                                 await self.coordinator.hooks.emit(
                                     "llm:stream_block_delta",
                                     {
@@ -2988,7 +3107,9 @@ class GeminiProvider:
                     candidates=[_NS(content=_NS(parts=collected_parts), finish_reason=final_finish_reason)],
                     usage_metadata=final_usage_metadata,
                 )
-                return self._convert_to_chat_response(_synth, model=model)
+                return self._convert_to_chat_response(
+                    _synth, model=model, diagnostic_echoes=diagnostic_echoes
+                )
 
             except LLMTimeoutError:
                 raise
@@ -3027,7 +3148,7 @@ class GeminiProvider:
                                 "provider:concurrency",
                                 {
                                     "provider": "gemini",
-                                    "model": model,
+                                    "model": event_model,
                                     "active_requests": _active_requests,
                                     "waiting_requests": _waiting_requests,
                                     "max_concurrent": self._max_concurrent_requests,
@@ -3045,7 +3166,7 @@ class GeminiProvider:
                             "provider:concurrency",
                             {
                                 "provider": "gemini",
-                                "model": model,
+                                "model": event_model,
                                 "active_requests": _active_requests,
                                 "waiting_requests": _waiting_requests,
                                 "max_concurrent": 0,
@@ -3084,7 +3205,9 @@ class GeminiProvider:
                     raise ValueError("Gemini API response content has no parts")
 
                 # Convert to ChatResponse first (ordering fix — emit uses converted usage)
-                chat_response = self._convert_to_chat_response(response, model=model)
+                chat_response = self._convert_to_chat_response(
+                    response, model=model, diagnostic_echoes=diagnostic_echoes
+                )
 
             elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -3137,7 +3260,7 @@ class GeminiProvider:
                         usage_data["cost_unpriced_model"] = _unpriced_model
                 response_payload: dict[str, Any] = {
                     "provider": "gemini",
-                    "model": model,
+                    "model": event_model,
                     "usage": usage_data,
                     "status": "ok",
                     "duration_ms": elapsed_ms,
@@ -3164,7 +3287,7 @@ class GeminiProvider:
                     "llm:response",
                     {
                         "provider": "gemini",
-                        "model": model,
+                        "model": event_model,
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": error_msg,
@@ -3172,6 +3295,9 @@ class GeminiProvider:
                 )
             if image_request:
                 e.args = (IMAGE_ERROR,)
+                e.model = diagnostic_copy(e.model, diagnostic_echoes)
+                e.__cause__ = None
+                e.__context__ = None
                 raise e from None
             raise
 
@@ -3185,7 +3311,7 @@ class GeminiProvider:
                     "llm:response",
                     {
                         "provider": "gemini",
-                        "model": model,
+                        "model": event_model,
                         "status": "error",
                         "duration_ms": elapsed_ms,
                         "error": error_msg,
@@ -3199,7 +3325,7 @@ class GeminiProvider:
                 ) from None
             raise
     def _convert_to_chat_response(
-        self, response, *, model: str = ""
+        self, response, *, model: str = "", diagnostic_echoes: frozenset[str] = frozenset()
     ) -> GeminiChatResponse:
         """
         Convert Gemini response to ChatResponse.
@@ -3254,7 +3380,8 @@ class GeminiProvider:
                             loop = asyncio.get_running_loop()
                             loop.create_task(
                                 self.coordinator.hooks.emit(
-                                    "thinking:final", {"text": part_text}
+                                    "thinking:final",
+                                    diagnostic_copy({"text": part_text}, diagnostic_echoes),
                                 )
                             )
                 else:
@@ -3317,7 +3444,7 @@ class GeminiProvider:
                     logger.debug(
                         "[PROVIDER] Gemini: captured thought_signature on function_call "
                         "part '%s' (%d chars, base64)",
-                        fc.name,
+                        diagnostic_copy(fc.name, diagnostic_echoes),
                         len(_fc_sig),
                     )
 
@@ -3678,12 +3805,7 @@ class GeminiProvider:
         # Preserve the provider's retained route decision once it owns a client.
         # An injected client has no established Developer API route; controlled
         # fixtures can bind it using the existing count-route witness.
-        route_supported = (
-            _sdk_environment_uses_canonical_developer_route()
-            if self._client is None else
-            self._client is self._count_route_client
-            and self._client_uses_canonical_developer_route is True
-        )
+        route_supported = self._chat_image_route()
         user_images = route_supported and selected_model in USER_IMAGE_MODELS
         tool_images = route_supported and selected_model in TOOL_IMAGE_MODELS
         messages = normalize_results(messages)
@@ -3740,9 +3862,7 @@ class GeminiProvider:
                     # result to whichever function happened to appear first.
                     tool_name = tool_names.get(tool_call_id)
                     if not tool_name:
-                        logger.error(
-                            f"Could not determine tool name for tool_call_id: {tool_call_id}"
-                        )
+                        logger.error("Could not determine tool name for tool result")
                         tool_name = "unknown"
 
                 if tool_has_images(content) and (

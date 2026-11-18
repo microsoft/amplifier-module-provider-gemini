@@ -656,10 +656,22 @@ marker so an ordinary follow-up can dispatch; malformed supported base64 still
 fails without echoing the payload. This adapter has not qualified URL/file-URI transport, and never
 downloads a URL locally. This is an adapter limitation, **not** a claim that
 Google's APIs prohibit remote files. Vertex/Cloud qualification is separate.
+
+Foundation's indexed v2 support reports original user and matching tool-result
+positions on the canonical Developer `v1beta` route only. It reports the MIME
+intersection (PNG/JPEG/WebP) when tool positions are included; user-only
+requests can also advertise HEIC/HEIF. An injected client, a custom endpoint,
+or a per-request SDK HTTP override is not enough to establish route support.
+When the host binds enabled `experimental.media.v1`, the adapter revalidates
+the exact private request before count and each buffered or streaming send
+attempt. It does not hydrate references itself.
+
 The existing native counter sees the same projected image-bearing request as
 generation, with the same route/model eligibility rules. Raw hook copies omit
 typed pixels/URLs before the first subscriber, including exact request-known
-media echoes in raw request/response text. This is not a generic URL filter and
+media echoes in raw request/response keys and values. Image-bearing requests
+omit streaming text deltas because a source echo can span multiple chunks.
+This is not a generic URL filter and
 does not rewrite the actual SDK payload or returned response. Image-request error
 echoes are omitted without changing send/retry decisions.
 

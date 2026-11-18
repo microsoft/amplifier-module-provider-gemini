@@ -55,6 +55,7 @@ IMAGE_MIME_TYPES = frozenset(
         "image/heif",
     }
 )
+TOOL_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 UNAVAILABLE = (
     "[Image unavailable: model, route or original position is not qualified; "
     "no pixels supplied. Supply a supported user image or a text description.]"
@@ -122,6 +123,8 @@ def diagnostic_copy(value: Any, echoes: frozenset[str] = frozenset()) -> Any:
             if key in {"inline_data", "inlineData", "file_data", "fileData"}
             else diagnostic_copy(item, echoes)
             for key, item in value.items()
+            if not isinstance(key, bytes)
+            and not (isinstance(key, str) and any(echo in key for echo in echoes))
         }
     if isinstance(value, (list, tuple)):
         return [diagnostic_copy(item, echoes) for item in value]
@@ -260,11 +263,7 @@ def tool_response(
         source = block["source"]
         # Multimodal function responses document PNG/JPEG/WebP, not the wider
         # ordinary user-image MIME set.
-        qualified = supported and source.get("media_type") in {
-            "image/png",
-            "image/jpeg",
-            "image/webp",
-        }
+        qualified = supported and source.get("media_type") in TOOL_IMAGE_MIME_TYPES
         part = image_part(block, supported=qualified)
         if "inline_data" not in part:
             return part
