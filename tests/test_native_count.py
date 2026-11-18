@@ -720,6 +720,119 @@ def _budget_provider() -> tuple[GeminiProvider, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_image", [False, True], ids=["text-only", "image"])
+@pytest.mark.parametrize(
+    ("extra_request_params", "counting_available"),
+    [
+        ({}, True),
+        ({"http_options": None}, True),
+        ({"http_options": {}}, False),
+        ({"http_options": {"timeout": 1000}}, False),
+        ({"http_options": {"headers": {"x-fixture": "private-value"}}}, False),
+        ({"http_options": {"api_version": "v1"}}, False),
+        ({"http_options": {"base_url": "https://private.invalid/"}}, False),
+        ({"http_options": {"extra_body": {"private-field": "private-value"}}}, False),
+    ],
+    ids=[
+        "absent",
+        "null",
+        "empty",
+        "timeout",
+        "headers",
+        "api-version",
+        "base-url",
+        "extra-body",
+    ],
+)
+async def test_http_options_gate_count_advertisement_and_dispatch_for_all_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    with_image: bool,
+    extra_request_params: dict[str, Any],
+    counting_available: bool,
+) -> None:
+    """A fixed REST counter cannot qualify arbitrary SDK transport overrides."""
+    for name in (
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    sent: list[httpx.Request] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"totalTokens": 100})
+
+    _count_transport(monkeypatch, receive)
+    provider = GeminiProvider(
+        api_key="test-key",
+        config={
+            "default_model": "gemini-3.7-flash",
+            "extra_request_params": extra_request_params,
+        },
+    )
+    coordinator = _RecordingCoordinator()
+    provider.coordinator = coordinator  # type: ignore[assignment]
+    request = (
+        _request()
+        if with_image
+        else ChatRequest(
+            messages=[Message(role="user", content="Count this text.")],
+            max_output_tokens=321,
+        )
+    )
+    before = request.model_dump()
+
+    with caplog.at_level("DEBUG"):
+        capabilities = provider.get_info().capabilities
+        decision = await provider.request_budget(request, context_estimate=400)
+
+    for capability in ("request_budget", "request_budget:provider_count"):
+        assert (capability in capabilities) is counting_available
+    assert provider._client is None  # Advertisement/count must not start generation.
+    assert request.model_dump() == before
+    assert len(sent) == int(counting_available)
+    if counting_available:
+        assert decision is not None
+        assert decision["estimated_input_tokens"] == 100
+        assert decision["measurement"] == {
+            "kind": "provider_count",
+            "source": "gemini.developer.countTokens",
+            "input_tokens": 100,
+        }
+        assert sent[0].url == (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3.7-flash:countTokens"
+        )
+        assert sent[0].headers["x-goog-api-key"] == "test-key"
+        body = json.loads(sent[0].content)["generateContentRequest"]
+        assert body["model"] == "models/gemini-3.7-flash"
+        if with_image:
+            assert (
+                body["contents"][1]["parts"][1]["inlineData"]["mimeType"] == "image/png"
+            )
+        else:
+            assert body["contents"] == [
+                {"role": "user", "parts": [{"text": "Count this text."}]}
+            ]
+        assert _unavailable_events(coordinator) == []
+    else:
+        assert decision is None
+        assert _unavailable_events(coordinator) == [
+            {
+                "provider": "gemini",
+                "method": "developer.countTokens",
+                "model": "gemini-3.7-flash",
+                "reason": "unsupported_route",
+            }
+        ]
+    diagnostics = json.dumps(coordinator.hooks.events) + caplog.text
+    assert "private.invalid" not in diagnostics
+    assert "private-value" not in diagnostics
+
+
+@pytest.mark.asyncio
 async def test_successful_count_emits_no_unavailable_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
